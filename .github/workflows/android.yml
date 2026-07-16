@@ -4,7 +4,9 @@ name: Build APK Android
 # (boton "Run workflow", donde podes elegir la rama).
 on:
   push:
-    branches: [ main ]
+    branches:
+      - main
+      - claude/gps-tico-capacitor-apk-djrkna
   workflow_dispatch:
 
 jobs:
