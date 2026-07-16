@@ -1,0 +1,25 @@
+# Dependencias
+node_modules/
+
+# Keystore de firma (NUNCA se sube al repo)
+*.keystore
+*.jks
+release.keystore
+keystore.b64
+
+# Build de Android
+android/app/build/
+android/build/
+android/.gradle/
+android/captures/
+android/.idea/
+android/local.properties
+*.apk
+*.aab
+
+# Sistema
+.DS_Store
+Thumbs.db
+
+# Credenciales locales (NUNCA subir)
+keystore-credentials.txt
