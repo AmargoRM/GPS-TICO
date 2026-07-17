@@ -1066,10 +1066,35 @@ function panelExport(){
     bajar(S.proy.nom+'.geojson', JSON.stringify(fc,null,1), 'application/geo+json');
   };
 }
-function bajar(nom, txt, tipo){
+async function bajar(nom, txt, tipo){
+  const safe = nom.replace(/[^\w\-. áéíóúñÁÉÍÓÚÑ]/g,'_');
+  const P = window.Capacitor && window.Capacitor.Plugins;
+  // En el APK, <a download> con blob NO funciona en el WebView de Android.
+  // Escribimos el archivo con Filesystem y abrimos el menú Compartir.
+  if(P && P.Filesystem){
+    try{
+      const res = await P.Filesystem.writeFile({
+        path: safe,
+        data: txt,
+        directory: 'CACHE',
+        encoding: 'utf8'
+      });
+      if(P.Share){
+        await P.Share.share({ title: safe, text: safe, url: res.uri, dialogTitle: 'Guardar o compartir ' + safe });
+      } else {
+        toast('Guardado: ' + safe);
+      }
+      return;
+    }catch(e){
+      console.log('Filesystem/Share error:', e);
+      toast('No se pudo guardar el archivo: ' + (e && e.message ? e.message : e));
+      return;
+    }
+  }
+  // Navegador de escritorio: descarga clásica.
   const a = document.createElement('a');
   a.href = URL.createObjectURL(new Blob([txt], {type:tipo}));
-  a.download = nom.replace(/[^\w\-. áéíóúñÁÉÍÓÚÑ]/g,'_');
+  a.download = safe;
   a.click();
   setTimeout(()=> URL.revokeObjectURL(a.href), 4000);
   toast('Archivo descargado.');
