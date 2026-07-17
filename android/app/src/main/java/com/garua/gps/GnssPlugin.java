@@ -83,21 +83,8 @@ public class GnssPlugin extends Plugin {
             locationListener = new LocationListener() {
                 @Override
                 public void onLocationChanged(Location location) {
-                    JSObject locData = new JSObject();
-                    locData.put("latitude", location.getLatitude());
-                    locData.put("longitude", location.getLongitude());
-                    locData.put("accuracy", location.getAccuracy());
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                        locData.put("verticalAccuracy", location.getVerticalAccuracyMeters());
-                    }
-                    locData.put("altitude", location.getAltitude());
-                    locData.put("speed", location.getSpeed());
-                    locData.put("bearing", location.getBearing());
-                    locData.put("provider", location.getProvider());
-                    locData.put("timestamp", location.getTime());
-
                     JSObject data = new JSObject();
-                    data.put("data", locData);
+                    data.put("data", locationToJs(location));
                     data.put("timestamp", System.currentTimeMillis());
                     notifyListeners("location", data);
                 }
@@ -144,6 +131,30 @@ public class GnssPlugin extends Plugin {
         } catch (Exception e) {
             call.reject("Error starting GNSS listener: " + e.getMessage());
         }
+    }
+
+    // Serializa un Location con todas las exactitudes que expone Android.
+    private JSObject locationToJs(Location location) {
+        JSObject j = new JSObject();
+        j.put("latitude", location.getLatitude());
+        j.put("longitude", location.getLongitude());
+        j.put("accuracy", location.getAccuracy());
+        j.put("altitude", location.getAltitude());
+        j.put("speed", location.getSpeed());
+        j.put("bearing", location.getBearing());
+        j.put("provider", location.getProvider());
+        j.put("timestamp", location.getTime());
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            if (location.hasVerticalAccuracy()) j.put("verticalAccuracy", location.getVerticalAccuracyMeters());
+            if (location.hasSpeedAccuracy())    j.put("speedAccuracy", location.getSpeedAccuracyMetersPerSecond());
+            if (location.hasBearingAccuracy())  j.put("bearingAccuracy", location.getBearingAccuracyDegrees());
+        }
+        if (Build.VERSION.SDK_INT >= 31) {
+            j.put("isMock", location.isMock());
+        } else {
+            j.put("isMock", location.isFromMockProvider());
+        }
+        return j;
     }
 
     // Parsea sentencias NMEA-0183 para extraer DOP y geoide.
@@ -215,15 +226,7 @@ public class GnssPlugin extends Plugin {
         try {
             Location location = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER);
             if (location != null) {
-                JSObject locData = new JSObject();
-                locData.put("latitude", location.getLatitude());
-                locData.put("longitude", location.getLongitude());
-                locData.put("accuracy", location.getAccuracy());
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    locData.put("verticalAccuracy", location.getVerticalAccuracyMeters());
-                }
-                locData.put("altitude", location.getAltitude());
-                call.resolve(locData);
+                call.resolve(locationToJs(location));
             } else {
                 call.reject("No last known location");
             }

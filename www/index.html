@@ -393,8 +393,9 @@ async function migrarAGeoJSON(){
 const S = {
   modo: 'geo',
   capa: 'sat',
+  fuente: 'fused',     // fuente de posición: 'fused' | 'gps' (F1)
   proy: null,          // proyecto activo
-  fix: null,           // último GeolocationPosition
+  fix: null,           // último fix normalizado (coords + metadatos)
   grabando: null,      // track en curso
   seguir: true,        // centrar mapa en el fix
   centro: { lat: 9.4318, lon: -84.1620 },   // Quepos
@@ -652,22 +653,87 @@ async function liberarPantalla(){
   const KA = window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.KeepAwake;
   if(KA){ try{ await KA.allowSleep(); }catch(e){} }
 }
-function arrancarGPS(){
+/* --- fuente de posición: fused (WebView) o GPS puro (nativo) --- */
+// S.fuente: 'fused' = navigator.geolocation (GPS+WiFi+celda, rápido)
+//           'gps'   = LocationManager GPS_PROVIDER nativo (solo satélites)
+let watchFusedId = null;
+let gnssStarted = false;      // listener nativo activo (compartido con diagnóstico)
+let diagAbierto = false;      // panel de diagnóstico abierto
+let mainLocSub = null;        // suscripción del app al evento 'location' nativo
+
+function pluginGnss(){ return window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.Gnss; }
+
+function arrancarFused(){
+  if(watchFusedId!=null) return;
   if(!navigator.geolocation){ toast('Este navegador no expone GPS.'); return; }
-  navigator.geolocation.watchPosition(alFix, alErrorGPS, {
-    enableHighAccuracy: true, maximumAge: 0, timeout: 30000
-  });
+  watchFusedId = navigator.geolocation.watchPosition((pos)=>{
+    if(S.fuente==='fused') alFix(posDesdeFused(pos));
+  }, alErrorGPS, { enableHighAccuracy:true, maximumAge:0, timeout:30000 });
+}
+function detenerFused(){
+  if(watchFusedId!=null){ navigator.geolocation.clearWatch(watchFusedId); watchFusedId=null; }
+}
+async function gnssStart(){
+  const P = pluginGnss(); if(!P) return false;
+  if(!gnssStarted){ await P.startGnssListener(); gnssStarted = true; }
+  return true;
+}
+async function gnssStopSiOcioso(){
+  const P = pluginGnss(); if(!P) return;
+  if(S.fuente!=='gps' && !diagAbierto && gnssStarted){
+    try{ await P.stopGnssListener(); }catch(e){}
+    gnssStarted = false;
+  }
+}
+async function aplicarFuente(){
+  await dbPut('conf', S.fuente, 'fuente');
+  if(S.fuente==='gps'){
+    const ok = await gnssStart();
+    if(!ok){ S.fuente='fused'; toast('GPS puro no disponible en este equipo; uso posición fusionada.'); }
+  }
+  if(S.fuente==='gps') detenerFused(); else arrancarFused();
+  await gnssStopSiOcioso();
+}
+// Convierten cada fuente a la forma de un Position del navegador (coords + timestamp)
+function posDesdeFused(pos){
+  return { coords: pos.coords, timestamp: pos.timestamp,
+    fuente:'fused', vexac: pos.coords.altitudeAccuracy, sexac:null, bexac:null, mock:false, provider:'fused' };
+}
+function posDesdeNativo(d){
+  return {
+    coords: { latitude:d.latitude, longitude:d.longitude, altitude:(d.altitude!=null?d.altitude:null),
+              accuracy:d.accuracy, altitudeAccuracy:(d.verticalAccuracy!=null?d.verticalAccuracy:null),
+              speed:(d.speed!=null?d.speed:null), heading:(d.bearing!=null?d.bearing:null) },
+    timestamp: d.timestamp || Date.now(),
+    fuente:'gps', vexac:d.verticalAccuracy, sexac:d.speedAccuracy, bexac:d.bearingAccuracy,
+    mock:!!d.isMock, provider:d.provider };
+}
+async function arrancarGPS(){
+  S.fuente = await dbGet('conf','fuente') || 'fused';
+  // Suscripción única del app a los fixes nativos (se activa según S.fuente).
+  const P = pluginGnss();
+  if(P && !mainLocSub){
+    mainLocSub = await P.addListener('location', (ev)=>{
+      if(S.fuente==='gps') alFix(posDesdeNativo(ev.data));
+    });
+  }
+  await aplicarFuente();
 }
 function alFix(pos){
   S.fix = pos;
   const c = pos.coords;
+  const src = pos.fuente==='gps' ? 'GPS PURO' : 'FUSED';
   document.getElementById('estadoRed').textContent =
-    (navigator.onLine ? 'EN LÍNEA' : 'SIN RED · MAPA CACHÉ') + ' · FIX ' + new Date(pos.timestamp).toLocaleTimeString('es-CR',{hour12:false});
+    (navigator.onLine ? 'EN LÍNEA' : 'SIN RED') + ' · ' + src + ' · FIX ' + new Date(pos.timestamp).toLocaleTimeString('es-CR',{hour12:false});
   const f = fmtCoord(c.latitude, c.longitude, S.modo);
   document.getElementById('coordSys').textContent = PROY[S.modo].nom;
   document.getElementById('coordA').textContent = f.a;
   document.getElementById('coordB').textContent = f.b;
-  document.getElementById('coordC').textContent = f.c;
+  // Línea terciaria: coordenada + exactitud vertical + aviso de mock.
+  let cExtra = f.c;
+  if(pos.vexac!=null) cExtra += '  ·  ↕±' + pos.vexac.toFixed(1) + 'm';
+  if(pos.mock) cExtra += '  ·  ⚠ MOCK';
+  document.getElementById('coordC').textContent = cExtra;
   document.getElementById('mExac').textContent = c.accuracy!=null ? c.accuracy.toFixed(1) : '—';
   document.getElementById('mAlt').textContent  = c.altitude!=null ? c.altitude.toFixed(0) : '—';
   document.getElementById('mVel').textContent  = c.speed!=null ? (c.speed*3.6).toFixed(1) : '—';
@@ -695,7 +761,8 @@ function grabarPunto(pos){
     if(d < FILTRO.distMin) return;
     S.grabando.dist += d;
   }
-  const pt = { lat:c.latitude, lon:c.longitude, alt:c.altitude, exac:c.accuracy, t:pos.timestamp };
+  const pt = { lat:c.latitude, lon:c.longitude, alt:c.altitude, exac:c.accuracy,
+               vexac: pos.vexac!=null?pos.vexac:null, fuente: pos.fuente||'fused', t:pos.timestamp };
   pts.push(pt);
   S.grabando.geojson.geometry.coordinates.push([pt.lon, pt.lat]);
   S.grabando.geojson.properties = { nom: S.grabando.nom, dist: S.grabando.dist, puntos: pts.length };
@@ -775,11 +842,15 @@ document.getElementById('btnWp').onclick = ()=>{
   if(!S.proy){ toast('Creá un proyecto primero.'); return; }
   if(!S.fix){ toast('Sin posición todavía.'); return; }
   const c = S.fix.coords;
+  const fx = S.fix;
   const f = fmtCoord(c.latitude, c.longitude, S.modo);
   const n = S.puntos.length + 1;
+  const vTxt = fx.vexac!=null ? '  ·  ↕±'+fx.vexac.toFixed(1)+' m' : '';
+  const srcTxt = fx.fuente==='gps' ? 'GPS puro' : 'Fusionada';
   abrirPanel('Marcar punto', `
     <div class="res"><div class="k">${PROY[S.modo].nom}</div><div class="v">${f.a}<br>${f.b}</div></div>
-    <div class="res"><div class="k">Exactitud</div><div class="v">± ${c.accuracy.toFixed(1)} m${c.altitude!=null?'  ·  '+c.altitude.toFixed(0)+' m alt':''}</div></div>
+    <div class="res"><div class="k">Exactitud</div><div class="v">± ${c.accuracy.toFixed(1)} m${vTxt}${c.altitude!=null?'  ·  '+c.altitude.toFixed(0)+' m alt':''}</div></div>
+    <div class="res"><div class="k">Fuente</div><div class="v">${srcTxt}${fx.mock?'  ·  ⚠ MOCK':''}</div></div>
     <label>Nombre</label><input id="wpNom" value="P${String(n).padStart(3,'0')}">
     <label>Descripción</label><textarea id="wpDesc" rows="2" placeholder="Naciente, punto de aforo, testigo..."></textarea>
     <button class="ancho" id="wpOk">Guardar punto</button>
@@ -789,7 +860,8 @@ document.getElementById('btnWp').onclick = ()=>{
       id:nid(), proy:S.proy.id,
       nom: document.getElementById('wpNom').value.trim() || `P${n}`,
       desc: document.getElementById('wpDesc').value.trim(),
-      lat:c.latitude, lon:c.longitude, alt:c.altitude, exac:c.accuracy, t:Date.now()
+      lat:c.latitude, lon:c.longitude, alt:c.altitude, exac:c.accuracy,
+      vexac: fx.vexac!=null?fx.vexac:null, fuente: fx.fuente||'fused', t:Date.now()
     };
     await dbPut('puntos', p);
     S.puntos.push(p); cerrarPanel(); dibujar();
@@ -803,6 +875,7 @@ document.getElementById('btnTrack').onclick = alternarTrack;
 /* --- menú --- */
 document.getElementById('btnMenu').onclick = ()=>{
   abrirPanel('Menú', `
+    <div class="fila"><div class="cuerpo"><div class="t">Fuente de posición</div><div class="s">${S.fuente==='gps'?'GPS puro (nativo)':'Fusionada (GPS+WiFi+celda)'}</div></div><button class="mini" id="mFuente">Cambiar</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Diagnóstico GNSS</div><div class="s">Satélites, L5, exactitud</div></div><button class="mini" id="mDiag">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Puntos y tracks</div><div class="s">${S.puntos.length} puntos · ${S.tracks.length} tracks</div></div><button class="mini" id="mDatos">Ver</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Convertir coordenadas</div><div class="s">Geo ↔ CRTM05 ↔ Lambert N/S</div></div><button class="mini" id="mConv">Abrir</button></div>
@@ -810,6 +883,7 @@ document.getElementById('btnMenu').onclick = ()=>{
     <div class="fila"><div class="cuerpo"><div class="t">Exportar proyecto</div><div class="s">GPX · CSV · GeoJSON</div></div><button class="mini" id="mExp">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Precisión y advertencias</div><div class="s">Leer antes de usar en expedientes</div></div><button class="mini" id="mInfo">Abrir</button></div>
   `);
+  document.getElementById('mFuente').onclick = panelFuente;
   document.getElementById('mDiag').onclick  = panelDiagnosticos;
   document.getElementById('mDatos').onclick = panelDatos;
   document.getElementById('mConv').onclick  = panelConv;
@@ -1030,12 +1104,13 @@ function panelExport(){
   `);
   document.getElementById('exCsv').onclick = ()=>{
     const m = document.getElementById('exSys').value;
-    const enc = m==='geo' ? ['nombre','lat','lon','altura_m','exactitud_m','fecha','descripcion']
-                          : ['nombre','este','norte','altura_m','exactitud_m','fecha','descripcion','epsg'];
+    const enc = m==='geo' ? ['nombre','lat','lon','altura_m','exactitud_m','exac_vert_m','fuente','fecha','descripcion']
+                          : ['nombre','este','norte','altura_m','exactitud_m','exac_vert_m','fuente','fecha','descripcion','epsg'];
     const filas = S.puntos.map(p=>{
       const c = m==='geo' ? [p.lat.toFixed(7), p.lon.toFixed(7)]
                           : (q=> [q.e.toFixed(3), q.n.toFixed(3)])(desdeWgs(p.lat,p.lon,m));
       const base = [p.nom, ...c, p.alt!=null?p.alt.toFixed(1):'', p.exac.toFixed(1),
+                    p.vexac!=null?p.vexac.toFixed(1):'', p.fuente||'fused',
                     new Date(p.t).toISOString(), p.desc||''];
       if(m!=='geo') base.push(PROY[m].epsg);
       return base.map(v=>`"${String(v).replace(/"/g,'""')}"`).join(',');
@@ -1113,6 +1188,27 @@ function panelInfo(){
   `);
 }
 
+/* --- fuente de posición (F1) --- */
+function panelFuente(){
+  const hayPlugin = !!pluginGnss();
+  abrirPanel('Fuente de posición', `
+    <div class="res"><div class="k">Activa ahora</div><div class="v">${S.fuente==='gps'?'GPS puro (nativo)':'Fusionada (WebView)'}</div></div>
+    <button class="ancho ${S.fuente==='fused'?'':'borde'}" id="fFused">Fusionada · GPS+WiFi+celda</button>
+    <button class="ancho ${S.fuente==='gps'?'':'borde'}" id="fGps" ${hayPlugin?'':'disabled style="opacity:.4"'}>GPS puro · solo satélites</button>
+    <div class="nota"><b>Fusionada</b> (por defecto): rápida, la da el sistema mezclando GPS, WiFi y antenas de celular. Buen primer fix, pero no es "GNSS puro".</div>
+    <div class="nota"><b>GPS puro</b>: usa solo el chip de satélites (GPS_PROVIDER). El <u>primer fix puede tardar 30–60 s</u> y a cielo abierto. Es más honesto y reporta exactitud vertical, pero los tracks tienen más "zig-zag". Cada punto guardado anota con qué fuente se tomó.</div>
+    ${hayPlugin?'':'<div class="nota" style="border-color:var(--sangre)">El plugin nativo no está disponible; solo Fusionada. Asegurate de correr el APK.</div>'}
+  `);
+  document.getElementById('fFused').onclick = async ()=>{
+    S.fuente = 'fused'; await aplicarFuente(); toast('Fuente: Fusionada.'); cerrarPanel();
+  };
+  document.getElementById('fGps').onclick = async ()=>{
+    if(!hayPlugin) return;
+    S.fuente = 'gps'; await aplicarFuente();
+    toast('Fuente: GPS puro. El primer fix puede tardar; salí a cielo abierto.'); cerrarPanel();
+  };
+}
+
 /* --- diagnosticos gnss (F0) --- */
 // Constelaciones GnssStatus: 1=GPS 2=SBAS 3=GLONASS 4=QZSS 5=BEIDOU 6=GALILEO 7=IRNSS
 const CONSTEL = {
@@ -1166,10 +1262,11 @@ async function panelDiagnosticos(){
   diagSamples = [];
   document.getElementById('diagExport').onclick = exportarDiagCSV;
 
-  if(window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.Gnss){
+  if(pluginGnss()){
     try {
-      const Gnss = window.Capacitor.Plugins.Gnss;
-      await Gnss.startGnssListener();
+      const Gnss = pluginGnss();
+      diagAbierto = true;
+      await gnssStart();               // compartido con GPS puro del app
       gnssState.listening = true;
       const hSat = await Gnss.addListener('gnssStatus', (d)=> updateGnssUI(d.data));
       const hLoc = await Gnss.addListener('location',   (d)=> updateLocationUI(d.data));
@@ -1181,7 +1278,8 @@ async function panelDiagnosticos(){
       diagCleanup = async ()=>{
         if(diagInterval){ clearInterval(diagInterval); diagInterval = null; }
         try{ hSat && hSat.remove(); hLoc && hLoc.remove(); hDop && hDop.remove(); hGga && hGga.remove(); }catch(e){}
-        try{ await Gnss.stopGnssListener(); }catch(e){}
+        diagAbierto = false;
+        await gnssStopSiOcioso();       // solo detiene si el app no usa GPS puro
         gnssState.listening = false;
       };
     } catch(e){
@@ -1298,16 +1396,17 @@ function exportarDiagCSV(){
   const pa = await dbGet('conf','proyActivo');
   if(pa && await dbGet('proyectos', pa)) await cargarProyecto(pa);
   if(navigator.storage && navigator.storage.persist) navigator.storage.persist();
-  medir(); dibujarAnillo(null); arrancarGPS();
+  medir(); dibujarAnillo(null);
   window.addEventListener('resize', medir);
   window.addEventListener('online',  ()=> dibujar());
   window.addEventListener('offline', ()=>{ document.getElementById('estadoRed').textContent = 'SIN RED · MAPA CACHÉ'; });
-  // Capacitor: pedir permiso de ubicación nativo al arrancar.
-  // La lectura del GPS sigue igual, via navigator.geolocation (no se toca).
+  // Capacitor: pedir permiso de ubicación nativo ANTES de arrancar la fuente
+  // (el GPS puro nativo también requiere ACCESS_FINE_LOCATION).
   try{
     const Geo = window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.Geolocation;
     if(Geo) await Geo.requestPermissions();
   }catch(e){}
+  await arrancarGPS();
 })();
 </script>
 </body>
