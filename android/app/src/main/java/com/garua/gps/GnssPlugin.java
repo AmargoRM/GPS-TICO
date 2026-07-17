@@ -154,12 +154,23 @@ public class GnssPlugin extends Plugin {
         } else {
             j.put("isMock", location.isFromMockProvider());
         }
+        // Altura ortométrica (sobre el geoide) calculada por el sistema. API 34+.
+        if (Build.VERSION.SDK_INT >= 34) {
+            if (location.hasMslAltitude()) {
+                j.put("mslAltitude", location.getMslAltitudeMeters());
+                if (location.hasMslAltitudeAccuracy()) {
+                    j.put("mslAltitudeAccuracy", location.getMslAltitudeAccuracyMeters());
+                }
+            }
+        }
         return j;
     }
 
-    // Parsea sentencias NMEA-0183 para extraer DOP y geoide.
+    // Parsea sentencias NMEA-0183 para extraer DOP y altura.
     // GSA: $--GSA,modo,fix,sv...(12),PDOP,HDOP,VDOP*cs
-    // GGA: $--GGA,hora,lat,N,lon,E,calidad,nSats,HDOP,altElip,M,geoide,M,...*cs
+    // GGA: $--GGA,hora,lat,N,lon,E,calidad,nSats,HDOP,altMSL,M,geoide,M,...*cs
+    //   campo 9 = altura sobre el geoide (ORTOMÉTRICA/MSL), directa.
+    //   campo 11 = separación del geoide (N). Elipsoidal = MSL + N.
     private void parseNmea(String message, long timestamp) {
         if (message == null || message.length() < 6) return;
         // El talker son 2 chars (GP, GN, GL...); el tipo de sentencia empieza en índice 3.
@@ -180,7 +191,7 @@ public class GnssPlugin extends Plugin {
             } else if (type.equals("GGA") && f.length >= 12) {
                 JSObject gga = new JSObject();
                 gga.put("hdop", parseFloatSafe(f[8]));
-                gga.put("altEllipsoidal", parseFloatSafe(f[9]));
+                gga.put("mslAltitude", parseFloatSafe(f[9]));       // ortométrica directa
                 gga.put("geoidSeparation", parseFloatSafe(f[11]));
                 gga.put("fixQuality", parseIntSafe(f[6]));
                 JSObject data = new JSObject();

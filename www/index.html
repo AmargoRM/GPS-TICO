@@ -126,7 +126,7 @@ label{display:block;font-size:9px;letter-spacing:.14em;text-transform:uppercase;
   </div>
   <div id="metricas">
     <div class="met"><div class="n" id="mExac">—</div><div class="u">Exactitud m</div></div>
-    <div class="met"><div class="n" id="mAlt">—</div><div class="u">Altura m</div></div>
+    <div class="met"><div class="n" id="mAlt">—</div><div class="u" id="mAltU">Altura m</div></div>
     <div class="met"><div class="n" id="mVel">—</div><div class="u">km/h</div></div>
     <div class="met"><div class="n" id="mRec">—</div><div class="u">Track m</div></div>
   </div>
@@ -660,6 +660,9 @@ let watchFusedId = null;
 let gnssStarted = false;      // listener nativo activo (compartido con diagnóstico)
 let diagAbierto = false;      // panel de diagnóstico abierto
 let mainLocSub = null;        // suscripción del app al evento 'location' nativo
+let mainGgaSub = null;        // suscripción del app al evento 'gga' (altura ortométrica)
+let ultimoGeoide = null;      // separación del geoide más reciente (NMEA), metros
+let ultimoMslNmea = null;     // altura ortométrica más reciente vía NMEA GGA, metros
 
 function pluginGnss(){ return window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.Gnss; }
 
@@ -695,26 +698,42 @@ async function aplicarFuente(){
   await gnssStopSiOcioso();
 }
 // Convierten cada fuente a la forma de un Position del navegador (coords + timestamp)
+// altElip = altura elipsoidal (WGS84, cruda del GPS)
+// altOrto = altura ortométrica (sobre el geoide/nivel del mar; la que importa)
 function posDesdeFused(pos){
+  const alt = pos.coords.altitude;
   return { coords: pos.coords, timestamp: pos.timestamp,
-    fuente:'fused', vexac: pos.coords.altitudeAccuracy, sexac:null, bexac:null, mock:false, provider:'fused' };
+    fuente:'fused', vexac: pos.coords.altitudeAccuracy, sexac:null, bexac:null, mock:false, provider:'fused',
+    altElip: alt!=null?alt:null, altOrto:null, altOrtoFuente:null, geoide: ultimoGeoide };
 }
 function posDesdeNativo(d){
+  const altElip = (d.altitude!=null?d.altitude:null);
+  // Ortométrica: preferir la del sistema (MSL_API, API 34); si no, la de NMEA GGA.
+  let altOrto = null, altOrtoFuente = null;
+  if(d.mslAltitude!=null){ altOrto = d.mslAltitude; altOrtoFuente = 'MSL_API'; }
+  else if(ultimoMslNmea!=null){ altOrto = ultimoMslNmea; altOrtoFuente = 'NMEA_GGA'; }
   return {
-    coords: { latitude:d.latitude, longitude:d.longitude, altitude:(d.altitude!=null?d.altitude:null),
+    coords: { latitude:d.latitude, longitude:d.longitude, altitude:altElip,
               accuracy:d.accuracy, altitudeAccuracy:(d.verticalAccuracy!=null?d.verticalAccuracy:null),
               speed:(d.speed!=null?d.speed:null), heading:(d.bearing!=null?d.bearing:null) },
     timestamp: d.timestamp || Date.now(),
     fuente:'gps', vexac:d.verticalAccuracy, sexac:d.speedAccuracy, bexac:d.bearingAccuracy,
-    mock:!!d.isMock, provider:d.provider };
+    mock:!!d.isMock, provider:d.provider,
+    altElip: altElip, altOrto: altOrto, altOrtoFuente: altOrtoFuente, geoide: ultimoGeoide };
 }
 async function arrancarGPS(){
   S.fuente = await dbGet('conf','fuente') || 'fused';
-  // Suscripción única del app a los fixes nativos (se activa según S.fuente).
+  // Suscripciones únicas del app a los eventos nativos (se activan según S.fuente).
   const P = pluginGnss();
   if(P && !mainLocSub){
     mainLocSub = await P.addListener('location', (ev)=>{
       if(S.fuente==='gps') alFix(posDesdeNativo(ev.data));
+    });
+    // La altura ortométrica y el geoide llegan por NMEA GGA; los guardamos
+    // aunque no estemos mostrando el diagnóstico, para tenerlos al marcar puntos.
+    mainGgaSub = await P.addListener('gga', (ev)=>{
+      if(ev.data.geoidSeparation!=null) ultimoGeoide = ev.data.geoidSeparation;
+      if(ev.data.mslAltitude!=null) ultimoMslNmea = ev.data.mslAltitude;
     });
   }
   await aplicarFuente();
@@ -729,13 +748,25 @@ function alFix(pos){
   document.getElementById('coordSys').textContent = PROY[S.modo].nom;
   document.getElementById('coordA').textContent = f.a;
   document.getElementById('coordB').textContent = f.b;
-  // Línea terciaria: coordenada + exactitud vertical + aviso de mock.
+  // Métrica de altura: mostrar ORTOMÉTRICA si la tenemos (la que importa),
+  // si no, la elipsoidal, con la etiqueta que corresponda.
+  if(pos.altOrto!=null){
+    document.getElementById('mAlt').textContent = pos.altOrto.toFixed(0);
+    document.getElementById('mAltU').textContent = 'Alt orto m';
+  } else if(pos.altElip!=null){
+    document.getElementById('mAlt').textContent = pos.altElip.toFixed(0);
+    document.getElementById('mAltU').textContent = 'Alt elip m';
+  } else {
+    document.getElementById('mAlt').textContent = '—';
+    document.getElementById('mAltU').textContent = 'Altura m';
+  }
+  // Línea terciaria: coordenada + exactitud vertical + ambas alturas + mock.
   let cExtra = f.c;
   if(pos.vexac!=null) cExtra += '  ·  ↕±' + pos.vexac.toFixed(1) + 'm';
+  if(pos.altOrto!=null && pos.altElip!=null) cExtra += '  ·  elip ' + pos.altElip.toFixed(0) + 'm';
   if(pos.mock) cExtra += '  ·  ⚠ MOCK';
   document.getElementById('coordC').textContent = cExtra;
   document.getElementById('mExac').textContent = c.accuracy!=null ? c.accuracy.toFixed(1) : '—';
-  document.getElementById('mAlt').textContent  = c.altitude!=null ? c.altitude.toFixed(0) : '—';
   document.getElementById('mVel').textContent  = c.speed!=null ? (c.speed*3.6).toFixed(1) : '—';
   dibujarAnillo(c.accuracy);
   if(S.grabando) grabarPunto(pos);
@@ -762,7 +793,10 @@ function grabarPunto(pos){
     S.grabando.dist += d;
   }
   const pt = { lat:c.latitude, lon:c.longitude, alt:c.altitude, exac:c.accuracy,
-               vexac: pos.vexac!=null?pos.vexac:null, fuente: pos.fuente||'fused', t:pos.timestamp };
+               vexac: pos.vexac!=null?pos.vexac:null, fuente: pos.fuente||'fused',
+               altElip: pos.altElip!=null?pos.altElip:null, altOrto: pos.altOrto!=null?pos.altOrto:null,
+               altOrtoFuente: pos.altOrtoFuente||null, geoide: pos.geoide!=null?pos.geoide:null,
+               t:pos.timestamp };
   pts.push(pt);
   S.grabando.geojson.geometry.coordinates.push([pt.lon, pt.lat]);
   S.grabando.geojson.properties = { nom: S.grabando.nom, dist: S.grabando.dist, puntos: pts.length };
@@ -847,13 +881,22 @@ document.getElementById('btnWp').onclick = ()=>{
   const n = S.puntos.length + 1;
   const vTxt = fx.vexac!=null ? '  ·  ↕±'+fx.vexac.toFixed(1)+' m' : '';
   const srcTxt = fx.fuente==='gps' ? 'GPS puro' : 'Fusionada';
+  const ortoTxt = fx.altOrto!=null
+    ? `${fx.altOrto.toFixed(1)} m  <span style="color:var(--musgo)">(${fx.altOrtoFuente==='MSL_API'?'sistema':'NMEA'})</span>`
+    : '<span style="color:var(--alerta)">no disponible</span>';
+  const elipTxt = fx.altElip!=null ? fx.altElip.toFixed(1)+' m' : '—';
   abrirPanel('Marcar punto', `
     <div class="res"><div class="k">${PROY[S.modo].nom}</div><div class="v">${f.a}<br>${f.b}</div></div>
-    <div class="res"><div class="k">Exactitud</div><div class="v">± ${c.accuracy.toFixed(1)} m${vTxt}${c.altitude!=null?'  ·  '+c.altitude.toFixed(0)+' m alt':''}</div></div>
+    <div class="res"><div class="k">Exactitud</div><div class="v">± ${c.accuracy.toFixed(1)} m${vTxt}</div></div>
+    <div class="grid2">
+      <div class="res"><div class="k">Altura ortométrica</div><div class="v">${ortoTxt}</div></div>
+      <div class="res"><div class="k">Altura elipsoidal</div><div class="v">${elipTxt}</div></div>
+    </div>
     <div class="res"><div class="k">Fuente</div><div class="v">${srcTxt}${fx.mock?'  ·  ⚠ MOCK':''}</div></div>
     <label>Nombre</label><input id="wpNom" value="P${String(n).padStart(3,'0')}">
     <label>Descripción</label><textarea id="wpDesc" rows="2" placeholder="Naciente, punto de aforo, testigo..."></textarea>
     <button class="ancho" id="wpOk">Guardar punto</button>
+    <div class="nota">La <b>altura ortométrica</b> (sobre el nivel del mar) es la correcta para dictámenes. La elipsoidal es la cruda del GPS. En GPS puro y a cielo abierto la ortométrica sale del sistema; bajo techo puede no estar disponible.</div>
   `);
   document.getElementById('wpOk').onclick = async ()=>{
     const p = {
@@ -861,7 +904,10 @@ document.getElementById('btnWp').onclick = ()=>{
       nom: document.getElementById('wpNom').value.trim() || `P${n}`,
       desc: document.getElementById('wpDesc').value.trim(),
       lat:c.latitude, lon:c.longitude, alt:c.altitude, exac:c.accuracy,
-      vexac: fx.vexac!=null?fx.vexac:null, fuente: fx.fuente||'fused', t:Date.now()
+      vexac: fx.vexac!=null?fx.vexac:null, fuente: fx.fuente||'fused',
+      altElip: fx.altElip!=null?fx.altElip:null, altOrto: fx.altOrto!=null?fx.altOrto:null,
+      altOrtoFuente: fx.altOrtoFuente||null, geoide: fx.geoide!=null?fx.geoide:null,
+      t:Date.now()
     };
     await dbPut('puntos', p);
     S.puntos.push(p); cerrarPanel(); dibujar();
@@ -1104,13 +1150,15 @@ function panelExport(){
   `);
   document.getElementById('exCsv').onclick = ()=>{
     const m = document.getElementById('exSys').value;
-    const enc = m==='geo' ? ['nombre','lat','lon','altura_m','exactitud_m','exac_vert_m','fuente','fecha','descripcion']
-                          : ['nombre','este','norte','altura_m','exactitud_m','exac_vert_m','fuente','fecha','descripcion','epsg'];
+    const enc = m==='geo' ? ['nombre','lat','lon','altura_orto_m','altura_elip_m','geoide_m','altura_fuente','exactitud_m','exac_vert_m','fuente','fecha','descripcion']
+                          : ['nombre','este','norte','altura_orto_m','altura_elip_m','geoide_m','altura_fuente','exactitud_m','exac_vert_m','fuente','fecha','descripcion','epsg'];
     const filas = S.puntos.map(p=>{
       const c = m==='geo' ? [p.lat.toFixed(7), p.lon.toFixed(7)]
                           : (q=> [q.e.toFixed(3), q.n.toFixed(3)])(desdeWgs(p.lat,p.lon,m));
-      const base = [p.nom, ...c, p.alt!=null?p.alt.toFixed(1):'', p.exac.toFixed(1),
-                    p.vexac!=null?p.vexac.toFixed(1):'', p.fuente||'fused',
+      const orto = p.altOrto!=null ? p.altOrto.toFixed(1) : '';
+      const elip = p.altElip!=null ? p.altElip.toFixed(1) : (p.alt!=null?p.alt.toFixed(1):'');
+      const base = [p.nom, ...c, orto, elip, p.geoide!=null?p.geoide.toFixed(1):'', p.altOrtoFuente||'',
+                    p.exac.toFixed(1), p.vexac!=null?p.vexac.toFixed(1):'', p.fuente||'fused',
                     new Date(p.t).toISOString(), p.desc||''];
       if(m!=='geo') base.push(PROY[m].epsg);
       return base.map(v=>`"${String(v).replace(/"/g,'""')}"`).join(',');
@@ -1120,21 +1168,31 @@ function panelExport(){
   document.getElementById('exGpx').onclick = ()=>{
     const esc = s => String(s||'').replace(/[<>&]/g, c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]));
     let g = `<?xml version="1.0" encoding="UTF-8"?>\n<gpx version="1.1" creator="Garua Campo" xmlns="http://www.topografix.com/GPX/1/1">\n<metadata><name>${esc(S.proy.nom)}</name></metadata>\n`;
+    // GPX <ele> es altura sobre el nivel del mar: usamos la ortométrica si está.
+    const ele = o => (o.altOrto!=null ? o.altOrto : (o.altElip!=null ? o.altElip : o.alt));
     for(const p of S.puntos){
-      g += `<wpt lat="${p.lat}" lon="${p.lon}">${p.alt!=null?`<ele>${p.alt.toFixed(1)}</ele>`:''}<time>${new Date(p.t).toISOString()}</time><name>${esc(p.nom)}</name><desc>${esc(p.desc)}</desc></wpt>\n`;
+      const e = ele(p);
+      g += `<wpt lat="${p.lat}" lon="${p.lon}">${e!=null?`<ele>${e.toFixed(1)}</ele>`:''}<time>${new Date(p.t).toISOString()}</time><name>${esc(p.nom)}</name><desc>${esc(p.desc)}</desc></wpt>\n`;
     }
     for(const t of S.tracks){
       g += `<trk><name>${esc(t.nom)}</name><trkseg>\n`;
-      for(const q of t.pts) g += `<trkpt lat="${q.lat}" lon="${q.lon}">${q.alt!=null?`<ele>${q.alt.toFixed(1)}</ele>`:''}<time>${new Date(q.t).toISOString()}</time></trkpt>\n`;
+      for(const q of t.pts){ const e = ele(q); g += `<trkpt lat="${q.lat}" lon="${q.lon}">${e!=null?`<ele>${e.toFixed(1)}</ele>`:''}<time>${new Date(q.t).toISOString()}</time></trkpt>\n`; }
       g += `</trkseg></trk>\n`;
     }
     bajar(S.proy.nom+'.gpx', g+'</gpx>', 'application/gpx+xml');
   };
   document.getElementById('exGeo').onclick = ()=>{
     const fc = { type:'FeatureCollection', name:S.proy.nom, crs:{type:'name',properties:{name:'urn:ogc:def:crs:OGC:1.3:CRS84'}}, features:[] };
-    for(const p of S.puntos) fc.features.push({ type:'Feature',
-      properties:{ nombre:p.nom, desc:p.desc, altura_m:p.alt, exactitud_m:p.exac, fecha:new Date(p.t).toISOString() },
-      geometry:{ type:'Point', coordinates:[p.lon, p.lat, p.alt||0] } });
+    for(const p of S.puntos){
+      const zOrto = p.altOrto!=null ? p.altOrto : null;
+      const zElip = p.altElip!=null ? p.altElip : (p.alt!=null?p.alt:null);
+      fc.features.push({ type:'Feature',
+        properties:{ nombre:p.nom, desc:p.desc,
+          altura_orto_m:zOrto, altura_elip_m:zElip, geoide_m:(p.geoide!=null?p.geoide:null),
+          altura_fuente:(p.altOrtoFuente||null), exactitud_m:p.exac, exac_vert_m:(p.vexac!=null?p.vexac:null),
+          fuente:(p.fuente||'fused'), fecha:new Date(p.t).toISOString() },
+        geometry:{ type:'Point', coordinates:[p.lon, p.lat, (zOrto!=null?zOrto:(zElip!=null?zElip:0))] } });
+    }
     for(const t of S.tracks) fc.features.push({ type:'Feature',
       properties:{ nombre:t.nom, distancia_m:Math.round(t.dist), puntos:t.pts.length },
       geometry:{ type:'LineString', coordinates:t.pts.map(q=>[q.lon,q.lat,q.alt||0]) } });
@@ -1178,8 +1236,9 @@ async function bajar(nom, txt, tipo){
 /* --- info --- */
 function panelInfo(){
   abrirPanel('Precisión y advertencias', `
-    <div class="nota" style="border-color:var(--sangre)">Este piloto NO es más preciso que tu Montana 680. Lee la posición que el sistema operativo le entrega al navegador: una fusión de GPS, wifi y celda, sin acceso al chip GNSS crudo. Sirve para validar el flujo de trabajo, las proyecciones y los tracks — no para ganar metros todavía.</div>
-    <div class="nota">Para superar al Montana hace falta app nativa: leer L5 (doble frecuencia), contar satélites, ver DOP y filtrar por constelación. Eso existe en Android vía GnssMeasurement pero no se expone al navegador.</div>
+    <div class="nota" style="border-color:var(--alerta)">Fuente de posición configurable (menú → Fuente): <b>Fusionada</b> (GPS+WiFi+celda, rápida) o <b>GPS puro</b> (solo satélites, GPS_PROVIDER nativo). En GPS puro se expone exactitud vertical, satélites, DOP y altura ortométrica.</div>
+    <div class="nota">Altura: se guarda la <b>ortométrica</b> (sobre el nivel del mar, la de dictámenes) cuando el sistema la calcula, además de la elipsoidal cruda. Bajo techo o sin cielo despejado la ortométrica puede no estar disponible.</div>
+    <div class="nota">Diagnóstico GNSS (menú): satélites por constelación, C/N0, bandas de frecuencia (L1/L5/...), HDOP/VDOP/PDOP. Exportá el CSV para comparar contra el Montana en un punto conocido.</div>
     <div class="nota">Lambert ↔ CRTM05 aquí usa Helmert de 7 parámetros (Ocotepeque→CR05, EPSG:6890), la misma ruta de QGIS. El método oficial del IGN es polinómico (CRTM90→CRTM98→CRTM05). Difieren de 1 a varios metros. No uses estos números para amojonamiento ni catastro sin verificar.</div>
     <div class="res"><div class="k">CRTM05 · EPSG:5367</div><div class="v" style="font-size:11px">TM · MC 84°O · lat0 0° · k 0,9999<br>FE 500000 · FN 0 · WGS84</div></div>
     <div class="res"><div class="k">Lambert Norte · EPSG:5456</div><div class="v" style="font-size:11px">LCC 1SP · lat0 10°28' · MC 84°20'O<br>k 0,99995696 · FE 500000 · FN 271820,522<br>Clarke 1866 · Ocotepeque 1935</div></div>
