@@ -1120,6 +1120,20 @@ const CONSTEL = {
   4:{n:'QZSS',c:'#B07CC6'}, 5:{n:'BeiDou',c:'#6FCF6F'}, 6:{n:'Galileo',c:'#E0A458'},
   7:{n:'IRNSS',c:'#E06AA0'}, 0:{n:'?',c:'#6E8B86'}
 };
+// Clasifica la frecuencia portadora (Hz) en banda GNSS.
+function bandDe(freqHz){
+  if(!freqHz) return null;
+  const m = freqHz/1e6;
+  if(Math.abs(m-1176.45)<10) return 'L5';   // GPS L5 / Galileo E5a / BeiDou B2a
+  if(Math.abs(m-1207.14)<8)  return 'E5b';  // Galileo E5b / BeiDou B2b
+  if(Math.abs(m-1202.025)<5) return 'L3';   // GLONASS L3
+  if(Math.abs(m-1227.60)<10) return 'L2';   // GPS L2C
+  if(Math.abs(m-1575.42)<10) return 'L1';   // GPS L1 / Galileo E1 / BeiDou B1C
+  if(Math.abs(m-1561.098)<5) return 'B1I';  // BeiDou B1I
+  if(m>1592 && m<1615)       return 'G1';   // GLONASS L1 (FDMA)
+  if(m>1240 && m<1256)       return 'G2';   // GLONASS L2 (FDMA)
+  return m.toFixed(0);
+}
 let gnssState = { satellites: [], location: null, dop: {}, gga: {}, listening: false };
 let diagSamples = [];
 let diagInterval = null;
@@ -1140,6 +1154,7 @@ async function panelDiagnosticos(){
         <div class="res"><div class="k">PDOP</div><div class="v" id="gnssPdop">—</div></div>
         <div class="res"><div class="k">Sep. geoide</div><div class="v" id="gnssGeoid">—</div></div>
       </div>
+      <div class="res" style="margin-top:8px"><div class="k">Bandas de frecuencia vistas</div><div class="v" id="gnssBandas" style="font-size:12px">—</div></div>
       <div style="display:flex;gap:8px;align-items:center;margin-top:10px">
         <div class="k" style="flex:1">Muestras: <span id="diagCount">0</span></div>
         <button class="mini verde" id="diagExport">Exportar CSV</button>
@@ -1181,10 +1196,23 @@ function updateGnssUI(data){
   gnssState.satellites = data.satellites || [];
   const total = data.count || 0;
   const used = data.usedInFix || 0;
-  const l5count = gnssState.satellites.filter(s=> s.isL5).length;
+  // Conteo de bandas por frecuencia portadora.
+  const tally = {};
+  for(const s of gnssState.satellites){
+    const b = bandDe(s.carrierFreq);
+    if(b) tally[b] = (tally[b]||0) + 1;
+  }
+  const l5count = tally['L5'] || 0;
   document.getElementById('gnssTotal').textContent = total;
   document.getElementById('gnssUsed').textContent = used;
   document.getElementById('gnssL5').textContent = l5count;
+  // Mostrar bandas ordenadas por cantidad, resaltando si hay L5.
+  const orden = Object.keys(tally).sort((a,b)=> tally[b]-tally[a]);
+  const bandasTxt = orden.length
+    ? orden.map(b=> `${b}×${tally[b]}`).join('  ·  ')
+    : 'sin datos de frecuencia';
+  const bEl = document.getElementById('gnssBandas');
+  if(bEl){ bEl.textContent = bandasTxt; bEl.style.color = l5count>0 ? 'var(--fix)' : 'var(--niebla)'; }
 
   // ordenar por C/N0 desc para leer los más fuertes primero
   const sats = gnssState.satellites.slice().sort((a,b)=> (b.cn0||0)-(a.cn0||0));
@@ -1227,27 +1255,30 @@ function tomarMuestraDiag(){
   const loc = gnssState.location; if(!loc) return;
   const sats = gnssState.satellites || [];
   const cn0s = sats.filter(s=> s.cn0>0).map(s=> s.cn0);
+  const tally = {};
+  for(const s of sats){ const b = bandDe(s.carrierFreq); if(b) tally[b]=(tally[b]||0)+1; }
+  const bandas = Object.keys(tally).sort((a,b)=> tally[b]-tally[a]).map(b=> `${b}x${tally[b]}`).join(' ');
   const row = {
     t: new Date().toISOString(),
     lat: loc.latitude, lon: loc.longitude,
     alt: loc.altitude, accH: loc.accuracy, accV: loc.verticalAccuracy,
     total: sats.length, usados: sats.filter(s=> s.usedInFix).length,
-    l5: sats.filter(s=> s.isL5).length,
+    l5: tally['L5'] || 0,
     cn0min: cn0s.length? Math.min(...cn0s):null, cn0max: cn0s.length? Math.max(...cn0s):null,
     hdop: gnssState.dop.hdop, vdop: gnssState.dop.vdop, pdop: gnssState.dop.pdop,
-    geoid: gnssState.gga.geoidSeparation, prov: loc.provider
+    geoid: gnssState.gga.geoidSeparation, prov: loc.provider, bandas: bandas
   };
   diagSamples.push(row);
   document.getElementById('diagCount').textContent = diagSamples.length;
 }
 function exportarDiagCSV(){
   if(!diagSamples.length){ toast('Sin muestras todavía. Esperá unos segundos.'); return; }
-  const enc = ['timestamp','lat','lon','altura_elip_m','exac_h_m','exac_v_m','sats_total','sats_usados','l5','cn0_min','cn0_max','hdop','vdop','pdop','geoide_m','proveedor'];
+  const enc = ['timestamp','lat','lon','altura_elip_m','exac_h_m','exac_v_m','sats_total','sats_usados','l5','cn0_min','cn0_max','hdop','vdop','pdop','geoide_m','proveedor','bandas'];
   const num = (v,d=6)=> v==null?'':(typeof v==='number'? v.toFixed(d):v);
   const filas = diagSamples.map(r=> [
     r.t, num(r.lat,7), num(r.lon,7), num(r.alt,1), num(r.accH,1), num(r.accV,1),
     r.total??'', r.usados??'', r.l5??'', num(r.cn0min,1), num(r.cn0max,1),
-    num(r.hdop,2), num(r.vdop,2), num(r.pdop,2), num(r.geoid,1), r.prov||''
+    num(r.hdop,2), num(r.vdop,2), num(r.pdop,2), num(r.geoid,1), r.prov||'', r.bandas||''
   ].join(','));
   bajar('diagnostico_gnss_'+new Date().toISOString().slice(0,19).replace(/[:T]/g,'-')+'.csv',
         enc.join(',')+'\n'+filas.join('\n'), 'text/csv');
