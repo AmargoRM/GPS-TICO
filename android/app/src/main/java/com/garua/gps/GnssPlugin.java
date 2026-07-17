@@ -1,6 +1,7 @@
 package com.garua.gps;
 
 import android.annotation.SuppressLint;
+import android.content.Intent;
 import android.location.GnssStatus;
 import android.location.Location;
 import android.location.LocationListener;
@@ -30,6 +31,74 @@ public class GnssPlugin extends Plugin {
     @Override
     public void load() {
         locationManager = (LocationManager) getContext().getSystemService(android.content.Context.LOCATION_SERVICE);
+        TrackServiceBridge.register(this);
+    }
+
+    @Override
+    protected void handleOnDestroy() {
+        TrackServiceBridge.unregister(this);
+        super.handleOnDestroy();
+    }
+
+    // ---- Servicio en primer plano para grabar con pantalla apagada (F4) ----
+
+    @PluginMethod
+    public void startForegroundTracking(PluginCall call) {
+        try {
+            String text = call.getString("text", "Grabando track…");
+            Intent i = new Intent(getContext(), TrackForegroundService.class);
+            i.putExtra(TrackForegroundService.EXTRA_TEXT, text);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                getContext().startForegroundService(i);
+            } else {
+                getContext().startService(i);
+            }
+            call.resolve(new JSObject().put("status", "started"));
+        } catch (Exception e) {
+            call.reject("No se pudo iniciar el servicio: " + e.getMessage());
+        }
+    }
+
+    @PluginMethod
+    public void stopForegroundTracking(PluginCall call) {
+        try {
+            Intent i = new Intent(getContext(), TrackForegroundService.class);
+            getContext().stopService(i);
+            call.resolve(new JSObject().put("status", "stopped"));
+        } catch (Exception e) {
+            call.reject("No se pudo detener el servicio: " + e.getMessage());
+        }
+    }
+
+    @PluginMethod
+    public void updateTrackingNotification(PluginCall call) {
+        try {
+            String text = call.getString("text", "Grabando track…");
+            TrackForegroundService.updateNotification(getContext(), text);
+            call.resolve();
+        } catch (Exception e) {
+            call.reject("No se pudo actualizar la notificación: " + e.getMessage());
+        }
+    }
+
+    @PluginMethod
+    public void requestNotifPermission(PluginCall call) {
+        try {
+            if (Build.VERSION.SDK_INT >= 33 && getActivity() != null) {
+                androidx.core.app.ActivityCompat.requestPermissions(
+                    getActivity(),
+                    new String[]{ android.Manifest.permission.POST_NOTIFICATIONS },
+                    9911);
+            }
+            call.resolve();
+        } catch (Exception e) {
+            call.resolve();
+        }
+    }
+
+    // Llamado desde la notificación (botón Detener) vía TrackServiceBridge.
+    public void onStopRequestedFromNotification() {
+        notifyListeners("stopTrackRequested", new JSObject());
     }
 
     @PluginMethod

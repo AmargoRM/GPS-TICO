@@ -758,6 +758,10 @@ async function arrancarGPS(){
       const cn = sats.filter(s=> s.usedInFix && s.cn0>0).map(s=> s.cn0);
       ultimoCn0Mean = cn.length ? cn.reduce((a,b)=>a+b,0)/cn.length : null;
     });
+    // Botón "Detener" de la notificación del servicio en primer plano.
+    await P.addListener('stopTrackRequested', async ()=>{
+      if(S.grabando) await alternarTrack();
+    });
   }
   await aplicarFuente();
 }
@@ -950,7 +954,16 @@ function grabarPunto(pos){
   S.grabando.geojson.properties = { nom: S.grabando.nom, dist: S.grabando.dist, puntos: pts.length };
   document.getElementById('mRec').textContent = S.grabando.dist.toFixed(0);
   if(pts.length % 10 === 0) dbPut('tracks', JSON.parse(JSON.stringify(S.grabando)));
+  // Actualizar la notificación del servicio cada 5 puntos.
+  if(pts.length % 5 === 0){
+    const P = pluginGnss();
+    if(P && P.updateTrackingNotification){
+      const min = Math.round((Date.now()-S.grabando.ini)/60000);
+      try{ P.updateTrackingNotification({ text: `${pts.length} pts · ${S.grabando.dist.toFixed(0)} m · ${min} min` }); }catch(e){}
+    }
+  }
 }
+let fuentePrevTrack = null;   // fuente a restaurar al terminar el track
 async function alternarTrack(){
   const b = document.getElementById('btnTrack');
   if(S.grabando){
@@ -958,7 +971,11 @@ async function alternarTrack(){
     toast(`Track guardado · ${S.grabando.pts.length} puntos · ${S.grabando.dist.toFixed(0)} m`);
     S.grabando = null;
     b.dataset.on = '0'; b.textContent = 'Grabar track';
+    await detenerServicioTrack();
     await liberarPantalla();
+    // Restaurar la fuente que el usuario tenía antes del track.
+    if(fuentePrevTrack && fuentePrevTrack !== S.fuente){ S.fuente = fuentePrevTrack; await aplicarFuente(); }
+    fuentePrevTrack = null;
     if(S.proy) await cargarProyecto(S.proy.id);
   } else {
     if(!S.proy){
@@ -970,9 +987,33 @@ async function alternarTrack(){
     S.grabando = { id:nid(), proy:S.proy.id, nom:'Track ' + new Date().toLocaleString('es-CR'), pts:[], dist:0, ini:Date.now(), geojson:{type:'Feature',geometry:{type:'LineString',coordinates:[]},properties:{}} };
     b.dataset.on = '1'; b.textContent = 'Detener';
     await mantenerPantalla();
-    toast('Grabando. La pantalla se mantiene encendida.');
+    await iniciarServicioTrack();
+    dibujar();
   }
   dibujar();
+}
+
+// Inicia el servicio en primer plano y fuerza GPS puro (lectura nativa fiable
+// con la pantalla apagada). Guarda la fuente previa para restaurarla al parar.
+async function iniciarServicioTrack(){
+  const P = pluginGnss();
+  if(!P){ toast('Grabando. (Pantalla encendida; sin servicio nativo)'); return; }
+  try{
+    await P.requestNotifPermission();
+    // GPS puro: la lectura nativa sigue en background; navigator.geolocation no.
+    if(S.fuente!=='gps'){ fuentePrevTrack = S.fuente; S.fuente='gps'; await aplicarFuente(); }
+    else fuentePrevTrack = null;
+    await P.startForegroundTracking({ text: 'Grabando… tocá para volver a la app' });
+    toast('Grabando. Podés apagar la pantalla; sigue registrando.');
+  }catch(e){
+    console.log('servicio track error', e);
+    toast('Grabando. (No se pudo iniciar el servicio de fondo)');
+  }
+}
+async function detenerServicioTrack(){
+  const P = pluginGnss();
+  if(!P) return;
+  try{ await P.stopForegroundTracking(); }catch(e){}
 }
 
 /* =======================================================================
