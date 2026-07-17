@@ -5,6 +5,7 @@ import android.location.GnssStatus;
 import android.location.Location;
 import android.location.LocationListener;
 import android.location.LocationManager;
+import android.location.OnNmeaMessageListener;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Looper;
@@ -23,6 +24,7 @@ public class GnssPlugin extends Plugin {
     private LocationManager locationManager;
     private GnssStatus.Callback gnssStatusCallback;
     private LocationListener locationListener;
+    private OnNmeaMessageListener nmeaListener;
     private boolean isListening = false;
 
     @Override
@@ -110,10 +112,22 @@ public class GnssPlugin extends Plugin {
                 public void onStatusChanged(String provider, int status, Bundle extras) {}
             };
 
+            // NMEA: parsea GSA (PDOP/HDOP/VDOP) y GGA (separación del geoide).
+            nmeaListener = new OnNmeaMessageListener() {
+                @Override
+                public void onNmeaMessage(String message, long timestamp) {
+                    parseNmea(message, timestamp);
+                }
+            };
+
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                 locationManager.registerGnssStatusCallback(
                     Executors.newSingleThreadExecutor(),
                     gnssStatusCallback
+                );
+                locationManager.addNmeaListener(
+                    Executors.newSingleThreadExecutor(),
+                    nmeaListener
                 );
             }
 
@@ -132,11 +146,58 @@ public class GnssPlugin extends Plugin {
         }
     }
 
+    // Parsea sentencias NMEA-0183 para extraer DOP y geoide.
+    // GSA: $--GSA,modo,fix,sv...(12),PDOP,HDOP,VDOP*cs
+    // GGA: $--GGA,hora,lat,N,lon,E,calidad,nSats,HDOP,altElip,M,geoide,M,...*cs
+    private void parseNmea(String message, long timestamp) {
+        if (message == null || message.length() < 6) return;
+        // El talker son 2 chars (GP, GN, GL...); el tipo de sentencia empieza en índice 3.
+        String type = message.substring(3, 6);
+        String[] f = message.split(",");
+        try {
+            if (type.equals("GSA") && f.length >= 18) {
+                JSObject dop = new JSObject();
+                dop.put("pdop", parseFloatSafe(f[15]));
+                dop.put("hdop", parseFloatSafe(f[16]));
+                // VDOP puede traer el checksum pegado: "1.5*3A"
+                String vdopStr = f[17].split("\\*")[0];
+                dop.put("vdop", parseFloatSafe(vdopStr));
+                JSObject data = new JSObject();
+                data.put("data", dop);
+                data.put("timestamp", System.currentTimeMillis());
+                notifyListeners("dop", data);
+            } else if (type.equals("GGA") && f.length >= 12) {
+                JSObject gga = new JSObject();
+                gga.put("hdop", parseFloatSafe(f[8]));
+                gga.put("altEllipsoidal", parseFloatSafe(f[9]));
+                gga.put("geoidSeparation", parseFloatSafe(f[11]));
+                gga.put("fixQuality", parseIntSafe(f[6]));
+                JSObject data = new JSObject();
+                data.put("data", gga);
+                data.put("timestamp", System.currentTimeMillis());
+                notifyListeners("gga", data);
+            }
+        } catch (Exception ignored) {}
+    }
+
+    private Double parseFloatSafe(String s) {
+        if (s == null || s.trim().isEmpty()) return null;
+        try { return Double.parseDouble(s.trim()); } catch (NumberFormatException e) { return null; }
+    }
+
+    private Integer parseIntSafe(String s) {
+        if (s == null || s.trim().isEmpty()) return null;
+        try { return Integer.parseInt(s.trim()); } catch (NumberFormatException e) { return null; }
+    }
+
     @PluginMethod
     public void stopGnssListener(PluginCall call) {
         try {
             if (gnssStatusCallback != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                 locationManager.unregisterGnssStatusCallback(gnssStatusCallback);
+            }
+            if (nmeaListener != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                locationManager.removeNmeaListener(nmeaListener);
             }
             if (locationListener != null) {
                 locationManager.removeUpdates(locationListener);

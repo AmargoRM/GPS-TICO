@@ -743,6 +743,7 @@ function abrirPanel(titulo, html){
 function cerrarPanel(){
   document.getElementById('panel').classList.remove('on');
   document.getElementById('velo').classList.remove('on');
+  if(diagCleanup){ const c = diagCleanup; diagCleanup = null; c(); }
 }
 document.getElementById('panelCerrar').onclick = cerrarPanel;
 document.getElementById('velo').onclick = cerrarPanel;
@@ -1088,35 +1089,67 @@ function panelInfo(){
 }
 
 /* --- diagnosticos gnss (F0) --- */
-let gnssState = { satellites: [], location: null, listening: false };
+// Constelaciones GnssStatus: 1=GPS 2=SBAS 3=GLONASS 4=QZSS 5=BEIDOU 6=GALILEO 7=IRNSS
+const CONSTEL = {
+  1:{n:'GPS',c:'#4FD1C5'}, 2:{n:'SBAS',c:'#8899AA'}, 3:{n:'GLONASS',c:'#C75146'},
+  4:{n:'QZSS',c:'#B07CC6'}, 5:{n:'BeiDou',c:'#6FCF6F'}, 6:{n:'Galileo',c:'#E0A458'},
+  7:{n:'IRNSS',c:'#E06AA0'}, 0:{n:'?',c:'#6E8B86'}
+};
+let gnssState = { satellites: [], location: null, dop: {}, gga: {}, listening: false };
+let diagSamples = [];
+let diagInterval = null;
+let diagCleanup = null;
+
 async function panelDiagnosticos(){
   abrirPanel('Diagnóstico GNSS (Fase 0)', `
     <div id="gnssStatus">
-      <div class="res"><div class="k">Satélites totales</div><div class="v" id="gnssTotal">—</div></div>
-      <div class="res"><div class="k">Satélites en fix</div><div class="v" id="gnssUsed">—</div></div>
-      <div class="res"><div class="k">L5 detectados</div><div class="v" id="gnssL5">—</div></div>
-      <div class="res"><div class="k">Exactitud horizontal</div><div class="v" id="gnssAccuracy">—</div></div>
-      <div class="res"><div class="k">Exactitud vertical</div><div class="v" id="gnssVAccuracy">—</div></div>
-      <div id="gnssSatList" style="margin-top:12px;font-size:11px;max-height:200px;overflow-y:auto;border:1px solid var(--cauce);border-radius:6px;padding:8px;"></div>
+      <div class="grid2">
+        <div class="res"><div class="k">Satélites totales</div><div class="v" id="gnssTotal">—</div></div>
+        <div class="res"><div class="k">En fix</div><div class="v" id="gnssUsed">—</div></div>
+        <div class="res"><div class="k">L5 detectados</div><div class="v" id="gnssL5">—</div></div>
+        <div class="res"><div class="k">Proveedor</div><div class="v" id="gnssProv" style="font-size:11px">—</div></div>
+        <div class="res"><div class="k">Exactitud horiz.</div><div class="v" id="gnssAccuracy">—</div></div>
+        <div class="res"><div class="k">Exactitud vert.</div><div class="v" id="gnssVAccuracy">—</div></div>
+        <div class="res"><div class="k">HDOP</div><div class="v" id="gnssHdop">—</div></div>
+        <div class="res"><div class="k">VDOP</div><div class="v" id="gnssVdop">—</div></div>
+        <div class="res"><div class="k">PDOP</div><div class="v" id="gnssPdop">—</div></div>
+        <div class="res"><div class="k">Sep. geoide</div><div class="v" id="gnssGeoid">—</div></div>
+      </div>
+      <div style="display:flex;gap:8px;align-items:center;margin-top:10px">
+        <div class="k" style="flex:1">Muestras: <span id="diagCount">0</span></div>
+        <button class="mini verde" id="diagExport">Exportar CSV</button>
+      </div>
+      <div id="gnssSatList" style="margin-top:12px;font-size:11px;max-height:260px;overflow-y:auto;border:1px solid var(--cauce);border-radius:6px;padding:8px;"></div>
+      <div class="nota">HDOP/VDOP vienen de NMEA (sentencia GSA). Si quedan en "—", tu chip no emite NMEA a la app; la exactitud en metros sí es fiable. Parate quieto ~1 min y exportá el CSV para comparar contra el Garmin.</div>
     </div>
   `);
-  if(window.Capacitor){
+  diagSamples = [];
+  document.getElementById('diagExport').onclick = exportarDiagCSV;
+
+  if(window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.Gnss){
     try {
       const Gnss = window.Capacitor.Plugins.Gnss;
       await Gnss.startGnssListener();
       gnssState.listening = true;
-      Gnss.addListener('gnssStatus', (data)=>{
-        updateGnssUI(data.data);
-      });
-      Gnss.addListener('location', (data)=>{
-        updateLocationUI(data.data);
-      });
+      const hSat = await Gnss.addListener('gnssStatus', (d)=> updateGnssUI(d.data));
+      const hLoc = await Gnss.addListener('location',   (d)=> updateLocationUI(d.data));
+      const hDop = await Gnss.addListener('dop',        (d)=> updateDopUI(d.data));
+      const hGga = await Gnss.addListener('gga',        (d)=> updateGgaUI(d.data));
+      // muestreo 1 Hz para el CSV
+      diagInterval = setInterval(tomarMuestraDiag, 1000);
+      // limpieza al cerrar el panel
+      diagCleanup = async ()=>{
+        if(diagInterval){ clearInterval(diagInterval); diagInterval = null; }
+        try{ hSat && hSat.remove(); hLoc && hLoc.remove(); hDop && hDop.remove(); hGga && hGga.remove(); }catch(e){}
+        try{ await Gnss.stopGnssListener(); }catch(e){}
+        gnssState.listening = false;
+      };
     } catch(e){
       console.log('GNSS plugin error:', e);
-      document.getElementById('gnssStatus').innerHTML = '<div class="nota" style="border-color:var(--sangre);">Plugin GNSS no disponible en este dispositivo o versión de Android. Requiere API 24+ (Android 7+).</div>';
+      document.getElementById('gnssStatus').innerHTML = '<div class="nota" style="border-color:var(--sangre);">Plugin GNSS no disponible. Requiere API 24+ (Android 7+) y permiso de ubicación.</div>';
     }
   } else {
-    document.getElementById('gnssStatus').innerHTML = '<div class="nota" style="border-color:var(--sangre);">Capacitor no disponible. Asegúrate de estar ejecutando desde el APK.</div>';
+    document.getElementById('gnssStatus').innerHTML = '<div class="nota" style="border-color:var(--sangre);">Capacitor no disponible. Ejecutá desde el APK, no desde el navegador.</div>';
   }
 }
 function updateGnssUI(data){
@@ -1124,24 +1157,75 @@ function updateGnssUI(data){
   const total = data.count || 0;
   const used = data.usedInFix || 0;
   const l5count = gnssState.satellites.filter(s=> s.isL5).length;
-
   document.getElementById('gnssTotal').textContent = total;
   document.getElementById('gnssUsed').textContent = used;
   document.getElementById('gnssL5').textContent = l5count;
 
+  // ordenar por C/N0 desc para leer los más fuertes primero
+  const sats = gnssState.satellites.slice().sort((a,b)=> (b.cn0||0)-(a.cn0||0));
   let satHtml = '';
-  for(const s of gnssState.satellites){
-    const freq = s.carrierFreq ? `${(s.carrierFreq/1e6).toFixed(2)}MHz` : '—';
-    const cn0 = s.cn0 ? `${s.cn0.toFixed(1)}dBHz` : '—';
-    const mark = s.isL5 ? ' 🟦' : '';
-    satHtml += `<div style="padding:4px 0;border-bottom:1px solid var(--cauce);font-family:var(--mono)">SV${String(s.svid).padStart(2,'0')} ${cn0} ${freq}${mark}</div>`;
+  for(const s of sats){
+    const con = CONSTEL[s.constellation] || CONSTEL[0];
+    const cn0 = s.cn0 || 0;
+    const w = Math.max(2, Math.min(100, cn0*2)); // 0-50 dBHz -> 0-100%
+    const freq = s.carrierFreq ? `${(s.carrierFreq/1e6).toFixed(0)}` : '';
+    const l5 = s.isL5 ? ' L5' : '';
+    const fixMark = s.usedInFix ? '●' : '○';
+    satHtml += `<div style="display:flex;align-items:center;gap:6px;padding:3px 0;font-family:var(--mono);font-size:10px">
+      <span style="color:${con.c};width:14px">${fixMark}</span>
+      <span style="width:58px">${con.n.slice(0,3)}${String(s.svid).padStart(2,'0')}</span>
+      <span style="flex:1;background:var(--cauce);height:8px;border-radius:4px;overflow:hidden"><i style="display:block;height:100%;width:${w}%;background:${con.c}"></i></span>
+      <span style="width:34px;text-align:right">${cn0?cn0.toFixed(0):'—'}</span>
+      <span style="width:30px;text-align:right;color:var(--musgo)">${freq}${l5}</span>
+    </div>`;
   }
-  document.getElementById('gnssSatList').innerHTML = satHtml || '<div style="color:var(--musgo);">Sin satélites visibles</div>';
+  document.getElementById('gnssSatList').innerHTML = satHtml || '<div style="color:var(--musgo);">Buscando satélites… (el primer fix GPS puro puede tardar 30-60s)</div>';
 }
 function updateLocationUI(data){
   gnssState.location = data;
-  document.getElementById('gnssAccuracy').textContent = data.accuracy ? `${data.accuracy.toFixed(1)}m` : '—';
+  document.getElementById('gnssAccuracy').textContent = data.accuracy!=null ? `${data.accuracy.toFixed(1)}m` : '—';
   document.getElementById('gnssVAccuracy').textContent = data.verticalAccuracy ? `${data.verticalAccuracy.toFixed(1)}m` : '—';
+  document.getElementById('gnssProv').textContent = data.provider || '—';
+}
+function updateDopUI(d){
+  gnssState.dop = d;
+  if(d.hdop!=null) document.getElementById('gnssHdop').textContent = d.hdop.toFixed(2);
+  if(d.vdop!=null) document.getElementById('gnssVdop').textContent = d.vdop.toFixed(2);
+  if(d.pdop!=null) document.getElementById('gnssPdop').textContent = d.pdop.toFixed(2);
+}
+function updateGgaUI(d){
+  gnssState.gga = d;
+  if(d.geoidSeparation!=null) document.getElementById('gnssGeoid').textContent = d.geoidSeparation.toFixed(1)+'m';
+  if(d.hdop!=null && document.getElementById('gnssHdop').textContent==='—') document.getElementById('gnssHdop').textContent = d.hdop.toFixed(2);
+}
+function tomarMuestraDiag(){
+  const loc = gnssState.location; if(!loc) return;
+  const sats = gnssState.satellites || [];
+  const cn0s = sats.filter(s=> s.cn0>0).map(s=> s.cn0);
+  const row = {
+    t: new Date().toISOString(),
+    lat: loc.latitude, lon: loc.longitude,
+    alt: loc.altitude, accH: loc.accuracy, accV: loc.verticalAccuracy,
+    total: sats.length, usados: sats.filter(s=> s.usedInFix).length,
+    l5: sats.filter(s=> s.isL5).length,
+    cn0min: cn0s.length? Math.min(...cn0s):null, cn0max: cn0s.length? Math.max(...cn0s):null,
+    hdop: gnssState.dop.hdop, vdop: gnssState.dop.vdop, pdop: gnssState.dop.pdop,
+    geoid: gnssState.gga.geoidSeparation, prov: loc.provider
+  };
+  diagSamples.push(row);
+  document.getElementById('diagCount').textContent = diagSamples.length;
+}
+function exportarDiagCSV(){
+  if(!diagSamples.length){ toast('Sin muestras todavía. Esperá unos segundos.'); return; }
+  const enc = ['timestamp','lat','lon','altura_elip_m','exac_h_m','exac_v_m','sats_total','sats_usados','l5','cn0_min','cn0_max','hdop','vdop','pdop','geoide_m','proveedor'];
+  const num = (v,d=6)=> v==null?'':(typeof v==='number'? v.toFixed(d):v);
+  const filas = diagSamples.map(r=> [
+    r.t, num(r.lat,7), num(r.lon,7), num(r.alt,1), num(r.accH,1), num(r.accV,1),
+    r.total??'', r.usados??'', r.l5??'', num(r.cn0min,1), num(r.cn0max,1),
+    num(r.hdop,2), num(r.vdop,2), num(r.pdop,2), num(r.geoid,1), r.prov||''
+  ].join(','));
+  bajar('diagnostico_gnss_'+new Date().toISOString().slice(0,19).replace(/[:T]/g,'-')+'.csv',
+        enc.join(',')+'\n'+filas.join('\n'), 'text/csv');
 }
 
 /* =======================================================================
