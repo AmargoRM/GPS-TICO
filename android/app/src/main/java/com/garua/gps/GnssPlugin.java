@@ -16,7 +16,6 @@ import com.getcapacitor.PluginCall;
 import com.getcapacitor.PluginMethod;
 import com.getcapacitor.annotation.CapacitorPlugin;
 
-import org.json.JSONException;
 import java.util.concurrent.Executors;
 
 @CapacitorPlugin(name = "Gnss")
@@ -43,43 +42,39 @@ public class GnssPlugin extends Plugin {
             gnssStatusCallback = new GnssStatus.Callback() {
                 @Override
                 public void onSatelliteStatusChanged(GnssStatus status) {
-                    try {
-                        JSObject satellites = new JSObject();
-                        JSArray sats = new JSArray();
-                        int usedCount = 0;
+                    JSObject satellites = new JSObject();
+                    JSArray sats = new JSArray();
+                    int usedCount = 0;
 
-                        for (int i = 0; i < status.getSatelliteCount(); i++) {
-                            JSObject sat = new JSObject();
-                            sat.put("svid", status.getSvid(i));
-                            sat.put("constellation", status.getConstellationType(i));
-                            sat.put("cn0", status.getCn0DbHz(i));
-                            sat.put("elevation", status.getElevationDegrees(i));
-                            sat.put("azimuth", status.getAzimuthDegrees(i));
+                    for (int i = 0; i < status.getSatelliteCount(); i++) {
+                        JSObject sat = new JSObject();
+                        sat.put("svid", status.getSvid(i));
+                        sat.put("constellation", status.getConstellationType(i));
+                        sat.put("cn0", status.getCn0DbHz(i));
+                        sat.put("elevation", status.getElevationDegrees(i));
+                        sat.put("azimuth", status.getAzimuthDegrees(i));
 
-                            boolean used = status.usedInFix(i);
-                            sat.put("usedInFix", used);
-                            if (used) usedCount++;
+                        boolean used = status.usedInFix(i);
+                        sat.put("usedInFix", used);
+                        if (used) usedCount++;
 
-                            if (status.hasCarrierFrequencyHz(i)) {
-                                long freqHz = (long) status.getCarrierFrequencyHz(i);
-                                sat.put("carrierFreq", freqHz);
-                                sat.put("isL5", Math.abs(freqHz - 1176450000L) < 100000);
-                            }
-
-                            sats.put(sat);
+                        if (status.hasCarrierFrequencyHz(i)) {
+                            long freqHz = (long) status.getCarrierFrequencyHz(i);
+                            sat.put("carrierFreq", freqHz);
+                            sat.put("isL5", Math.abs(freqHz - 1176450000L) < 100000);
                         }
 
-                        satellites.put("count", status.getSatelliteCount());
-                        satellites.put("usedInFix", usedCount);
-                        satellites.put("satellites", sats);
-
-                        JSObject data = new JSObject();
-                        data.put("data", satellites);
-                        data.put("timestamp", System.currentTimeMillis());
-                        notifyListeners("gnssStatus", data);
-                    } catch (JSONException e) {
-                        e.printStackTrace();
+                        sats.put(sat);
                     }
+
+                    satellites.put("count", status.getSatelliteCount());
+                    satellites.put("usedInFix", usedCount);
+                    satellites.put("satellites", sats);
+
+                    JSObject data = new JSObject();
+                    data.put("data", satellites);
+                    data.put("timestamp", System.currentTimeMillis());
+                    notifyListeners("gnssStatus", data);
                 }
             };
 
