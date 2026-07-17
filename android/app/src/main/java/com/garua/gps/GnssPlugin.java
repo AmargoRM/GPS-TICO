@@ -1,5 +1,6 @@
 package com.garua.gps;
 
+import android.annotation.SuppressLint;
 import android.location.GnssStatus;
 import android.location.Location;
 import android.location.LocationListener;
@@ -12,6 +13,7 @@ import com.getcapacitor.JSArray;
 import com.getcapacitor.JSObject;
 import com.getcapacitor.Plugin;
 import com.getcapacitor.PluginCall;
+import com.getcapacitor.PluginMethod;
 import com.getcapacitor.annotation.CapacitorPlugin;
 
 import org.json.JSONException;
@@ -29,6 +31,8 @@ public class GnssPlugin extends Plugin {
         locationManager = (LocationManager) getContext().getSystemService(android.content.Context.LOCATION_SERVICE);
     }
 
+    @PluginMethod
+    @SuppressLint("MissingPermission")
     public void startGnssListener(PluginCall call) {
         try {
             if (isListening) {
@@ -42,6 +46,7 @@ public class GnssPlugin extends Plugin {
                     try {
                         JSObject satellites = new JSObject();
                         JSArray sats = new JSArray();
+                        int usedCount = 0;
 
                         for (int i = 0; i < status.getSatelliteCount(); i++) {
                             JSObject sat = new JSObject();
@@ -50,6 +55,10 @@ public class GnssPlugin extends Plugin {
                             sat.put("cn0", status.getCn0DbHz(i));
                             sat.put("elevation", status.getElevationDegrees(i));
                             sat.put("azimuth", status.getAzimuthDegrees(i));
+
+                            boolean used = status.usedInFix(i);
+                            sat.put("usedInFix", used);
+                            if (used) usedCount++;
 
                             if (status.hasCarrierFrequencyHz(i)) {
                                 long freqHz = (long) status.getCarrierFrequencyHz(i);
@@ -61,7 +70,7 @@ public class GnssPlugin extends Plugin {
                         }
 
                         satellites.put("count", status.getSatelliteCount());
-                        satellites.put("usedInFix", status.getUsedInFixCount());
+                        satellites.put("usedInFix", usedCount);
                         satellites.put("satellites", sats);
 
                         JSObject data = new JSObject();
@@ -128,6 +137,7 @@ public class GnssPlugin extends Plugin {
         }
     }
 
+    @PluginMethod
     public void stopGnssListener(PluginCall call) {
         try {
             if (gnssStatusCallback != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
@@ -143,6 +153,8 @@ public class GnssPlugin extends Plugin {
         }
     }
 
+    @PluginMethod
+    @SuppressLint("MissingPermission")
     public void getLastKnownLocation(PluginCall call) {
         try {
             Location location = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER);
