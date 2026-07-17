@@ -353,6 +353,40 @@ const dbDel   = (s,k)=> pedir(tx(s,'readwrite').delete(k));
 const porIndice = (s,i,v)=> pedir(tx(s).index(i).getAll(v));
 const nid = ()=> Date.now().toString(36) + Math.random().toString(36).slice(2,7);
 
+// Conversión a GeoJSON
+function puntoAFeature(p){
+  return { type:'Feature', geometry:{type:'Point',coordinates:[p.lon,p.lat]},
+    properties:{id:p.id,proy:p.proy,nom:p.nom,alt:p.alt,exac:p.exac,t:p.t,timestamp:p.timestamp||p.t} };
+}
+function trackAFeature(t){
+  const coords = t.pts.map(p=>[p.lon,p.lat]);
+  return { type:'Feature', geometry:{type:'LineString',coordinates:coords},
+    properties:{id:t.id,proy:t.proy,nom:t.nom,dist:t.dist,ini:t.ini,puntos:t.pts.length} };
+}
+async function migrarAGeoJSON(){
+  const migrado = await dbGet('conf','geojson_v1');
+  if(migrado) return;
+  try{
+    const tracks = await dbAll('tracks');
+    for(const t of tracks){
+      if(!t.geojson){
+        const feature = trackAFeature(t);
+        t.geojson = feature;
+        await dbPut('tracks', t);
+      }
+    }
+    const puntos = await dbAll('puntos');
+    for(const p of puntos){
+      if(!p.geojson){
+        const feature = puntoAFeature(p);
+        p.geojson = feature;
+        await dbPut('puntos', p);
+      }
+    }
+    await dbPut('conf', true, 'geojson_v1');
+  }catch(e){ console.error('Migración GeoJSON:', e); }
+}
+
 /* =======================================================================
    3. ESTADO
    ======================================================================= */
@@ -413,7 +447,15 @@ async function tile(z,x,y,capa){
   try{
     let blob = await dbGet('tiles', k);
     if(!blob){
-      pidiendo.delete(k); return null;
+      if(!navigator.onLine) { pidiendo.delete(k); return null; }
+      try{
+        const r = await fetch(CAPAS[capa].url(z,x,y), {signal: AbortSignal.timeout(5000)});
+        if(!r.ok) throw 0;
+        blob = await r.blob();
+        dbPut('tiles', blob, k).catch(()=>{});
+      }catch(e){
+        pidiendo.delete(k); return null;
+      }
     }
     const img = await createImageBitmap(blob);
     if(memTiles.size > 400){ for(const kk of Array.from(memTiles.keys()).slice(0,150)) memTiles.delete(kk); }
@@ -452,24 +494,13 @@ function dibujar(){
     }
   }
   if(!hayTiles){
-    ctx.fillStyle = '#6E8B8633';
-    ctx.font = '10px ' + getComputedStyle(document.body).fontFamily;
+    ctx.fillStyle = '#0A1214';
+    ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = '#6E8B8666';
+    ctx.font = '12px ' + getComputedStyle(document.body).fontFamily;
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
-    const gridSize = Math.pow(2, Math.max(0, 8 - Math.round(S.zoom)));
-    for(let ty=ty0-1; ty<=ty1+1; ty++){
-      for(let tx=tx0-1; tx<=tx1+1; tx++){
-        const lat = px2lat(ty*256, zi);
-        const lon = px2lon(tx*256, zi);
-        const sx = (tx*256 - x0)*esc, sy = (ty*256 - y0)*esc;
-        ctx.strokeStyle = '#6E8B8666';
-        ctx.lineWidth = 1;
-        ctx.strokeRect(Math.round(sx), Math.round(sy), Math.ceil(ts), Math.ceil(ts));
-        ctx.fillStyle = '#DCE6E4';
-        ctx.fillText(lat.toFixed(2) + '°', Math.round(sx + ts/2), Math.round(sy + ts/3));
-        ctx.fillText(lon.toFixed(2) + '°', Math.round(sx + ts/2), Math.round(sy + 2*ts/3));
-      }
-    }
+    ctx.fillText('(mapa sin conexión)', W/2, H/2);
   }
   const aPant = (lat,lon)=>({
     x: (lon2px(lon,zi) - x0)*esc,
@@ -659,7 +690,10 @@ function grabarPunto(pos){
     if(d < FILTRO.distMin) return;
     S.grabando.dist += d;
   }
-  pts.push({ lat:c.latitude, lon:c.longitude, alt:c.altitude, exac:c.accuracy, t:pos.timestamp });
+  const pt = { lat:c.latitude, lon:c.longitude, alt:c.altitude, exac:c.accuracy, t:pos.timestamp };
+  pts.push(pt);
+  S.grabando.geojson.geometry.coordinates.push([pt.lon, pt.lat]);
+  S.grabando.geojson.properties = { nom: S.grabando.nom, dist: S.grabando.dist, puntos: pts.length };
   document.getElementById('mRec').textContent = S.grabando.dist.toFixed(0);
   if(pts.length % 10 === 0) dbPut('tracks', JSON.parse(JSON.stringify(S.grabando)));
 }
@@ -679,7 +713,7 @@ async function alternarTrack(){
       S.proy = proy;
       document.getElementById('proyBtn').querySelector('.val').textContent = proy.nom;
     }
-    S.grabando = { id:nid(), proy:S.proy.id, nom:'Track ' + new Date().toLocaleString('es-CR'), pts:[], dist:0, ini:Date.now() };
+    S.grabando = { id:nid(), proy:S.proy.id, nom:'Track ' + new Date().toLocaleString('es-CR'), pts:[], dist:0, ini:Date.now(), geojson:{type:'Feature',geometry:{type:'LineString',coordinates:[]},properties:{}} };
     b.dataset.on = '1'; b.textContent = 'Detener';
     await mantenerPantalla();
     toast('Grabando. La pantalla se mantiene encendida.');
@@ -1048,6 +1082,7 @@ function panelInfo(){
    ======================================================================= */
 (async ()=>{
   await abrirDB();
+  await migrarAGeoJSON();
   S.modo = await dbGet('conf','modo') || 'geo';
   S.capa = await dbGet('conf','capa') || 'sat';
   document.querySelectorAll('#modo button').forEach(b=> b.setAttribute('aria-pressed', b.dataset.m===S.modo));
