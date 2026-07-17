@@ -7,8 +7,9 @@ import com.getcapacitor.BridgeActivity;
 public class MainActivity extends BridgeActivity {
     @Override
     public void onCreate(Bundle savedInstanceState) {
-        // Registrar el plugin nativo de pantalla encendida antes de super.
+        // Registrar plugins nativos antes de super.
         registerPlugin(KeepAwakePlugin.class);
+        registerPlugin(GnssPlugin.class);
         super.onCreate(savedInstanceState);
     }
 }

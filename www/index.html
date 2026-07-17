@@ -794,12 +794,14 @@ document.getElementById('btnWp').onclick = ()=>{
 /* --- menú --- */
 document.getElementById('btnMenu').onclick = ()=>{
   abrirPanel('Menú', `
+    <div class="fila"><div class="cuerpo"><div class="t">Diagnóstico GNSS</div><div class="s">Satélites, L5, exactitud</div></div><button class="mini" id="mDiag">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Puntos y tracks</div><div class="s">${S.puntos.length} puntos · ${S.tracks.length} tracks</div></div><button class="mini" id="mDatos">Ver</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Convertir coordenadas</div><div class="s">Geo ↔ CRTM05 ↔ Lambert N/S</div></div><button class="mini" id="mConv">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Mapa sin conexión</div><div class="s">Descargar el área visible</div></div><button class="mini" id="mOff">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Exportar proyecto</div><div class="s">GPX · CSV · GeoJSON</div></div><button class="mini" id="mExp">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Precisión y advertencias</div><div class="s">Leer antes de usar en expedientes</div></div><button class="mini" id="mInfo">Abrir</button></div>
   `);
+  document.getElementById('mDiag').onclick  = panelDiagnosticos;
   document.getElementById('mDatos').onclick = panelDatos;
   document.getElementById('mConv').onclick  = panelConv;
   document.getElementById('mOff').onclick   = panelOffline;
@@ -1075,6 +1077,63 @@ function panelInfo(){
     <div class="res"><div class="k">Lambert Sur · EPSG:5457</div><div class="v" style="font-size:11px">LCC 1SP · lat0 9°00' · MC 83°40'O<br>k 0,99995696 · FE 500000 · FN 327987,436</div></div>
     <div class="nota">Cartografía: Esri World Imagery (Esri, Maxar, Earthstar Geographics) y OpenStreetMap (© colaboradores de OSM, ODbL). Los tiles de Google no se usan porque sus términos prohíben la descarga para uso sin conexión.</div>
   `);
+}
+
+/* --- diagnosticos gnss (F0) --- */
+let gnssState = { satellites: [], location: null, listening: false };
+async function panelDiagnosticos(){
+  abrirPanel('Diagnóstico GNSS (Fase 0)', `
+    <div id="gnssStatus">
+      <div class="res"><div class="k">Satélites totales</div><div class="v" id="gnssTotal">—</div></div>
+      <div class="res"><div class="k">Satélites en fix</div><div class="v" id="gnssUsed">—</div></div>
+      <div class="res"><div class="k">L5 detectados</div><div class="v" id="gnssL5">—</div></div>
+      <div class="res"><div class="k">Exactitud horizontal</div><div class="v" id="gnssAccuracy">—</div></div>
+      <div class="res"><div class="k">Exactitud vertical</div><div class="v" id="gnssVAccuracy">—</div></div>
+      <div id="gnssSatList" style="margin-top:12px;font-size:11px;max-height:200px;overflow-y:auto;border:1px solid var(--cauce);border-radius:6px;padding:8px;"></div>
+    </div>
+  `);
+  if(window.Capacitor){
+    try {
+      const Gnss = window.Capacitor.Plugins.Gnss;
+      await Gnss.startGnssListener();
+      gnssState.listening = true;
+      Gnss.addListener('gnssStatus', (data)=>{
+        updateGnssUI(data.data);
+      });
+      Gnss.addListener('location', (data)=>{
+        updateLocationUI(data.data);
+      });
+    } catch(e){
+      console.log('GNSS plugin error:', e);
+      document.getElementById('gnssStatus').innerHTML = '<div class="nota" style="border-color:var(--sangre);">Plugin GNSS no disponible en este dispositivo o versión de Android. Requiere API 24+ (Android 7+).</div>';
+    }
+  } else {
+    document.getElementById('gnssStatus').innerHTML = '<div class="nota" style="border-color:var(--sangre);">Capacitor no disponible. Asegúrate de estar ejecutando desde el APK.</div>';
+  }
+}
+function updateGnssUI(data){
+  gnssState.satellites = data.satellites || [];
+  const total = data.count || 0;
+  const used = data.usedInFix || 0;
+  const l5count = gnssState.satellites.filter(s=> s.isL5).length;
+
+  document.getElementById('gnssTotal').textContent = total;
+  document.getElementById('gnssUsed').textContent = used;
+  document.getElementById('gnssL5').textContent = l5count;
+
+  let satHtml = '';
+  for(const s of gnssState.satellites){
+    const freq = s.carrierFreq ? `${(s.carrierFreq/1e6).toFixed(2)}MHz` : '—';
+    const cn0 = s.cn0 ? `${s.cn0.toFixed(1)}dBHz` : '—';
+    const mark = s.isL5 ? ' 🟦' : '';
+    satHtml += `<div style="padding:4px 0;border-bottom:1px solid var(--cauce);font-family:var(--mono)">SV${String(s.svid).padStart(2,'0')} ${cn0} ${freq}${mark}</div>`;
+  }
+  document.getElementById('gnssSatList').innerHTML = satHtml || '<div style="color:var(--musgo);">Sin satélites visibles</div>';
+}
+function updateLocationUI(data){
+  gnssState.location = data;
+  document.getElementById('gnssAccuracy').textContent = data.accuracy ? `${data.accuracy.toFixed(1)}m` : '—';
+  document.getElementById('gnssVAccuracy').textContent = data.verticalAccuracy ? `${data.verticalAccuracy.toFixed(1)}m` : '—';
 }
 
 /* =======================================================================
