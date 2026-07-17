@@ -436,7 +436,9 @@ function medir(){
   dibujar();
 }
 
-async function tile(z,x,y,capa){
+// tile() es SINCRÓNICA: devuelve el tile de la caché en RAM si está,
+// o null y dispara la carga en segundo plano (que al terminar redibuja).
+function tile(z,x,y,capa){
   const n = 2**z;
   x = ((x%n)+n)%n;
   if(y<0 || y>=n) return null;
@@ -444,17 +446,21 @@ async function tile(z,x,y,capa){
   if(memTiles.has(k)) return memTiles.get(k);
   if(pidiendo.has(k)) return null;
   pidiendo.add(k);
+  cargarTile(z,x,y,capa,k);
+  return null;
+}
+async function cargarTile(z,x,y,capa,k){
   try{
     let blob = await dbGet('tiles', k);
     if(!blob){
-      if(!navigator.onLine) { pidiendo.delete(k); return null; }
+      if(!navigator.onLine){ pidiendo.delete(k); return; }
       try{
-        const r = await fetch(CAPAS[capa].url(z,x,y), {signal: AbortSignal.timeout(5000)});
+        const r = await fetch(CAPAS[capa].url(z,x,y), {signal: AbortSignal.timeout(8000)});
         if(!r.ok) throw 0;
         blob = await r.blob();
         dbPut('tiles', blob, k).catch(()=>{});
       }catch(e){
-        pidiendo.delete(k); return null;
+        pidiendo.delete(k); return;
       }
     }
     const img = await createImageBitmap(blob);
@@ -462,8 +468,7 @@ async function tile(z,x,y,capa){
     memTiles.set(k, img);
     pidiendo.delete(k);
     dibujar();
-    return img;
-  }catch(e){ pidiendo.delete(k); return null; }
+  }catch(e){ pidiendo.delete(k); }
 }
 
 function dibujar(){
@@ -790,6 +795,9 @@ document.getElementById('btnWp').onclick = ()=>{
     toast('Punto guardado.');
   };
 };
+
+/* --- grabar track --- */
+document.getElementById('btnTrack').onclick = alternarTrack;
 
 /* --- menú --- */
 document.getElementById('btnMenu').onclick = ()=>{
