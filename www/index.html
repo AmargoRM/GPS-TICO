@@ -394,6 +394,7 @@ const S = {
   modo: 'geo',
   capa: 'sat',
   fuente: 'fused',     // fuente de posición: 'fused' | 'gps' (F1)
+  filtros: { activo:false, preset:'normal', hdopMax:5, satMin:6, exacMax:10, cn0Min:20, avisar:true }, // F5
   proy: null,          // proyecto activo
   fix: null,           // último fix normalizado (coords + metadatos)
   grabando: null,      // track en curso
@@ -676,6 +677,7 @@ let ultimoGeoide = null;      // separación del geoide más reciente (NMEA), me
 let ultimoMslNmea = null;     // altura ortométrica más reciente vía NMEA GGA, metros
 let ultimoHdop = null;        // HDOP más reciente (NMEA), para promediado
 let ultimoCn0Mean = null;     // C/N0 medio de satélites en fix, para promediado
+let ultimoSatsUsados = null;  // satélites usados en el fix, para filtros (F5)
 
 function pluginGnss(){ return window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.Gnss; }
 
@@ -755,7 +757,9 @@ async function arrancarGPS(){
     });
     mainStatSub = await P.addListener('gnssStatus', (ev)=>{
       const sats = (ev.data && ev.data.satellites) || [];
-      const cn = sats.filter(s=> s.usedInFix && s.cn0>0).map(s=> s.cn0);
+      const usados = sats.filter(s=> s.usedInFix);
+      ultimoSatsUsados = (ev.data && ev.data.usedInFix!=null) ? ev.data.usedInFix : usados.length;
+      const cn = usados.filter(s=> s.cn0>0).map(s=> s.cn0);
       ultimoCn0Mean = cn.length ? cn.reduce((a,b)=>a+b,0)/cn.length : null;
     });
     // Botón "Detener" de la notificación del servicio en primer plano.
@@ -769,8 +773,10 @@ function alFix(pos){
   S.fix = pos;
   const c = pos.coords;
   const src = pos.fuente==='gps' ? 'GPS PURO' : 'FUSED';
-  document.getElementById('estadoRed').textContent =
-    (navigator.onLine ? 'EN LÍNEA' : 'SIN RED') + ' · ' + src + ' · FIX ' + new Date(pos.timestamp).toLocaleTimeString('es-CR',{hour12:false});
+  let estado = (navigator.onLine ? 'EN LÍNEA' : 'SIN RED') + ' · ' + src + ' · FIX ' + new Date(pos.timestamp).toLocaleTimeString('es-CR',{hour12:false});
+  if(S.grabando && S.filtros && S.filtros.activo)
+    estado += ` · ✓${S.grabando.aceptados||0} ✗${S.grabando.rechazados||0}`;
+  document.getElementById('estadoRed').textContent = estado;
   const f = fmtCoord(c.latitude, c.longitude, S.modo);
   document.getElementById('coordSys').textContent = PROY[S.modo].nom;
   document.getElementById('coordA').textContent = f.a;
@@ -936,7 +942,17 @@ function cancelarOcupacion(){
 const FILTRO = { exacMax: 30, distMin: 3 };
 function grabarPunto(pos){
   const c = pos.coords;
-  if(c.accuracy > FILTRO.exacMax) return;
+  // Filtro de calidad configurable (F5). Si está apagado, mantiene el
+  // límite de seguridad histórico de 30 m.
+  if(S.filtros && S.filtros.activo){
+    if(!pasaFiltros(pos)){
+      S.grabando.rechazados = (S.grabando.rechazados||0) + 1;
+      if(S.filtros.avisar) avisarRechazo();
+      return;
+    }
+  } else if(c.accuracy > FILTRO.exacMax){
+    return;
+  }
   const pts = S.grabando.pts;
   const ult = pts[pts.length-1];
   if(ult){
@@ -944,6 +960,7 @@ function grabarPunto(pos){
     if(d < FILTRO.distMin) return;
     S.grabando.dist += d;
   }
+  S.grabando.aceptados = (S.grabando.aceptados||0) + 1;
   const pt = { lat:c.latitude, lon:c.longitude, alt:c.altitude, exac:c.accuracy,
                vexac: pos.vexac!=null?pos.vexac:null, fuente: pos.fuente||'fused',
                altElip: pos.altElip!=null?pos.altElip:null, altOrto: pos.altOrto!=null?pos.altOrto:null,
@@ -968,7 +985,8 @@ async function alternarTrack(){
   const b = document.getElementById('btnTrack');
   if(S.grabando){
     await dbPut('tracks', JSON.parse(JSON.stringify(S.grabando)));
-    toast(`Track guardado · ${S.grabando.pts.length} puntos · ${S.grabando.dist.toFixed(0)} m`);
+    const rech = S.grabando.rechazados||0;
+    toast(`Track guardado · ${S.grabando.pts.length} puntos · ${S.grabando.dist.toFixed(0)} m` + (rech?` · ${rech} filtrados`:''));
     S.grabando = null;
     b.dataset.on = '0'; b.textContent = 'Grabar track';
     await detenerServicioTrack();
@@ -984,7 +1002,10 @@ async function alternarTrack(){
       S.proy = proy;
       document.getElementById('proyBtn').querySelector('.val').textContent = proy.nom;
     }
-    S.grabando = { id:nid(), proy:S.proy.id, nom:'Track ' + new Date().toLocaleString('es-CR'), pts:[], dist:0, ini:Date.now(), geojson:{type:'Feature',geometry:{type:'LineString',coordinates:[]},properties:{}} };
+    S.grabando = { id:nid(), proy:S.proy.id, nom:'Track ' + new Date().toLocaleString('es-CR'), pts:[], dist:0, ini:Date.now(),
+      aceptados:0, rechazados:0,
+      filtroConfig: (S.filtros && S.filtros.activo) ? JSON.parse(JSON.stringify(S.filtros)) : null,
+      geojson:{type:'Feature',geometry:{type:'LineString',coordinates:[]},properties:{}} };
     b.dataset.on = '1'; b.textContent = 'Detener';
     await mantenerPantalla();
     await iniciarServicioTrack();
@@ -1129,6 +1150,7 @@ document.getElementById('btnMenu').onclick = ()=>{
   abrirPanel('Menú', `
     <div class="fila"><div class="cuerpo"><div class="t">Fuente de posición</div><div class="s">${S.fuente==='gps'?'GPS puro (nativo)':'Fusionada (GPS+WiFi+celda)'}</div></div><button class="mini" id="mFuente">Cambiar</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Diagnóstico GNSS</div><div class="s">Satélites, L5, exactitud</div></div><button class="mini" id="mDiag">Abrir</button></div>
+    <div class="fila"><div class="cuerpo"><div class="t">Filtros de calidad</div><div class="s">${S.filtros.activo?'Activo · '+S.filtros.preset:'Apagado'}</div></div><button class="mini" id="mFilt">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Puntos y tracks</div><div class="s">${S.puntos.length} puntos · ${S.tracks.length} tracks</div></div><button class="mini" id="mDatos">Ver</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Convertir coordenadas</div><div class="s">Geo ↔ CRTM05 ↔ Lambert N/S</div></div><button class="mini" id="mConv">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Mapa sin conexión</div><div class="s">Descargar el área visible</div></div><button class="mini" id="mOff">Abrir</button></div>
@@ -1137,6 +1159,7 @@ document.getElementById('btnMenu').onclick = ()=>{
   `);
   document.getElementById('mFuente').onclick = panelFuente;
   document.getElementById('mDiag').onclick  = panelDiagnosticos;
+  document.getElementById('mFilt').onclick  = panelFiltros;
   document.getElementById('mDatos').onclick = panelDatos;
   document.getElementById('mConv').onclick  = panelConv;
   document.getElementById('mOff').onclick   = panelOffline;
@@ -1206,7 +1229,7 @@ async function panelDatos(){
       </div>`;
     }).join('')}
     ${S.tracks.map(t=>`<div class="fila">
-      <div class="cuerpo"><div class="t">${t.nom}</div><div class="s">${t.pts.length} pts · ${t.dist.toFixed(0)} m</div></div>
+      <div class="cuerpo"><div class="t">${t.nom}</div><div class="s">${t.pts.length} pts · ${t.dist.toFixed(0)} m${t.rechazados?` · ${t.rechazados} filtrados`:''}</div></div>
       <button class="mini rojo" data-dt="${t.id}">×</button>
     </div>`).join('')}
   `);
@@ -1409,7 +1432,9 @@ function panelExport(){
         geometry:{ type:'Point', coordinates:[p.lon, p.lat, (zOrto!=null?zOrto:(zElip!=null?zElip:0))] } });
     }
     for(const t of S.tracks) fc.features.push({ type:'Feature',
-      properties:{ nombre:t.nom, distancia_m:Math.round(t.dist), puntos:t.pts.length },
+      properties:{ nombre:t.nom, distancia_m:Math.round(t.dist), puntos:t.pts.length,
+        puntos_aceptados:(t.aceptados!=null?t.aceptados:null), puntos_filtrados:(t.rechazados!=null?t.rechazados:null),
+        filtro: t.filtroConfig ? `HDOP<=${t.filtroConfig.hdopMax} sat>=${t.filtroConfig.satMin} exac<=${t.filtroConfig.exacMax}m CN0>=${t.filtroConfig.cn0Min}` : null },
       geometry:{ type:'LineString', coordinates:t.pts.map(q=>[q.lon,q.lat,q.alt||0]) } });
     bajar(S.proy.nom+'.geojson', JSON.stringify(fc,null,1), 'application/geo+json');
   };
@@ -1428,9 +1453,12 @@ async function bajar(nom, txt, tipo){
         encoding: 'utf8'
       });
       if(P.Share){
-        await P.Share.share({ title: safe, text: safe, url: res.uri, dialogTitle: 'Guardar o compartir ' + safe });
+        // IMPORTANTE: compartir SOLO el archivo (url). Si se manda 'text'
+        // junto, con extensiones que Android no reconoce (.gpx/.geojson) el
+        // menú prioriza el texto y descarta el archivo.
+        await P.Share.share({ title: safe, url: res.uri, dialogTitle: 'Guardar o compartir ' + safe });
       } else {
-        toast('Guardado: ' + safe);
+        toast('Guardado en caché: ' + safe);
       }
       return;
     }catch(e){
@@ -1481,6 +1509,63 @@ function panelFuente(){
     S.fuente = 'gps'; await aplicarFuente();
     toast('Fuente: GPS puro. El primer fix puede tardar; salí a cielo abierto.'); cerrarPanel();
   };
+}
+
+/* --- filtros de calidad (F5) --- */
+const PRESETS_FILTRO = {
+  suave:  { hdopMax:8, satMin:4, exacMax:20, cn0Min:15 },
+  normal: { hdopMax:5, satMin:6, exacMax:10, cn0Min:20 },
+  estricto:{ hdopMax:2, satMin:8, exacMax:5,  cn0Min:30 }
+};
+async function guardarFiltros(){ await dbPut('conf', JSON.parse(JSON.stringify(S.filtros)), 'filtros'); }
+function aplicarPresetFiltro(nombre){
+  const p = PRESETS_FILTRO[nombre];
+  if(p){ S.filtros.preset=nombre; S.filtros.hdopMax=p.hdopMax; S.filtros.satMin=p.satMin; S.filtros.exacMax=p.exacMax; S.filtros.cn0Min=p.cn0Min; }
+}
+function panelFiltros(){
+  const F = S.filtros;
+  abrirPanel('Filtros de calidad', `
+    <div class="fila"><div class="cuerpo"><div class="t">Filtrar durante la grabación</div><div class="s">Descarta fixes de baja calidad al grabar tracks</div></div>
+      <button class="mini ${F.activo?'verde':''}" id="filtToggle">${F.activo?'ACTIVO':'Apagado'}</button></div>
+    <label>Preset</label>
+    <div class="grid2" style="grid-template-columns:1fr 1fr 1fr">
+      <button class="mini ${F.preset==='suave'?'verde':''}" id="pSuave">Suave</button>
+      <button class="mini ${F.preset==='normal'?'verde':''}" id="pNormal">Normal</button>
+      <button class="mini ${F.preset==='estricto'?'verde':''}" id="pEstricto">Estricto</button>
+    </div>
+    <label>HDOP máximo</label><input id="fHdop" type="number" step="0.1" value="${F.hdopMax}">
+    <label>Satélites mínimos en fix</label><input id="fSat" type="number" step="1" value="${F.satMin}">
+    <label>Exactitud horizontal máxima (m)</label><input id="fExac" type="number" step="0.5" value="${F.exacMax}">
+    <label>C/N0 mínimo (dB-Hz)</label><input id="fCn0" type="number" step="1" value="${F.cn0Min}">
+    <div class="fila"><div class="cuerpo"><div class="t">Avisar al descartar</div><div class="s">Vibración + aviso al filtrar un punto</div></div>
+      <button class="mini ${F.avisar?'verde':''}" id="filtAvisar">${F.avisar?'SÍ':'No'}</button></div>
+    <button class="ancho" id="filtGuardar">Guardar filtros</button>
+    <div class="nota">Se aplican <b>solo al grabar tracks</b> (no al marcar puntos, que son deliberados). Requiere GPS puro para HDOP/satélites/C/N0; con la fuente Fusionada solo se puede filtrar por exactitud.</div>
+  `);
+  const setEd = (k,id)=>{ const el=document.getElementById(id); el.oninput = ()=>{ S.filtros[k] = parseFloat(el.value)||0; S.filtros.preset='custom'; document.querySelectorAll('#pSuave,#pNormal,#pEstricto').forEach(b=>b.classList.remove('verde')); }; };
+  setEd('hdopMax','fHdop'); setEd('satMin','fSat'); setEd('exacMax','fExac'); setEd('cn0Min','fCn0');
+  document.getElementById('filtToggle').onclick = ()=>{ S.filtros.activo=!S.filtros.activo; panelFiltros(); };
+  document.getElementById('filtAvisar').onclick = ()=>{ S.filtros.avisar=!S.filtros.avisar; panelFiltros(); };
+  document.getElementById('pSuave').onclick = ()=>{ aplicarPresetFiltro('suave'); panelFiltros(); };
+  document.getElementById('pNormal').onclick = ()=>{ aplicarPresetFiltro('normal'); panelFiltros(); };
+  document.getElementById('pEstricto').onclick = ()=>{ aplicarPresetFiltro('estricto'); panelFiltros(); };
+  document.getElementById('filtGuardar').onclick = async ()=>{ await guardarFiltros(); toast('Filtros guardados.'); cerrarPanel(); };
+}
+// Evalúa si un fix pasa los filtros de calidad. Criterios sin dato no rechazan.
+function pasaFiltros(pos){
+  const F = S.filtros; if(!F || !F.activo) return true;
+  const acc = pos.coords.accuracy;
+  if(acc!=null && F.exacMax>0 && acc > F.exacMax) return false;
+  if(ultimoHdop!=null && F.hdopMax>0 && ultimoHdop > F.hdopMax) return false;
+  if(ultimoSatsUsados!=null && F.satMin>0 && ultimoSatsUsados < F.satMin) return false;
+  if(ultimoCn0Mean!=null && F.cn0Min>0 && ultimoCn0Mean < F.cn0Min) return false;
+  return true;
+}
+let ultimoAvisoRechazo = 0;
+function avisarRechazo(){
+  if(navigator.vibrate){ try{ navigator.vibrate(60); }catch(e){} }
+  const ahora = Date.now();
+  if(ahora - ultimoAvisoRechazo > 4000){ ultimoAvisoRechazo = ahora; toast('✗ Punto filtrado (calidad baja)'); }
 }
 
 /* --- diagnosticos gnss (F0) --- */
@@ -1664,6 +1749,8 @@ function exportarDiagCSV(){
   await migrarAGeoJSON();
   S.modo = await dbGet('conf','modo') || 'geo';
   S.capa = await dbGet('conf','capa') || 'sat';
+  const filtGuardados = await dbGet('conf','filtros');
+  if(filtGuardados) S.filtros = Object.assign(S.filtros, filtGuardados);
   document.querySelectorAll('#modo button').forEach(b=> b.setAttribute('aria-pressed', b.dataset.m===S.modo));
   document.getElementById('btnCapa').textContent = CAPAS[S.capa].nom;
   document.getElementById('coordSys').textContent = PROY[S.modo].nom;
