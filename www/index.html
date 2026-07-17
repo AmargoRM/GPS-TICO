@@ -529,9 +529,18 @@ function dibujar(){
   for(const p of S.puntos){
     const s = aPant(p.lat, p.lon);
     if(s.x<-30||s.x>W+30||s.y<-30||s.y>H+30) continue;
-    ctx.beginPath(); ctx.arc(s.x, s.y, 6, 0, 7); 
-    ctx.fillStyle = '#DCE6E4'; ctx.fill();
-    ctx.lineWidth = 2; ctx.strokeStyle = '#0A1214'; ctx.stroke();
+    if(p.promediado){
+      // punto promediado: anillo doble en color fix, para distinguirlo.
+      ctx.beginPath(); ctx.arc(s.x, s.y, 8, 0, 7);
+      ctx.lineWidth = 2; ctx.strokeStyle = '#4FD1C5'; ctx.stroke();
+      ctx.beginPath(); ctx.arc(s.x, s.y, 5, 0, 7);
+      ctx.fillStyle = '#4FD1C5'; ctx.fill();
+      ctx.lineWidth = 1.5; ctx.strokeStyle = '#0A1214'; ctx.stroke();
+    } else {
+      ctx.beginPath(); ctx.arc(s.x, s.y, 6, 0, 7);
+      ctx.fillStyle = '#DCE6E4'; ctx.fill();
+      ctx.lineWidth = 2; ctx.strokeStyle = '#0A1214'; ctx.stroke();
+    }
     ctx.fillStyle = '#DCE6E4'; ctx.font = '600 11px system-ui'; ctx.textAlign = 'center';
     ctx.strokeStyle = 'rgba(10,18,20,.9)'; ctx.lineWidth = 3;
     ctx.strokeText(p.nom, s.x, s.y-11); ctx.fillText(p.nom, s.x, s.y-11);
@@ -661,8 +670,12 @@ let gnssStarted = false;      // listener nativo activo (compartido con diagnós
 let diagAbierto = false;      // panel de diagnóstico abierto
 let mainLocSub = null;        // suscripción del app al evento 'location' nativo
 let mainGgaSub = null;        // suscripción del app al evento 'gga' (altura ortométrica)
+let mainDopSub = null;        // suscripción a 'dop' (HDOP para calidad de ocupación)
+let mainStatSub = null;       // suscripción a 'gnssStatus' (C/N0 medio)
 let ultimoGeoide = null;      // separación del geoide más reciente (NMEA), metros
 let ultimoMslNmea = null;     // altura ortométrica más reciente vía NMEA GGA, metros
+let ultimoHdop = null;        // HDOP más reciente (NMEA), para promediado
+let ultimoCn0Mean = null;     // C/N0 medio de satélites en fix, para promediado
 
 function pluginGnss(){ return window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.Gnss; }
 
@@ -734,6 +747,16 @@ async function arrancarGPS(){
     mainGgaSub = await P.addListener('gga', (ev)=>{
       if(ev.data.geoidSeparation!=null) ultimoGeoide = ev.data.geoidSeparation;
       if(ev.data.mslAltitude!=null) ultimoMslNmea = ev.data.mslAltitude;
+      if(ev.data.hdop!=null) ultimoHdop = ev.data.hdop;
+    });
+    // HDOP y C/N0 para las estadísticas de calidad del promediado (F3).
+    mainDopSub = await P.addListener('dop', (ev)=>{
+      if(ev.data.hdop!=null) ultimoHdop = ev.data.hdop;
+    });
+    mainStatSub = await P.addListener('gnssStatus', (ev)=>{
+      const sats = (ev.data && ev.data.satellites) || [];
+      const cn = sats.filter(s=> s.usedInFix && s.cn0>0).map(s=> s.cn0);
+      ultimoCn0Mean = cn.length ? cn.reduce((a,b)=>a+b,0)/cn.length : null;
     });
   }
   await aplicarFuente();
@@ -770,12 +793,137 @@ function alFix(pos){
   document.getElementById('mVel').textContent  = c.speed!=null ? (c.speed*3.6).toFixed(1) : '—';
   dibujarAnillo(c.accuracy);
   if(S.grabando) grabarPunto(pos);
+  if(ocupacion && ocupacion.activa) ocupacion.muestras.push({
+    lat:c.latitude, lon:c.longitude, acc:(c.accuracy!=null?c.accuracy:null),
+    altElip:pos.altElip, altOrto:pos.altOrto, altOrtoFuente:pos.altOrtoFuente,
+    geoide:pos.geoide, hdop:ultimoHdop, cn0:ultimoCn0Mean
+  });
   if(S.seguir){ S.centro.lat = c.latitude; S.centro.lon = c.longitude; }
   dibujar();
 }
 function alErrorGPS(e){
   document.getElementById('estadoRed').textContent = 'GPS: ' +
     (e.code===1 ? 'PERMISO DENEGADO' : e.code===2 ? 'SIN POSICIÓN' : 'TIEMPO AGOTADO');
+}
+
+/* =======================================================================
+   6b. PROMEDIADO ESTÁTICO (ocupación de punto) — Fase 3
+   ======================================================================= */
+let ocupacion = null;   // { activa, muestras:[], t0, durMs, timer, nom, desc }
+
+const M_POR_GRADO = 111320;   // metros por grado de latitud (aprox)
+
+// Media ponderada por exactitud (w = 1/acc^2) + desviación estándar en metros.
+// Descarta atípicos a > 3σ de la media, en una pasada.
+function calcOcupacion(muestras){
+  if(!muestras.length) return null;
+  const mediaPond = (arr)=>{
+    let sw=0, slat=0, slon=0;
+    for(const m of arr){
+      const w = (m.acc && m.acc>0) ? 1/(m.acc*m.acc) : 1;
+      sw += w; slat += m.lat*w; slon += m.lon*w;
+    }
+    return { lat:slat/sw, lon:slon/sw };
+  };
+  const disp = (arr, ctr)=>{
+    // distancia de cada muestra a la media, en metros
+    const mLon = M_POR_GRADO*Math.cos(ctr.lat*D2R);
+    return arr.map(m=>{
+      const dx = (m.lon-ctr.lon)*mLon, dy = (m.lat-ctr.lat)*M_POR_GRADO;
+      return Math.sqrt(dx*dx+dy*dy);
+    });
+  };
+  // 1ª media con todas
+  let ctr = mediaPond(muestras);
+  let d = disp(muestras, ctr);
+  const sigma = Math.sqrt(d.reduce((a,b)=>a+b*b,0)/d.length) || 0;
+  // descartar atípicos > 3σ
+  const aceptadas = muestras.filter((m,i)=> sigma===0 || d[i] <= 3*sigma);
+  const rechazadas = muestras.length - aceptadas.length;
+  ctr = mediaPond(aceptadas);
+  // desviación estándar final (separada lat/lon, en metros)
+  const mLon = M_POR_GRADO*Math.cos(ctr.lat*D2R);
+  let sLat2=0, sLon2=0, sD2=0;
+  for(const m of aceptadas){
+    const dy=(m.lat-ctr.lat)*M_POR_GRADO, dx=(m.lon-ctr.lon)*mLon;
+    sLat2 += dy*dy; sLon2 += dx*dx; sD2 += dx*dx+dy*dy;
+  }
+  const n = aceptadas.length;
+  const div = n>1 ? n-1 : 1;
+  const prom = (sel)=>{ const v = aceptadas.map(sel).filter(x=> x!=null); return v.length? v.reduce((a,b)=>a+b,0)/v.length : null; };
+  return {
+    lat: ctr.lat, lon: ctr.lon,
+    altElip: prom(m=>m.altElip), altOrto: prom(m=>m.altOrto),
+    altOrtoFuente: (aceptadas.find(m=>m.altOrtoFuente)||{}).altOrtoFuente || null,
+    geoide: prom(m=>m.geoide),
+    accMean: prom(m=>m.acc), hdopMean: prom(m=>m.hdop), cn0Mean: prom(m=>m.cn0),
+    stdLat: Math.sqrt(sLat2/div), stdLon: Math.sqrt(sLon2/div), stdM: Math.sqrt(sD2/div),
+    n: n, aceptadas: n, rechazadas: rechazadas
+  };
+}
+
+function iniciarOcupacion(nom, desc, durSeg){
+  ocupacion = { activa:true, muestras:[], t0:Date.now(), durMs:durSeg*1000, nom, desc, dur:durSeg };
+  renderOcupacion();
+  ocupacion.timer = setInterval(()=>{
+    if(!ocupacion || !ocupacion.activa) return;
+    renderOcupacion();
+    if(Date.now()-ocupacion.t0 >= ocupacion.durMs) finalizarOcupacion();
+  }, 300);
+}
+function renderOcupacion(){
+  if(!ocupacion) return;
+  const el = Math.min(1, (Date.now()-ocupacion.t0)/ocupacion.durMs);
+  const seg = Math.round((Date.now()-ocupacion.t0)/1000);
+  const r = calcOcupacion(ocupacion.muestras);
+  const cont = document.getElementById('ocuBody');
+  if(!cont) return;
+  const f = r ? fmtCoord(r.lat, r.lon, S.modo) : null;
+  cont.innerHTML = `
+    <div class="barra"><i style="width:${(el*100).toFixed(0)}%"></i></div>
+    <div class="k" style="margin-top:6px">${seg}s / ${ocupacion.dur}s · ${ocupacion.muestras.length} muestras</div>
+    ${r ? `
+      <div class="res"><div class="k">${PROY[S.modo].nom} (media)</div><div class="v">${f.a}<br>${f.b}</div></div>
+      <div class="grid2">
+        <div class="res"><div class="k">Desv. estándar</div><div class="v">± ${r.stdM.toFixed(2)} m</div></div>
+        <div class="res"><div class="k">Muestras usadas</div><div class="v">${r.aceptadas} <span style="color:var(--musgo);font-size:11px">(−${r.rechazadas})</span></div></div>
+        <div class="res"><div class="k">Alt orto (media)</div><div class="v">${r.altOrto!=null?r.altOrto.toFixed(1)+' m':'—'}</div></div>
+        <div class="res"><div class="k">HDOP medio</div><div class="v">${r.hdopMean!=null?r.hdopMean.toFixed(2):'—'}</div></div>
+      </div>` : '<div class="vacio">Esperando fixes…</div>'}
+    <div class="nota" style="border-color:var(--alerta)">⚠️ El promediado reduce el ruido aleatorio, NO el sesgo por multipath (rebote en paredes/árboles). Una desviación baja NO garantiza exactitud absoluta.</div>
+    <button class="ancho" id="ocuStop">Detener y guardar ahora</button>
+    <button class="ancho borde" id="ocuCancel">Cancelar</button>
+  `;
+  document.getElementById('ocuStop').onclick = finalizarOcupacion;
+  document.getElementById('ocuCancel').onclick = cancelarOcupacion;
+}
+async function finalizarOcupacion(){
+  if(!ocupacion) return;
+  ocupacion.activa = false;
+  if(ocupacion.timer){ clearInterval(ocupacion.timer); ocupacion.timer=null; }
+  const r = calcOcupacion(ocupacion.muestras);
+  if(!r){ toast('No se capturaron fixes. Cancelado.'); ocupacion=null; cerrarPanel(); return; }
+  const p = {
+    id:nid(), proy:S.proy.id, nom:ocupacion.nom, desc:ocupacion.desc,
+    lat:r.lat, lon:r.lon, alt:r.altElip, exac:(r.accMean!=null?r.accMean:r.stdM),
+    altElip:r.altElip, altOrto:r.altOrto, altOrtoFuente:r.altOrtoFuente, geoide:r.geoide,
+    vexac:null, fuente:S.fuente,
+    promediado:true, muestras:r.n, desvStd:r.stdM, stdLat:r.stdLat, stdLon:r.stdLon,
+    hdopMedio:r.hdopMean, cn0Medio:r.cn0Mean, duracion:ocupacion.dur,
+    t:Date.now()
+  };
+  await dbPut('puntos', p);
+  S.puntos.push(p);
+  const nMuestras = r.n;
+  ocupacion = null;
+  cerrarPanel(); dibujar();
+  toast(`Punto promediado: ${nMuestras} muestras · ±${r.stdM.toFixed(2)} m`);
+}
+function cancelarOcupacion(){
+  if(ocupacion && ocupacion.timer) clearInterval(ocupacion.timer);
+  ocupacion = null;
+  cerrarPanel();
+  toast('Ocupación cancelada.');
 }
 
 /* =======================================================================
@@ -845,6 +993,11 @@ function cerrarPanel(){
   document.getElementById('panel').classList.remove('on');
   document.getElementById('velo').classList.remove('on');
   if(diagCleanup){ const c = diagCleanup; diagCleanup = null; c(); }
+  // Si se cierra el panel con una ocupación en curso (X o velo), cancelarla.
+  if(ocupacion && ocupacion.activa){
+    if(ocupacion.timer) clearInterval(ocupacion.timer);
+    ocupacion = null;
+  }
 }
 document.getElementById('panelCerrar').onclick = cerrarPanel;
 document.getElementById('velo').onclick = cerrarPanel;
@@ -895,23 +1048,35 @@ document.getElementById('btnWp').onclick = ()=>{
     <div class="res"><div class="k">Fuente</div><div class="v">${srcTxt}${fx.mock?'  ·  ⚠ MOCK':''}</div></div>
     <label>Nombre</label><input id="wpNom" value="P${String(n).padStart(3,'0')}">
     <label>Descripción</label><textarea id="wpDesc" rows="2" placeholder="Naciente, punto de aforo, testigo..."></textarea>
-    <button class="ancho" id="wpOk">Guardar punto</button>
-    <div class="nota">La <b>altura ortométrica</b> (sobre el nivel del mar) es la correcta para dictámenes. La elipsoidal es la cruda del GPS. En GPS puro y a cielo abierto la ortométrica sale del sistema; bajo techo puede no estar disponible.</div>
+    <button class="ancho" id="wpOk">Guardar ahora (instantáneo)</button>
+    <label>Promediar (ocupación estática)</label>
+    <select id="wpDur"><option value="30">30 segundos</option><option value="60" selected>60 segundos</option><option value="120">2 minutos</option><option value="300">5 minutos</option></select>
+    <button class="ancho borde" id="wpProm">Promediar quieto</button>
+    <div class="nota">La <b>altura ortométrica</b> (sobre el nivel del mar) es la correcta para dictámenes. <b>Promediar</b>: parate quieto y la app promedia los fixes para reducir ruido; te muestra la desviación estándar en vivo.</div>
   `);
+  const construirPunto = ()=> ({
+    lat:c.latitude, lon:c.longitude, alt:c.altitude, exac:c.accuracy,
+    vexac: fx.vexac!=null?fx.vexac:null, fuente: fx.fuente||'fused',
+    altElip: fx.altElip!=null?fx.altElip:null, altOrto: fx.altOrto!=null?fx.altOrto:null,
+    altOrtoFuente: fx.altOrtoFuente||null, geoide: fx.geoide!=null?fx.geoide:null
+  });
   document.getElementById('wpOk').onclick = async ()=>{
-    const p = {
-      id:nid(), proy:S.proy.id,
+    const p = Object.assign({ id:nid(), proy:S.proy.id,
       nom: document.getElementById('wpNom').value.trim() || `P${n}`,
       desc: document.getElementById('wpDesc').value.trim(),
-      lat:c.latitude, lon:c.longitude, alt:c.altitude, exac:c.accuracy,
-      vexac: fx.vexac!=null?fx.vexac:null, fuente: fx.fuente||'fused',
-      altElip: fx.altElip!=null?fx.altElip:null, altOrto: fx.altOrto!=null?fx.altOrto:null,
-      altOrtoFuente: fx.altOrtoFuente||null, geoide: fx.geoide!=null?fx.geoide:null,
-      t:Date.now()
-    };
+      promediado:false, t:Date.now() }, construirPunto());
     await dbPut('puntos', p);
     S.puntos.push(p); cerrarPanel(); dibujar();
     toast('Punto guardado.');
+  };
+  document.getElementById('wpProm').onclick = ()=>{
+    const nom = document.getElementById('wpNom').value.trim() || `P${n}`;
+    const desc = document.getElementById('wpDesc').value.trim();
+    const dur = parseInt(document.getElementById('wpDur').value, 10) || 60;
+    // Reemplaza el contenido del panel por la UI de ocupación en vivo.
+    document.getElementById('panelTitulo').textContent = 'Promediando: ' + nom;
+    document.getElementById('panelCuerpo').innerHTML = '<div id="ocuBody"></div>';
+    iniciarOcupacion(nom, desc, dur);
   };
 };
 
@@ -992,8 +1157,9 @@ async function panelDatos(){
     ${S.puntos.length||S.tracks.length ? '' : '<div class="vacio">Nada guardado todavía.</div>'}
     ${S.puntos.map(p=>{
       const f = fmtCoord(p.lat, p.lon, S.modo);
+      const prom = p.promediado ? ` <span style="color:var(--fix)">◎ ${p.muestras} muestras · σ±${p.desvStd!=null?p.desvStd.toFixed(2):'?'}m</span>` : '';
       return `<div class="fila">
-        <div class="cuerpo"><div class="t">${p.nom}</div><div class="s">${f.a} · ${f.b}<br>± ${p.exac.toFixed(1)} m${p.desc?' · '+p.desc:''}</div></div>
+        <div class="cuerpo"><div class="t">${p.nom}${p.promediado?' ◎':''}</div><div class="s">${f.a} · ${f.b}<br>± ${p.exac.toFixed(1)} m${prom}${p.desc?' · '+p.desc:''}</div></div>
         <button class="mini" data-ir="${p.lat},${p.lon}">Ir</button>
         <button class="mini rojo" data-dp="${p.id}">×</button>
       </div>`;
@@ -1150,15 +1316,19 @@ function panelExport(){
   `);
   document.getElementById('exCsv').onclick = ()=>{
     const m = document.getElementById('exSys').value;
-    const enc = m==='geo' ? ['nombre','lat','lon','altura_orto_m','altura_elip_m','geoide_m','altura_fuente','exactitud_m','exac_vert_m','fuente','fecha','descripcion']
-                          : ['nombre','este','norte','altura_orto_m','altura_elip_m','geoide_m','altura_fuente','exactitud_m','exac_vert_m','fuente','fecha','descripcion','epsg'];
+    const colsCal = ['tipo','muestras','desv_std_m','hdop_medio','cn0_medio','duracion_s'];
+    const enc = m==='geo' ? ['nombre','lat','lon','altura_orto_m','altura_elip_m','geoide_m','altura_fuente','exactitud_m','exac_vert_m','fuente',...colsCal,'fecha','descripcion']
+                          : ['nombre','este','norte','altura_orto_m','altura_elip_m','geoide_m','altura_fuente','exactitud_m','exac_vert_m','fuente',...colsCal,'fecha','descripcion','epsg'];
     const filas = S.puntos.map(p=>{
       const c = m==='geo' ? [p.lat.toFixed(7), p.lon.toFixed(7)]
                           : (q=> [q.e.toFixed(3), q.n.toFixed(3)])(desdeWgs(p.lat,p.lon,m));
       const orto = p.altOrto!=null ? p.altOrto.toFixed(1) : '';
       const elip = p.altElip!=null ? p.altElip.toFixed(1) : (p.alt!=null?p.alt.toFixed(1):'');
+      const cal = [ p.promediado?'promediado':'instantaneo', p.muestras!=null?p.muestras:'',
+                    p.desvStd!=null?p.desvStd.toFixed(2):'', p.hdopMedio!=null?p.hdopMedio.toFixed(2):'',
+                    p.cn0Medio!=null?p.cn0Medio.toFixed(1):'', p.duracion!=null?p.duracion:'' ];
       const base = [p.nom, ...c, orto, elip, p.geoide!=null?p.geoide.toFixed(1):'', p.altOrtoFuente||'',
-                    p.exac.toFixed(1), p.vexac!=null?p.vexac.toFixed(1):'', p.fuente||'fused',
+                    p.exac.toFixed(1), p.vexac!=null?p.vexac.toFixed(1):'', p.fuente||'fused', ...cal,
                     new Date(p.t).toISOString(), p.desc||''];
       if(m!=='geo') base.push(PROY[m].epsg);
       return base.map(v=>`"${String(v).replace(/"/g,'""')}"`).join(',');
@@ -1190,7 +1360,11 @@ function panelExport(){
         properties:{ nombre:p.nom, desc:p.desc,
           altura_orto_m:zOrto, altura_elip_m:zElip, geoide_m:(p.geoide!=null?p.geoide:null),
           altura_fuente:(p.altOrtoFuente||null), exactitud_m:p.exac, exac_vert_m:(p.vexac!=null?p.vexac:null),
-          fuente:(p.fuente||'fused'), fecha:new Date(p.t).toISOString() },
+          fuente:(p.fuente||'fused'),
+          tipo:(p.promediado?'promediado':'instantaneo'), muestras:(p.muestras!=null?p.muestras:null),
+          desv_std_m:(p.desvStd!=null?p.desvStd:null), hdop_medio:(p.hdopMedio!=null?p.hdopMedio:null),
+          cn0_medio:(p.cn0Medio!=null?p.cn0Medio:null), duracion_s:(p.duracion!=null?p.duracion:null),
+          fecha:new Date(p.t).toISOString() },
         geometry:{ type:'Point', coordinates:[p.lon, p.lat, (zOrto!=null?zOrto:(zElip!=null?zElip:0))] } });
     }
     for(const t of S.tracks) fc.features.push({ type:'Feature',
