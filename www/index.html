@@ -1928,7 +1928,7 @@ async function agregarCapaURL(nombre, url){
 }
 async function agregarCapaWMS(nombre, url, layerName, version){
   if(!url || !layerName){ toast('Faltan URL o nombre de capa.'); return; }
-  const capa = { id:nid(), nombre:(nombre||layerName).slice(0,40), tipo:'wms', visible:true, consultable:false,
+  const capa = { id:nid(), nombre:(nombre||layerName).slice(0,40), tipo:'wms', visible:true, consultable:true,
                  url, capa:layerName, version:version||'1.3.0', format:'image/png' };
   await dbPut('capas', capa); S.capas.push(capa); dibujar();
   toast(`Capa WMS "${capa.nombre}" agregada.`);
@@ -1960,6 +1960,7 @@ function hitGeom(g, px, py, ll){
 }
 function consultarEnPantalla(px,py){
   const ll = pantallaALatLon(px,py); if(!ll) return;
+  // 1) Capas vectoriales (GeoJSON / WFS): consulta local.
   for(let i=S.capas.length-1;i>=0;i--){
     const c = S.capas[i];
     if(!c.visible || c.tipo==='wms' || c.consultable===false || !c.geojson) continue;
@@ -1967,6 +1968,53 @@ function consultarEnPantalla(px,py){
     const encontrados = feats.filter(f=> hitGeom(f&&f.geometry, px, py, ll));
     if(encontrados.length){ mostrarAtributos(c, encontrados); return; }
   }
+  // 2) Capas WMS (imagen): se le pregunta al servidor con GetFeatureInfo.
+  for(let i=S.capas.length-1;i>=0;i--){
+    const c = S.capas[i];
+    if(!c.visible || c.tipo!=='wms' || c.consultable===false) continue;
+    consultarWMS(c, px, py);
+    return;
+  }
+}
+function lon2merc(lon){ return lon*MERC_MAX/180; }
+function lat2merc(lat){ const y = Math.log(Math.tan((90+lat)*Math.PI/360))/(Math.PI/180); return y*MERC_MAX/180; }
+function wmsFeatureInfoUrl(layer, w, h, iPx, jPx, bbox){
+  const v = layer.version || '1.3.0';
+  const base = layer.url.split('?')[0];
+  const p = new URLSearchParams({
+    SERVICE:'WMS', VERSION:v, REQUEST:'GetFeatureInfo',
+    LAYERS: layer.capa||'', QUERY_LAYERS: layer.capa||'', STYLES:'',
+    FORMAT: layer.format||'image/png', INFO_FORMAT:'application/json',
+    FEATURE_COUNT:'5', WIDTH:String(w), HEIGHT:String(h)
+  });
+  const crs = (v==='1.3.0') ? 'CRS=EPSG:3857' : 'SRS=EPSG:3857';
+  const ij  = (v==='1.3.0') ? `I=${iPx}&J=${jPx}` : `X=${iPx}&Y=${jPx}`;
+  return `${base}?${p.toString()}&${crs}&BBOX=${bbox}&${ij}`;
+}
+async function consultarWMS(capa, px, py){
+  if(!ultimoT){ return; }
+  mostrarCargando('Consultando capa…');
+  try{
+    const t = ultimoT;
+    const oLon = px2lon(t.x0, t.zi), eLon = px2lon(t.x0 + W/t.esc, t.zi);
+    const nLat = px2lat(t.y0, t.zi), sLat = px2lat(t.y0 + H/t.esc, t.zi);
+    const bbox = `${lon2merc(oLon)},${lat2merc(sLat)},${lon2merc(eLon)},${lat2merc(nLat)}`;
+    const url = wmsFeatureInfoUrl(capa, Math.round(W), Math.round(H), Math.round(px), Math.round(py), bbox);
+    const r = await httpGet(url);
+    const txt = bytesATexto(r.bytes);
+    let gj = null; try{ gj = JSON.parse(txt); }catch(e){}
+    if(gj && gj.features && gj.features.length){
+      mostrarAtributos(capa, gj.features);
+    } else {
+      const limpio = txt.replace(/<[^>]+>/g,' ').replace(/\s+/g,' ').trim();
+      if(limpio && limpio.length > 2 && !/ServiceException|error/i.test(limpio.slice(0,80))){
+        abrirPanel('Info · '+capa.nombre, `<div class="res"><div class="v" style="font-size:12px;white-space:pre-wrap;word-break:break-word">${escHtml(limpio.slice(0,1500))}</div></div>`);
+      } else {
+        toast('Sin datos en ese punto (o el servidor no soporta consulta).');
+      }
+    }
+  }catch(e){ toast('No se pudo consultar la capa.'); }
+  finally{ ocultarCargando(); }
 }
 function escHtml(s){ return String(s==null?'':s).replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c])); }
 function fmtVal(v){ if(v==null) return ''; if(typeof v==='object') return JSON.stringify(v); return String(v); }
@@ -2008,10 +2056,10 @@ function panelCapas(){
   abrirPanel('Capas del proyecto', `
     ${S.capas.length ? S.capas.map(c=>`<div class="fila">
         <div class="cuerpo"><div class="t"><span style="color:${c.color||'#8899AA'}">■</span> ${c.nombre}</div>
-          <div class="s">${c.tipo==='wms'?'WMS · solo vista':'Vector · '+((c.geojson.features||[]).length)+' elem.'}${c.tipo!=='wms'?(c.consultable===false?' · 🔒 solo vista':' · 🔍 consultable'):''}</div></div>
+          <div class="s">${c.tipo==='wms'?'WMS':'Vector · '+((c.geojson.features||[]).length)+' elem.'} · ${c.consultable===false?'🔒 solo vista':'🔍 consultable'}</div></div>
         <div style="display:flex;flex-direction:column;gap:4px">
           <button class="mini ${c.visible?'verde':''}" data-tg="${c.id}">${c.visible?'Ver':'off'}</button>
-          ${c.tipo!=='wms'?`<button class="mini ${c.consultable===false?'':'verde'}" data-tq="${c.id}">${c.consultable===false?'🔒':'🔍'}</button>`:''}
+          <button class="mini ${c.consultable===false?'':'verde'}" data-tq="${c.id}">${c.consultable===false?'🔒':'🔍'}</button>
         </div>
         ${c.tipo!=='wms'?`<button class="mini" data-tb="${c.id}">Tabla</button>`:''}
         <button class="mini rojo" data-bc="${c.id}">×</button>

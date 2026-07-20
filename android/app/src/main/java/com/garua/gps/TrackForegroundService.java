@@ -36,7 +36,9 @@ import java.io.FileWriter;
  */
 public class TrackForegroundService extends Service {
     public static final String CHANNEL_ID = "gps_tico_track";
+    public static final String ALERT_CHANNEL_ID = "gps_tico_alert";
     public static final int NOTIF_ID = 4711;
+    public static final int NOTIF_ALERT_ID = 4712;
     public static final String EXTRA_TEXT = "text";
 
     public static final String ACTION_STOP        = "com.garua.gps.STOP_TRACK";     // desde notificación (app JS)
@@ -186,14 +188,49 @@ public class TrackForegroundService extends Service {
     }
 
     private void guardarPunto(Location loc) {
-        if (loc == null) { updateNotification(this, "Sin señal para el punto"); return; }
+        if (loc == null) { alerta("GPS TICO", "Sin señal para el punto", true); return; }
         try {
             String s = leer(archPuntos());
             JSONArray arr = (s != null) ? new JSONArray(s) : new JSONArray();
             arr.put(fixToArray(loc));
             escribir(archPuntos(), arr.toString());
             updateNotification(this, "Punto guardado (" + arr.length() + ")");
+            String exac = loc.hasAccuracy() ? ("  ±" + Math.round(loc.getAccuracy()) + " m") : "";
+            alerta("Punto guardado ✓", "Punto " + arr.length() + exac, true);
         } catch (Exception ignored) {}
+    }
+
+    // Aviso emergente (heads-up) arriba + vibración, aunque la app esté cerrada.
+    private void alerta(String titulo, String texto, boolean vibrar) {
+        if (vibrar) {
+            try {
+                android.os.Vibrator v = (android.os.Vibrator) getSystemService(Context.VIBRATOR_SERVICE);
+                if (v != null) {
+                    if (Build.VERSION.SDK_INT >= 26)
+                        v.vibrate(android.os.VibrationEffect.createOneShot(140, android.os.VibrationEffect.DEFAULT_AMPLITUDE));
+                    else v.vibrate(140);
+                }
+            } catch (Exception ignored) {}
+        }
+        createAlertChannel();
+        NotificationCompat.Builder b = new NotificationCompat.Builder(this, ALERT_CHANNEL_ID)
+            .setContentTitle(titulo)
+            .setContentText(texto)
+            .setSmallIcon(android.R.drawable.ic_menu_mylocation)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setDefaults(NotificationCompat.DEFAULT_VIBRATE)
+            .setAutoCancel(true);
+        if (Build.VERSION.SDK_INT >= 26) b.setTimeoutAfter(4000);
+        NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+        if (nm != null) try { nm.notify(NOTIF_ALERT_ID, b.build()); } catch (Exception ignored) {}
+    }
+    private void createAlertChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            NotificationChannel ch = new NotificationChannel(ALERT_CHANNEL_ID, "Avisos GPS TICO", NotificationManager.IMPORTANCE_HIGH);
+            ch.setDescription("Confirmaciones al marcar puntos desde el widget.");
+            NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+            if (nm != null) nm.createNotificationChannel(ch);
+        }
     }
 
     private void detenerTrackNativo() {
