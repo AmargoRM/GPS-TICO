@@ -32,12 +32,31 @@ public class GnssPlugin extends Plugin {
     public void load() {
         locationManager = (LocationManager) getContext().getSystemService(android.content.Context.LOCATION_SERVICE);
         TrackServiceBridge.register(this);
+        WidgetActionBridge.register(this);
     }
 
     @Override
     protected void handleOnDestroy() {
         TrackServiceBridge.unregister(this);
+        WidgetActionBridge.unregister(this);
         super.handleOnDestroy();
+    }
+
+    // ---- Widget de la pantalla de inicio ----
+
+    // Emite la acción del widget a JS (arranque en caliente).
+    public void emitWidgetAction(String action) {
+        JSObject o = new JSObject();
+        o.put("action", action);
+        notifyListeners("widgetAction", o);
+    }
+
+    // JS lo llama al iniciar para recoger una acción del widget en arranque en frío.
+    @PluginMethod
+    public void consumePendingWidgetAction(PluginCall call) {
+        JSObject o = new JSObject();
+        o.put("action", WidgetActionBridge.consume());
+        call.resolve(o);
     }
 
     // ---- Servicio en primer plano para grabar con pantalla apagada (F4) ----

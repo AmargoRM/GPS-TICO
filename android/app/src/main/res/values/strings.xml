@@ -4,4 +4,5 @@
     <string name="title_activity_main">GPS TICO</string>
     <string name="package_name">com.garua.gps</string>
     <string name="custom_url_scheme">com.garua.gps</string>
+    <string name="widget_desc">Iniciar track, marcar punto y detener sin abrir la app.</string>
 </resources>

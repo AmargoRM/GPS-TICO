@@ -848,6 +848,13 @@ async function arrancarGPS(){
     await P.addListener('stopTrackRequested', async ()=>{
       if(S.grabando) await alternarTrack();
     });
+    // Acciones del widget en arranque en caliente (app ya abierta).
+    await P.addListener('widgetAction', (ev)=> manejarAccionWidget(ev && ev.action));
+    // Acción del widget en arranque en frío (guardada por MainActivity).
+    try{
+      const pend = await P.consumePendingWidgetAction();
+      if(pend && pend.action) setTimeout(()=> manejarAccionWidget(pend.action), 600);
+    }catch(e){}
   }
   await aplicarFuente();
 }
@@ -884,6 +891,7 @@ function alFix(pos){
   document.getElementById('mExac').textContent = c.accuracy!=null ? c.accuracy.toFixed(1) : '—';
   document.getElementById('mVel').textContent  = c.speed!=null ? (c.speed*3.6).toFixed(1) : '—';
   dibujarAnillo(c.accuracy);
+  if(pendientePuntoWidget){ pendientePuntoWidget = false; marcarPuntoRapido(); }
   if(S.grabando) grabarPunto(pos);
   if(ocupacion && ocupacion.activa) ocupacion.muestras.push({
     lat:c.latitude, lon:c.longitude, acc:(c.accuracy!=null?c.accuracy:null),
@@ -1117,6 +1125,36 @@ async function detenerServicioTrack(){
   const P = pluginGnss();
   if(!P) return;
   try{ await P.stopForegroundTracking(); }catch(e){}
+}
+
+/* --- widget de la pantalla de inicio --- */
+let pendientePuntoWidget = false;
+async function marcarPuntoRapido(){
+  if(!S.fix){ pendientePuntoWidget = true; toast('Esperando posición para el punto…'); return; }
+  if(!S.proy){
+    const proy = { id:nid(), nom:'Temporal ' + new Date().toLocaleDateString('es-CR'), pts:[], tracks:[] };
+    await dbPut('proyectos', proy); S.proy = proy;
+    document.getElementById('proyBtn').querySelector('.val').textContent = proy.nom;
+  }
+  const c = S.fix.coords, fx = S.fix;
+  const n = S.puntos.length + 1;
+  const p = {
+    id:nid(), proy:S.proy.id, nom:'W'+String(n).padStart(3,'0'), desc:'(widget)',
+    lat:c.latitude, lon:c.longitude, alt:c.altitude, exac:c.accuracy,
+    vexac: fx.vexac!=null?fx.vexac:null, fuente: fx.fuente||'fused',
+    altElip: fx.altElip!=null?fx.altElip:null, altOrto: fx.altOrto!=null?fx.altOrto:null,
+    altOrtoFuente: fx.altOrtoFuente||null, geoide: fx.geoide!=null?fx.geoide:null,
+    promediado:false, t:Date.now()
+  };
+  await dbPut('puntos', p); S.puntos.push(p); dibujar();
+  if(navigator.vibrate){ try{ navigator.vibrate(40); }catch(e){} }
+  toast('Punto rápido guardado: ' + p.nom);
+}
+async function manejarAccionWidget(action){
+  if(!action) return;
+  if(action==='start'){ if(!S.grabando) await alternarTrack(); else toast('Ya estás grabando.'); }
+  else if(action==='stop'){ if(S.grabando) await alternarTrack(); else toast('No hay track activo.'); }
+  else if(action==='punto'){ await marcarPuntoRapido(); }
 }
 
 /* =======================================================================
