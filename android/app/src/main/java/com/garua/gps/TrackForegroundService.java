@@ -203,12 +203,14 @@ public class TrackForegroundService extends Service {
 
     private JSONArray fixToArray(Location loc) {
         JSONArray a = new JSONArray();
-        a.put(loc.getLatitude());
-        a.put(loc.getLongitude());
-        a.put(loc.hasAltitude() ? loc.getAltitude() : JSONObject.NULL);
-        a.put(loc.hasAccuracy() ? loc.getAccuracy() : JSONObject.NULL);
-        a.put((Build.VERSION.SDK_INT >= 26 && loc.hasVerticalAccuracy()) ? loc.getVerticalAccuracyMeters() : JSONObject.NULL);
-        a.put(loc.getTime());
+        try {
+            a.put(loc.getLatitude());
+            a.put(loc.getLongitude());
+            a.put(loc.hasAltitude() ? loc.getAltitude() : JSONObject.NULL);
+            a.put(loc.hasAccuracy() ? (double) loc.getAccuracy() : JSONObject.NULL);
+            a.put((Build.VERSION.SDK_INT >= 26 && loc.hasVerticalAccuracy()) ? (double) loc.getVerticalAccuracyMeters() : JSONObject.NULL);
+            a.put(loc.getTime());
+        } catch (org.json.JSONException e) { /* coordenada inválida (NaN); se ignora */ }
         return a;
     }
 
