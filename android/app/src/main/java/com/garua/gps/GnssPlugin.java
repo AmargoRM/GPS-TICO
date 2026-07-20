@@ -59,6 +59,17 @@ public class GnssPlugin extends Plugin {
         call.resolve(o);
     }
 
+    // Manda la app al segundo plano (tras arrancar un track desde el widget).
+    @PluginMethod
+    public void moverAppAlFondo(PluginCall call) {
+        if (getActivity() != null) {
+            getActivity().runOnUiThread(new Runnable() {
+                @Override public void run() { getActivity().moveTaskToBack(true); }
+            });
+        }
+        call.resolve();
+    }
+
     // ---- Servicio en primer plano para grabar con pantalla apagada (F4) ----
 
     @PluginMethod

@@ -20,6 +20,10 @@ public final class WidgetActionBridge {
         if (plugin == p) plugin = null;
     }
 
+    public static boolean isAppAlive() {
+        return plugin != null;
+    }
+
     /** Arranque en frío: se guarda hasta que JS lo pida con consume(). */
     public static void setPending(String action) {
         pending = action;

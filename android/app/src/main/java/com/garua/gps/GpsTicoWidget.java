@@ -31,13 +31,12 @@ public class GpsTicoWidget extends AppWidgetProvider {
     }
 
     private static PendingIntent pi(Context ctx, String action) {
-        Intent i = new Intent(ctx, MainActivity.class);
-        // Acción única por botón para que el sistema no fusione los extras.
+        // Broadcast: el receiver decide si abre la app o la maneja en 2do plano.
+        Intent i = new Intent(ctx, WidgetActionReceiver.class);
         i.setAction("com.garua.gps.WIDGET_" + action);
         i.putExtra("widget_action", action);
-        i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP);
         int flags = PendingIntent.FLAG_UPDATE_CURRENT;
         if (Build.VERSION.SDK_INT >= 23) flags |= PendingIntent.FLAG_IMMUTABLE;
-        return PendingIntent.getActivity(ctx, action.hashCode(), i, flags);
+        return PendingIntent.getBroadcast(ctx, action.hashCode(), i, flags);
     }
 }
