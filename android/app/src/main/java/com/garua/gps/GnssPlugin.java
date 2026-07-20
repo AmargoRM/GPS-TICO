@@ -77,6 +77,7 @@ public class GnssPlugin extends Plugin {
         try {
             String text = call.getString("text", "Grabando track…");
             Intent i = new Intent(getContext(), TrackForegroundService.class);
+            i.setAction(TrackForegroundService.ACTION_KEEPALIVE);
             i.putExtra(TrackForegroundService.EXTRA_TEXT, text);
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 getContext().startForegroundService(i);
@@ -87,6 +88,58 @@ public class GnssPlugin extends Plugin {
         } catch (Exception e) {
             call.reject("No se pudo iniciar el servicio: " + e.getMessage());
         }
+    }
+
+    // Guarda la fuente (fused/gps) para que el servicio nativo del widget la use.
+    @PluginMethod
+    public void setFuenteServicio(PluginCall call) {
+        try {
+            String fuente = call.getString("fuente", "fused");
+            getContext().getSharedPreferences("gps_tico_prefs", android.content.Context.MODE_PRIVATE)
+                .edit().putString("fuente", fuente).apply();
+            call.resolve();
+        } catch (Exception e) { call.resolve(); }
+    }
+
+    // Estado del servicio nativo (grabando por widget, cuántos puntos).
+    @PluginMethod
+    public void estadoServicio(PluginCall call) {
+        JSObject o = new JSObject();
+        o.put("grabando", TrackForegroundService.grabandoNativo);
+        o.put("puntos", TrackForegroundService.puntosNativos);
+        call.resolve(o);
+    }
+
+    // Lee los archivos que dejó el servicio nativo y los devuelve para importar.
+    @PluginMethod
+    public void importarPendientes(PluginCall call) {
+        JSObject o = new JSObject();
+        try {
+            java.io.File dir = getContext().getFilesDir();
+            java.io.File ft = new java.io.File(dir, "pending_track.json");
+            java.io.File fp = new java.io.File(dir, "pending_points.json");
+            // No importar un track que se está grabando ahora mismo.
+            if (ft.exists() && !TrackForegroundService.grabandoNativo) {
+                String s = leerArchivo(ft);
+                if (s != null) o.put("track", new org.json.JSONObject(s));
+                ft.delete();
+            }
+            if (fp.exists()) {
+                String s = leerArchivo(fp);
+                if (s != null) o.put("puntos", new org.json.JSONArray(s));
+                fp.delete();
+            }
+        } catch (Exception e) { /* devolver lo que se pudo */ }
+        call.resolve(o);
+    }
+
+    private String leerArchivo(java.io.File f) {
+        try {
+            byte[] b = new byte[(int) f.length()];
+            java.io.FileInputStream in = new java.io.FileInputStream(f);
+            int n = in.read(b); in.close();
+            return n > 0 ? new String(b, 0, n, "UTF-8") : null;
+        } catch (Exception e) { return null; }
     }
 
     @PluginMethod

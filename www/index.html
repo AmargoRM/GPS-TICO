@@ -535,15 +535,32 @@ function tileWMS(z,x,y,layer){
   return tileGen(`wms_${layer.id}/${z}/${x}/${y}`, wmsUrl(layer, z, x, y), true);
 }
 
-// Dibuja las capas vectoriales del usuario (GeoJSON/WFS) sobre el mapa.
-function dibujarCapasVector(aPant){
+// Caja envolvente [minLon,minLat,maxLon,maxLat] de una geometría (cacheada).
+function bboxGeom(g){
+  let a=[Infinity,Infinity,-Infinity,-Infinity];
+  const ext = c=>{ if(c[0]<a[0])a[0]=c[0]; if(c[1]<a[1])a[1]=c[1]; if(c[0]>a[2])a[2]=c[0]; if(c[1]>a[3])a[3]=c[1]; };
+  const rec = coords=>{ if(typeof coords[0]==='number') ext(coords); else for(const c of coords) rec(c); };
+  if(g.type==='GeometryCollection'){ for(const gg of (g.geometries||[])){ const b=bboxGeom(gg); if(b[0]<a[0])a[0]=b[0]; if(b[1]<a[1])a[1]=b[1]; if(b[2]>a[2])a[2]=b[2]; if(b[3]>a[3])a[3]=b[3]; } }
+  else if(g.coordinates) rec(g.coordinates);
+  return a;
+}
+// Dibuja las capas vectoriales del usuario (GeoJSON/WFS) sobre el mapa,
+// recortando por el área visible para rendir con capas grandes.
+function dibujarCapasVector(aPant, vista){
   for(const capa of S.capas){
     if(!capa.visible || capa.tipo==='wms' || !capa.geojson) continue;
     const fc = capa.geojson;
     const feats = fc.type==='FeatureCollection' ? (fc.features||[])
                 : fc.type==='Feature' ? [fc] : [];
     const color = capa.color || '#E0A458';
-    for(const f of feats) dibujarGeom(f && f.geometry, aPant, color);
+    for(const f of feats){
+      if(!f || !f.geometry) continue;
+      if(!f._bbox) f._bbox = bboxGeom(f.geometry);
+      const b = f._bbox;
+      // Descartar si la caja del elemento no intersecta la vista.
+      if(vista && (b[2]<vista.oLon || b[0]>vista.eLon || b[3]<vista.sLat || b[1]>vista.nLat)) continue;
+      dibujarGeom(f.geometry, aPant, color);
+    }
   }
 }
 function dibujarGeom(g, aPant, color){
@@ -566,6 +583,13 @@ function dibujarGeom(g, aPant, color){
   }
 }
 
+// Dibujado batcheado: coalesce múltiples pedidos en un solo frame.
+let _rafPend = false;
+function pedirDibujo(){
+  if(_rafPend) return;
+  _rafPend = true;
+  requestAnimationFrame(()=>{ _rafPend = false; dibujar(); });
+}
 function dibujar(){
   if(!W) return;
   ctx.fillStyle = '#0A1214'; ctx.fillRect(0,0,W,H);
@@ -623,8 +647,14 @@ function dibujar(){
   });
   ultimoT = { zi, x0, y0, esc };   // para consultas por toque
 
+  // Área visible en lon/lat (con margen) para recortar capas grandes.
+  const oLon = px2lon(x0, zi), eLon = px2lon(x0 + W/esc, zi);
+  const nLat = px2lat(y0, zi), sLat = px2lat(y0 + H/esc, zi);
+  const mLon = (eLon-oLon)*0.1, mLat = (nLat-sLat)*0.1;
+  const vista = { oLon:oLon-mLon, eLon:eLon+mLon, nLat:nLat+mLat, sLat:sLat-mLat };
+
   // Capas vectoriales del usuario (GeoJSON / WFS), debajo de puntos y tracks.
-  dibujarCapasVector(aPant);
+  dibujarCapasVector(aPant, vista);
 
   // tracks guardados
   ctx.lineJoin = ctx.lineCap = 'round';
@@ -725,15 +755,16 @@ cv.addEventListener('pointermove', e=>{
     const [a,b] = [...toques.values()];
     const d = Math.hypot(a.x-b.x, a.y-b.y);
     if(ultDist>0){ S.zoom = Math.max(2, Math.min(19, S.zoom + Math.log2(d/ultDist))); }
-    ultDist = d; S.seguir = false; dibujar();
+    ultDist = d; S.seguir = false; pedirDibujo();
   }
 });
 ['pointerup','pointercancel'].forEach(ev=> cv.addEventListener(ev, e=>{
-  // Toque corto sin arrastre = consulta de capa.
-  if(ev==='pointerup' && tapInicio && !arrastrando && toques.size===1){
+  // Toque corto con poco movimiento = consulta de capa. No dependemos de
+  // 'arrastrando' porque el jitter táctil lo activaba y bloqueaba el toque.
+  if(ev==='pointerup' && tapInicio && toques.size===1){
     const mov = Math.hypot(e.clientX-tapInicio.x, e.clientY-tapInicio.y);
     const dt = Date.now() - tapInicio.t;
-    if(mov < 12 && dt < 400){
+    if(mov < 16 && dt < 500){
       const r = cv.getBoundingClientRect();
       consultarEnPantalla(e.clientX - r.left, e.clientY - r.top);
     }
@@ -745,14 +776,14 @@ cv.addEventListener('pointermove', e=>{
 cv.addEventListener('wheel', e=>{
   e.preventDefault();
   S.zoom = Math.max(2, Math.min(19, S.zoom - Math.sign(e.deltaY)*0.4));
-  S.seguir = false; dibujar();
+  S.seguir = false; pedirDibujo();
 }, {passive:false});
 function mover(dx, dy){
   const z = S.zoom;
   const x = lon2px(S.centro.lon,z) + dx, y = lat2px(S.centro.lat,z) + dy;
   S.centro.lon = px2lon(x,z);
   S.centro.lat = Math.max(-85, Math.min(85, px2lat(y,z)));
-  dibujar();
+  pedirDibujo();
 }
 
 /* =======================================================================
@@ -834,6 +865,8 @@ async function gnssStopSiOcioso(){
 }
 async function aplicarFuente(){
   await dbPut('conf', S.fuente, 'fuente');
+  const P = pluginGnss();
+  if(P && P.setFuenteServicio){ try{ await P.setFuenteServicio({ fuente:S.fuente }); }catch(e){} }
   if(S.fuente==='gps'){
     const ok = await gnssStart();
     if(!ok){ S.fuente='fused'; toast('GPS puro no disponible en este equipo; uso posición fusionada.'); }
@@ -895,15 +928,47 @@ async function arrancarGPS(){
     await P.addListener('stopTrackRequested', async ()=>{
       if(S.grabando) await alternarTrack();
     });
-    // Acciones del widget en arranque en caliente (app ya abierta).
-    await P.addListener('widgetAction', (ev)=> manejarAccionWidget(ev && ev.action));
-    // Acción del widget en arranque en frío (guardada por MainActivity).
-    try{
-      const pend = await P.consumePendingWidgetAction();
-      if(pend && pend.action) setTimeout(()=> manejarAccionWidget(pend.action, true), 600);
-    }catch(e){}
   }
   await aplicarFuente();
+  // Importar lo que haya grabado el widget en segundo plano.
+  await importarPendientesWidget();
+  document.addEventListener('visibilitychange', ()=>{ if(!document.hidden) importarPendientesWidget(); });
+}
+// Trae a IndexedDB el track y los puntos que el servicio nativo (widget) grabó.
+async function importarPendientesWidget(){
+  const P = pluginGnss(); if(!P || !P.importarPendientes) return;
+  let data; try{ data = await P.importarPendientes(); }catch(e){ return; }
+  if(!data) return;
+  const asegurarProy = async ()=>{
+    if(!S.proy){
+      const proy = { id:nid(), nom:'Temporal ' + new Date().toLocaleDateString('es-CR'), pts:[], tracks:[] };
+      await dbPut('proyectos', proy); S.proy = proy;
+      document.getElementById('proyBtn').querySelector('.val').textContent = proy.nom;
+    }
+  };
+  const dePt = a=> ({ lat:a[0], lon:a[1], alt:(a[2]==null?null:a[2]), exac:(a[3]==null?null:a[3]),
+                      vexac:(a[4]==null?null:a[4]), altElip:(a[2]==null?null:a[2]), altOrto:null,
+                      fuente:(data.track&&data.track.fuente)||'fused', t:a[5] });
+  let algo = false, nT = 0, nP = 0;
+  if(data.track && Array.isArray(data.track.pts) && data.track.pts.length){
+    await asegurarProy();
+    const pts = data.track.pts.map(dePt);
+    let dist = 0; for(let i=1;i<pts.length;i++) dist += distM(pts[i-1].lat,pts[i-1].lon,pts[i].lat,pts[i].lon);
+    const tr = { id:nid(), proy:S.proy.id, nom:'Track widget ' + new Date(data.track.ini||Date.now()).toLocaleString('es-CR'),
+                 pts, dist, ini:data.track.ini||Date.now(), aceptados:pts.length, rechazados:0,
+                 geojson:{ type:'Feature', geometry:{type:'LineString',coordinates:pts.map(p=>[p.lon,p.lat])}, properties:{} } };
+    await dbPut('tracks', tr); algo = true; nT = pts.length;
+  }
+  if(Array.isArray(data.puntos) && data.puntos.length){
+    await asegurarProy();
+    for(const a of data.puntos){
+      const base = dePt(a); const n = S.puntos.length + 1;
+      const p = Object.assign({ id:nid(), proy:S.proy.id, nom:'W'+String(n).padStart(3,'0'), desc:'(widget)', promediado:false }, base);
+      await dbPut('puntos', p); S.puntos.push(p); nP++;
+    }
+    algo = true;
+  }
+  if(algo){ if(S.proy) await cargarProyecto(S.proy.id); dibujar(); toast(`Importado del widget: ${nT?nT+' pts de track':''}${nT&&nP?' · ':''}${nP?nP+' puntos':''}.`); }
 }
 let primerFix = false;
 let ultimoGuardadoCentro = 0;
@@ -960,7 +1025,7 @@ function alFix(pos){
     geoide:pos.geoide, hdop:ultimoHdop, cn0:ultimoCn0Mean
   });
   if(S.seguir){ S.centro.lat = c.latitude; S.centro.lon = c.longitude; }
-  dibujar();
+  pedirDibujo();
 }
 function alErrorGPS(e){
   document.getElementById('estadoRed').textContent = 'GPS: ' +
@@ -1165,21 +1230,20 @@ async function alternarTrack(){
   dibujar();
 }
 
-// Inicia el servicio en primer plano y fuerza GPS puro (lectura nativa fiable
-// con la pantalla apagada). Guarda la fuente previa para restaurarla al parar.
+// Inicia el servicio en primer plano (mantiene el proceso vivo con la pantalla
+// apagada). NO cambia la fuente: respeta la que eligió el usuario (fused por
+// defecto, más rápida con internet).
 async function iniciarServicioTrack(){
   const P = pluginGnss();
-  if(!P){ toast('Grabando. (Pantalla encendida; sin servicio nativo)'); return; }
+  fuentePrevTrack = null;
+  if(!P){ toast('Grabando.'); return; }
   try{
     await P.requestNotifPermission();
-    // GPS puro: la lectura nativa sigue en background; navigator.geolocation no.
-    if(S.fuente!=='gps'){ fuentePrevTrack = S.fuente; S.fuente='gps'; await aplicarFuente(); }
-    else fuentePrevTrack = null;
     await P.startForegroundTracking({ text: 'Grabando… tocá para volver a la app' });
     toast('Grabando. Podés apagar la pantalla; sigue registrando.');
   }catch(e){
     console.log('servicio track error', e);
-    toast('Grabando. (No se pudo iniciar el servicio de fondo)');
+    toast('Grabando.');
   }
 }
 async function detenerServicioTrack(){
