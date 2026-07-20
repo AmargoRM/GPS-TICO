@@ -331,7 +331,7 @@ function distM(a1,o1,a2,o2){
 let DB = null;
 function abrirDB(){
   return new Promise((ok, mal)=>{
-    const r = indexedDB.open('garua-campo', 1);
+    const r = indexedDB.open('garua-campo', 2);
     r.onupgradeneeded = ()=>{
       const d = r.result;
       if(!d.objectStoreNames.contains('proyectos')) d.createObjectStore('proyectos',{keyPath:'id'});
@@ -339,6 +339,7 @@ function abrirDB(){
       if(!d.objectStoreNames.contains('tracks'))    d.createObjectStore('tracks',{keyPath:'id'}).createIndex('proy','proy');
       if(!d.objectStoreNames.contains('tiles'))     d.createObjectStore('tiles');
       if(!d.objectStoreNames.contains('conf'))      d.createObjectStore('conf');
+      if(!d.objectStoreNames.contains('capas'))     d.createObjectStore('capas',{keyPath:'id'}); // capas del usuario (F: capas)
     };
     r.onsuccess = ()=>{ DB = r.result; ok(DB); };
     r.onerror = ()=> mal(r.error);
@@ -397,6 +398,7 @@ const S = {
   filtros: { activo:false, preset:'normal', hdopMax:5, satMin:6, exacMax:10, cn0Min:20, avisar:true }, // F5
   proy: null,          // proyecto activo
   fix: null,           // último fix normalizado (coords + metadatos)
+  capas: [],           // capas del usuario (GeoJSON/WFS/WMS)
   grabando: null,      // track en curso
   seguir: true,        // centrar mapa en el fix
   centro: { lat: 9.4318, lon: -84.1620 },   // Quepos
@@ -438,26 +440,23 @@ function medir(){
   dibujar();
 }
 
-// tile() es SINCRÓNICA: devuelve el tile de la caché en RAM si está,
+// tileGen() es SINCRÓNICA: devuelve el tile de la caché en RAM si está,
 // o null y dispara la carga en segundo plano (que al terminar redibuja).
-function tile(z,x,y,capa){
-  const n = 2**z;
-  x = ((x%n)+n)%n;
-  if(y<0 || y>=n) return null;
-  const k = `${capa}/${z}/${x}/${y}`;
+// Sirve para el mapa base y para capas WMS del usuario.
+function tileGen(k, url){
   if(memTiles.has(k)) return memTiles.get(k);
   if(pidiendo.has(k)) return null;
   pidiendo.add(k);
-  cargarTile(z,x,y,capa,k);
+  cargarTileURL(k, url);
   return null;
 }
-async function cargarTile(z,x,y,capa,k){
+async function cargarTileURL(k, url){
   try{
     let blob = await dbGet('tiles', k);
     if(!blob){
       if(!navigator.onLine){ pidiendo.delete(k); return; }
       try{
-        const r = await fetch(CAPAS[capa].url(z,x,y), {signal: AbortSignal.timeout(8000)});
+        const r = await fetch(url, {signal: AbortSignal.timeout(8000)});
         if(!r.ok) throw 0;
         blob = await r.blob();
         dbPut('tiles', blob, k).catch(()=>{});
@@ -471,6 +470,71 @@ async function cargarTile(z,x,y,capa,k){
     pidiendo.delete(k);
     dibujar();
   }catch(e){ pidiendo.delete(k); }
+}
+function tile(z,x,y,capa){
+  const n = 2**z;
+  x = ((x%n)+n)%n;
+  if(y<0 || y>=n) return null;
+  return tileGen(`${capa}/${z}/${x}/${y}`, CAPAS[capa].url(z,x,y));
+}
+// Capa WMS del usuario: construye la petición GetMap con la bbox del tile en
+// Web Mercator (EPSG:3857) y la cachea igual que el mapa base.
+const MERC_MAX = 20037508.342789244;
+function wmsUrl(layer, z, x, y){
+  const n = 2**z;
+  const tileSize = (MERC_MAX*2) / n;
+  const minx = -MERC_MAX + x*tileSize;
+  const maxx = minx + tileSize;
+  const maxy = MERC_MAX - y*tileSize;
+  const miny = maxy - tileSize;
+  const v = layer.version || '1.3.0';
+  const base = layer.url.split('?')[0];
+  const p = new URLSearchParams({
+    SERVICE:'WMS', REQUEST:'GetMap', VERSION:v,
+    LAYERS: layer.capa||'', STYLES:'',
+    FORMAT: layer.format||'image/png', TRANSPARENT:'true',
+    WIDTH:'256', HEIGHT:'256'
+  });
+  // EPSG:3857 usa orden X,Y en ambas versiones.
+  const crs = (v==='1.3.0') ? ('CRS=EPSG:3857') : ('SRS=EPSG:3857');
+  return `${base}?${p.toString()}&${crs}&BBOX=${minx},${miny},${maxx},${maxy}`;
+}
+function tileWMS(z,x,y,layer){
+  const n = 2**z;
+  x = ((x%n)+n)%n;
+  if(y<0 || y>=n) return null;
+  return tileGen(`wms_${layer.id}/${z}/${x}/${y}`, wmsUrl(layer, z, x, y));
+}
+
+// Dibuja las capas vectoriales del usuario (GeoJSON/WFS) sobre el mapa.
+function dibujarCapasVector(aPant){
+  for(const capa of S.capas){
+    if(!capa.visible || capa.tipo==='wms' || !capa.geojson) continue;
+    const fc = capa.geojson;
+    const feats = fc.type==='FeatureCollection' ? (fc.features||[])
+                : fc.type==='Feature' ? [fc] : [];
+    const color = capa.color || '#E0A458';
+    for(const f of feats) dibujarGeom(f && f.geometry, aPant, color);
+  }
+}
+function dibujarGeom(g, aPant, color){
+  if(!g) return;
+  const linea = (coords, cerrar)=>{
+    ctx.beginPath();
+    for(let i=0;i<coords.length;i++){ const p = aPant(coords[i][1], coords[i][0]); if(i===0) ctx.moveTo(p.x,p.y); else ctx.lineTo(p.x,p.y); }
+    if(cerrar){ ctx.closePath(); ctx.fillStyle = color+'33'; ctx.fill(); }
+    ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.stroke();
+  };
+  const punto = (c)=>{ const p = aPant(c[1],c[0]); ctx.beginPath(); ctx.arc(p.x,p.y,4,0,7); ctx.fillStyle = color; ctx.fill(); ctx.lineWidth=1.5; ctx.strokeStyle='#0A1214'; ctx.stroke(); };
+  switch(g.type){
+    case 'Point': punto(g.coordinates); break;
+    case 'MultiPoint': g.coordinates.forEach(punto); break;
+    case 'LineString': linea(g.coordinates, false); break;
+    case 'MultiLineString': g.coordinates.forEach(l=> linea(l,false)); break;
+    case 'Polygon': g.coordinates.forEach(r=> linea(r,true)); break;
+    case 'MultiPolygon': g.coordinates.forEach(poly=> poly.forEach(r=> linea(r,true))); break;
+    case 'GeometryCollection': (g.geometries||[]).forEach(gg=> dibujarGeom(gg, aPant, color)); break;
+  }
 }
 
 function dibujar(){
@@ -500,7 +564,22 @@ function dibujar(){
       }
     }
   }
-  if(!hayTiles){
+  // Capas WMS del usuario (raster, encima del mapa base).
+  let hayWMS = false;
+  for(const capa of S.capas){
+    if(!capa.visible || capa.tipo!=='wms') continue;
+    for(let ty=ty0; ty<=ty1; ty++){
+      for(let tx=tx0; tx<=tx1; tx++){
+        const img = tileWMS(zi,tx,ty,capa);
+        if(img && !(img instanceof Promise)){
+          hayWMS = true;
+          const sx = (tx*256 - x0)*esc, sy = (ty*256 - y0)*esc;
+          ctx.drawImage(img, Math.round(sx), Math.round(sy), Math.ceil(ts)+1, Math.ceil(ts)+1);
+        }
+      }
+    }
+  }
+  if(!hayTiles && !hayWMS){
     ctx.fillStyle = '#0A1214';
     ctx.fillRect(0, 0, W, H);
     ctx.fillStyle = '#6E8B8666';
@@ -513,6 +592,9 @@ function dibujar(){
     x: (lon2px(lon,zi) - x0)*esc,
     y: (lat2px(lat,zi) - y0)*esc
   });
+
+  // Capas vectoriales del usuario (GeoJSON / WFS), debajo de puntos y tracks.
+  dibujarCapasVector(aPant);
 
   // tracks guardados
   ctx.lineJoin = ctx.lineCap = 'round';
@@ -1151,6 +1233,7 @@ document.getElementById('btnMenu').onclick = ()=>{
     <div class="fila"><div class="cuerpo"><div class="t">Fuente de posición</div><div class="s">${S.fuente==='gps'?'GPS puro (nativo)':'Fusionada (GPS+WiFi+celda)'}</div></div><button class="mini" id="mFuente">Cambiar</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Diagnóstico GNSS</div><div class="s">Satélites, L5, exactitud</div></div><button class="mini" id="mDiag">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Filtros de calidad</div><div class="s">${S.filtros.activo?'Activo · '+S.filtros.preset:'Apagado'}</div></div><button class="mini" id="mFilt">Abrir</button></div>
+    <div class="fila"><div class="cuerpo"><div class="t">Capas del proyecto</div><div class="s">${S.capas.length} capa(s) · GeoJSON · WFS · WMS</div></div><button class="mini" id="mCapas">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Puntos y tracks</div><div class="s">${S.puntos.length} puntos · ${S.tracks.length} tracks</div></div><button class="mini" id="mDatos">Ver</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Convertir coordenadas</div><div class="s">Geo ↔ CRTM05 ↔ Lambert N/S</div></div><button class="mini" id="mConv">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Mapa sin conexión</div><div class="s">Descargar el área visible</div></div><button class="mini" id="mOff">Abrir</button></div>
@@ -1160,6 +1243,7 @@ document.getElementById('btnMenu').onclick = ()=>{
   document.getElementById('mFuente').onclick = panelFuente;
   document.getElementById('mDiag').onclick  = panelDiagnosticos;
   document.getElementById('mFilt').onclick  = panelFiltros;
+  document.getElementById('mCapas').onclick = panelCapas;
   document.getElementById('mDatos').onclick = panelDatos;
   document.getElementById('mConv').onclick  = panelConv;
   document.getElementById('mOff').onclick   = panelOffline;
@@ -1568,6 +1652,100 @@ function avisarRechazo(){
   if(ahora - ultimoAvisoRechazo > 4000){ ultimoAvisoRechazo = ahora; toast('✗ Punto filtrado (calidad baja)'); }
 }
 
+/* --- capas del usuario: GeoJSON / WFS / WMS --- */
+const PALETA_CAPAS = ['#E0A458','#4FD1C5','#C75146','#6FCF6F','#B07CC6','#E06AA0','#8899AA'];
+function colorCapa(i){ return PALETA_CAPAS[i % PALETA_CAPAS.length]; }
+
+async function guardarCapaVector(nombre, gj){
+  // Normaliza a FeatureCollection (acepta Feature o geometría suelta).
+  let fc = gj;
+  if(!gj || !gj.type){ toast('El contenido no es GeoJSON válido.'); return; }
+  if(gj.type !== 'FeatureCollection'){
+    fc = { type:'FeatureCollection', features: gj.type==='Feature' ? [gj] : [{type:'Feature',geometry:gj,properties:{}}] };
+  }
+  const capa = { id:nid(), nombre:(nombre||'Capa').slice(0,40), tipo:'geojson', visible:true,
+                 color: colorCapa(S.capas.length), geojson: fc };
+  await dbPut('capas', capa); S.capas.push(capa); dibujar();
+  toast(`Capa "${capa.nombre}": ${(fc.features||[]).length} elementos.`);
+  panelCapas();
+}
+function agregarCapaArchivo(file){
+  const reader = new FileReader();
+  reader.onload = ()=>{ try{ guardarCapaVector(file.name.replace(/\.(geo)?json$/i,''), JSON.parse(reader.result)); }
+                        catch(e){ toast('Archivo GeoJSON inválido.'); } };
+  reader.onerror = ()=> toast('No se pudo leer el archivo.');
+  reader.readAsText(file);
+}
+async function agregarCapaURL(nombre, url){
+  if(!url){ toast('Pegá la URL.'); return; }
+  toast('Descargando capa…');
+  try{
+    const r = await fetch(url, {signal: AbortSignal.timeout(20000)});
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    const gj = await r.json();
+    await guardarCapaVector(nombre || 'Capa', gj);
+  }catch(e){ toast('No se pudo cargar. ¿La URL devuelve GeoJSON en WGS84?'); }
+}
+async function agregarCapaWMS(nombre, url, layerName, version){
+  if(!url || !layerName){ toast('Faltan URL o nombre de capa.'); return; }
+  const capa = { id:nid(), nombre:(nombre||layerName).slice(0,40), tipo:'wms', visible:true,
+                 url, capa:layerName, version:version||'1.3.0', format:'image/png' };
+  await dbPut('capas', capa); S.capas.push(capa); dibujar();
+  toast(`Capa WMS "${capa.nombre}" agregada.`);
+  panelCapas();
+}
+async function toggleCapa(id){ const c=S.capas.find(x=>x.id===id); if(!c) return; c.visible=!c.visible; await dbPut('capas',c); dibujar(); panelCapas(); }
+async function borrarCapa(id){
+  // Borra también sus tiles WMS cacheados.
+  const c = S.capas.find(x=>x.id===id);
+  await dbDel('capas', id); S.capas = S.capas.filter(x=>x.id!==id);
+  if(c && c.tipo==='wms'){ for(const k of Array.from(memTiles.keys())) if(k.startsWith('wms_'+id+'/')) memTiles.delete(k); }
+  dibujar(); panelCapas();
+}
+function panelCapas(){
+  abrirPanel('Capas del proyecto', `
+    ${S.capas.length ? S.capas.map(c=>`<div class="fila">
+        <div class="cuerpo"><div class="t"><span style="color:${c.color||'#8899AA'}">■</span> ${c.nombre}</div><div class="s">${c.tipo==='wms'?'WMS':'Vector'}${c.tipo!=='wms'?' · '+((c.geojson.features||[]).length)+' elem.':''}</div></div>
+        <button class="mini ${c.visible?'verde':''}" data-tg="${c.id}">${c.visible?'ON':'off'}</button>
+        <button class="mini rojo" data-bc="${c.id}">×</button>
+      </div>`).join('') : '<div class="vacio">Sin capas todavía. Agregá una abajo.</div>'}
+    <label>Agregar capa</label>
+    <select id="capTipo">
+      <option value="file">GeoJSON (archivo del teléfono)</option>
+      <option value="urlgj">GeoJSON / WFS (enlace)</option>
+      <option value="wms">WMS (enlace)</option>
+    </select>
+    <div id="capForm"></div>
+    <div class="nota">Las capas vectoriales deben estar en <b>WGS84 (lon/lat)</b>. WMS se pide en Web Mercator. Shapefile todavía no; convertilo a GeoJSON (ej. en QGIS o mapshaper.org) e importalo como archivo.</div>
+  `);
+  document.querySelectorAll('[data-tg]').forEach(b=> b.onclick = ()=> toggleCapa(b.dataset.tg));
+  document.querySelectorAll('[data-bc]').forEach(b=> b.onclick = ()=> borrarCapa(b.dataset.bc));
+  const sel = document.getElementById('capTipo');
+  const render = ()=>{
+    const cf = document.getElementById('capForm');
+    if(sel.value==='file'){
+      cf.innerHTML = `<input type="file" id="capFile" accept=".geojson,.json,application/geo+json,application/json" style="margin-top:8px">
+        <button class="ancho" id="capAdd">Agregar archivo</button>`;
+      document.getElementById('capAdd').onclick = ()=>{ const f=document.getElementById('capFile').files[0]; if(!f){toast('Elegí un archivo.');return;} agregarCapaArchivo(f); };
+    } else if(sel.value==='urlgj'){
+      cf.innerHTML = `<label>Nombre</label><input id="capNom" placeholder="Fincas">
+        <label>URL que devuelve GeoJSON</label><input id="capUrl" placeholder="https://.../wfs?...&outputFormat=application/json&srsName=EPSG:4326">
+        <button class="ancho" id="capAdd">Descargar y agregar</button>`;
+      document.getElementById('capAdd').onclick = ()=> agregarCapaURL(document.getElementById('capNom').value.trim(), document.getElementById('capUrl').value.trim());
+    } else {
+      cf.innerHTML = `<label>Nombre</label><input id="capNom" placeholder="Ortofoto">
+        <label>URL del servicio WMS</label><input id="capUrl" placeholder="https://.../wms">
+        <label>Capa (parámetro LAYERS)</label><input id="capLyr" placeholder="ORTOFOTO_2017">
+        <label>Versión</label><select id="capVer"><option>1.3.0</option><option>1.1.1</option></select>
+        <button class="ancho" id="capAdd">Agregar WMS</button>`;
+      document.getElementById('capAdd').onclick = ()=> agregarCapaWMS(
+        document.getElementById('capNom').value.trim(), document.getElementById('capUrl').value.trim(),
+        document.getElementById('capLyr').value.trim(), document.getElementById('capVer').value);
+    }
+  };
+  sel.onchange = render; render();
+}
+
 /* --- diagnosticos gnss (F0) --- */
 // Constelaciones GnssStatus: 1=GPS 2=SBAS 3=GLONASS 4=QZSS 5=BEIDOU 6=GALILEO 7=IRNSS
 const CONSTEL = {
@@ -1751,6 +1929,7 @@ function exportarDiagCSV(){
   S.capa = await dbGet('conf','capa') || 'sat';
   const filtGuardados = await dbGet('conf','filtros');
   if(filtGuardados) S.filtros = Object.assign(S.filtros, filtGuardados);
+  try{ S.capas = await dbAll('capas') || []; }catch(e){ S.capas = []; }
   document.querySelectorAll('#modo button').forEach(b=> b.setAttribute('aria-pressed', b.dataset.m===S.modo));
   document.getElementById('btnCapa').textContent = CAPAS[S.capa].nom;
   document.getElementById('coordSys').textContent = PROY[S.modo].nom;
