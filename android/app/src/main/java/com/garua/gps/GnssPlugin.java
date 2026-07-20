@@ -120,6 +120,42 @@ public class GnssPlugin extends Plugin {
         notifyListeners("stopTrackRequested", new JSObject());
     }
 
+    // ---- HTTP nativo (evita CORS del WebView para WMS/WFS/GeoJSON) ----
+    @PluginMethod
+    public void httpGet(final PluginCall call) {
+        final String url = call.getString("url");
+        if (url == null || url.isEmpty()) { call.reject("URL vacía"); return; }
+        new Thread(new Runnable() {
+            @Override public void run() {
+                java.net.HttpURLConnection conn = null;
+                try {
+                    conn = (java.net.HttpURLConnection) new java.net.URL(url).openConnection();
+                    conn.setConnectTimeout(15000);
+                    conn.setReadTimeout(25000);
+                    conn.setInstanceFollowRedirects(true);
+                    conn.setRequestProperty("User-Agent", "GPS-TICO/1.0");
+                    conn.setRequestProperty("Accept", "*/*");
+                    int code = conn.getResponseCode();
+                    java.io.InputStream is = (code >= 200 && code < 400) ? conn.getInputStream() : conn.getErrorStream();
+                    java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
+                    byte[] buf = new byte[8192]; int n;
+                    if (is != null) { while ((n = is.read(buf)) > 0) bos.write(buf, 0, n); is.close(); }
+                    String ct = conn.getContentType();
+                    String b64 = android.util.Base64.encodeToString(bos.toByteArray(), android.util.Base64.NO_WRAP);
+                    JSObject r = new JSObject();
+                    r.put("status", code);
+                    r.put("contentType", ct == null ? "" : ct);
+                    r.put("dataBase64", b64);
+                    call.resolve(r);
+                } catch (Exception e) {
+                    call.reject("http error: " + e.getMessage());
+                } finally {
+                    if (conn != null) conn.disconnect();
+                }
+            }
+        }).start();
+    }
+
     @PluginMethod
     @SuppressLint("MissingPermission")
     public void startGnssListener(PluginCall call) {

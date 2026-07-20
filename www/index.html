@@ -443,22 +443,29 @@ function medir(){
 // tileGen() es SINCRÓNICA: devuelve el tile de la caché en RAM si está,
 // o null y dispara la carga en segundo plano (que al terminar redibuja).
 // Sirve para el mapa base y para capas WMS del usuario.
-function tileGen(k, url){
+function tileGen(k, url, nativo){
   if(memTiles.has(k)) return memTiles.get(k);
   if(pidiendo.has(k)) return null;
   pidiendo.add(k);
-  cargarTileURL(k, url);
+  cargarTileURL(k, url, nativo);
   return null;
 }
-async function cargarTileURL(k, url){
+async function cargarTileURL(k, url, nativo){
   try{
     let blob = await dbGet('tiles', k);
     if(!blob){
       if(!navigator.onLine){ pidiendo.delete(k); return; }
       try{
-        const r = await fetch(url, {signal: AbortSignal.timeout(8000)});
-        if(!r.ok) throw 0;
-        blob = await r.blob();
+        if(nativo){
+          // WMS: bajar por nativo para saltar CORS.
+          const r = await httpGet(url);
+          if(r.status<200 || r.status>=400) throw 0;
+          blob = new Blob([r.bytes], {type: r.contentType || 'image/png'});
+        } else {
+          const r = await fetch(url, {signal: AbortSignal.timeout(8000)});
+          if(!r.ok) throw 0;
+          blob = await r.blob();
+        }
         dbPut('tiles', blob, k).catch(()=>{});
       }catch(e){
         pidiendo.delete(k); return;
@@ -503,7 +510,7 @@ function tileWMS(z,x,y,layer){
   const n = 2**z;
   x = ((x%n)+n)%n;
   if(y<0 || y>=n) return null;
-  return tileGen(`wms_${layer.id}/${z}/${x}/${y}`, wmsUrl(layer, z, x, y));
+  return tileGen(`wms_${layer.id}/${z}/${x}/${y}`, wmsUrl(layer, z, x, y), true);
 }
 
 // Dibuja las capas vectoriales del usuario (GeoJSON/WFS) sobre el mapa.
@@ -1694,6 +1701,72 @@ function avisarRechazo(){
 const PALETA_CAPAS = ['#E0A458','#4FD1C5','#C75146','#6FCF6F','#B07CC6','#E06AA0','#8899AA'];
 function colorCapa(i){ return PALETA_CAPAS[i % PALETA_CAPAS.length]; }
 
+// HTTP por nativo (salta CORS). En navegador cae a fetch normal.
+async function httpGet(url){
+  const P = pluginGnss();
+  if(P && P.httpGet){
+    const r = await P.httpGet({ url });
+    const bytes = Uint8Array.from(atob(r.dataBase64), c=> c.charCodeAt(0));
+    return { status:r.status, contentType:r.contentType||'', bytes };
+  }
+  const resp = await fetch(url, {signal: AbortSignal.timeout(20000)});
+  const bytes = new Uint8Array(await resp.arrayBuffer());
+  return { status:resp.status, contentType: resp.headers.get('content-type')||'', bytes };
+}
+function bytesATexto(bytes){ return new TextDecoder('utf-8').decode(bytes); }
+function sinQuery(u){ return (u||'').split('?')[0]; }
+
+// Lee GetCapabilities y lista capas/feature types (maneja espacios de nombres por localName).
+function parseCapabilities(xmlText, tag){
+  const doc = new DOMParser().parseFromString(xmlText, 'text/xml');
+  const out = [];
+  const nodos = doc.getElementsByTagName('*');
+  for(let i=0;i<nodos.length;i++){
+    const el = nodos[i];
+    if(el.localName!==tag) continue;
+    let name=null, title=null;
+    for(let j=0;j<el.children.length;j++){
+      const ch = el.children[j];
+      if(ch.localName==='Name' && !name) name = ch.textContent.trim();
+      else if(ch.localName==='Title' && !title) title = ch.textContent.trim();
+    }
+    if(name) out.push({ name, title: title||name });
+  }
+  return out;
+}
+async function escanearWMS(url){
+  const base = sinQuery(url);
+  const cap = `${base}?SERVICE=WMS&REQUEST=GetCapabilities`;
+  const r = await httpGet(cap);
+  if(r.status<200||r.status>=400) throw new Error('HTTP '+r.status);
+  return parseCapabilities(bytesATexto(r.bytes), 'Layer');
+}
+async function escanearWFS(url){
+  const base = sinQuery(url);
+  const cap = `${base}?SERVICE=WFS&REQUEST=GetCapabilities`;
+  const r = await httpGet(cap);
+  if(r.status<200||r.status>=400) throw new Error('HTTP '+r.status);
+  return parseCapabilities(bytesATexto(r.bytes), 'FeatureType');
+}
+function urlWfsGeoJSON(base, typeName){
+  const b = sinQuery(base);
+  const p = new URLSearchParams({ service:'WFS', version:'2.0.0', request:'GetFeature',
+    typeNames:typeName, outputFormat:'application/json', srsName:'EPSG:4326', count:'10000' });
+  return `${b}?${p.toString()}`;
+}
+async function agregarCapaWFS(nombre, base, typeName){
+  toast('Descargando capa WFS…');
+  try{
+    const r = await httpGet(urlWfsGeoJSON(base, typeName));
+    if(r.status<200||r.status>=400) throw new Error('HTTP '+r.status);
+    const txt = bytesATexto(r.bytes);
+    let gj;
+    try{ gj = JSON.parse(txt); }
+    catch(e){ toast('El servidor no devolvió GeoJSON (¿no soporta outputFormat=application/json?).'); return; }
+    await guardarCapaVector(nombre||typeName, gj);
+  }catch(e){ toast('No se pudo descargar el WFS: '+(e.message||e)); }
+}
+
 async function guardarCapaVector(nombre, gj){
   // Normaliza a FeatureCollection (acepta Feature o geometría suelta).
   let fc = gj;
@@ -1718,11 +1791,13 @@ async function agregarCapaURL(nombre, url){
   if(!url){ toast('Pegá la URL.'); return; }
   toast('Descargando capa…');
   try{
-    const r = await fetch(url, {signal: AbortSignal.timeout(20000)});
-    if(!r.ok) throw new Error('HTTP '+r.status);
-    const gj = await r.json();
+    const r = await httpGet(url);
+    if(r.status<200||r.status>=400) throw new Error('HTTP '+r.status);
+    let gj;
+    try{ gj = JSON.parse(bytesATexto(r.bytes)); }
+    catch(e){ toast('La URL no devolvió GeoJSON. Si es un servicio WFS/WMS, usá esa opción para escanear capas.'); return; }
     await guardarCapaVector(nombre || 'Capa', gj);
-  }catch(e){ toast('No se pudo cargar. ¿La URL devuelve GeoJSON en WGS84?'); }
+  }catch(e){ toast('No se pudo cargar: '+(e.message||e)); }
 }
 async function agregarCapaWMS(nombre, url, layerName, version){
   if(!url || !layerName){ toast('Faltan URL o nombre de capa.'); return; }
@@ -1749,12 +1824,13 @@ function panelCapas(){
       </div>`).join('') : '<div class="vacio">Sin capas todavía. Agregá una abajo.</div>'}
     <label>Agregar capa</label>
     <select id="capTipo">
+      <option value="wms">WMS (servicio) — escanear capas</option>
+      <option value="wfs">WFS (servicio) — escanear capas</option>
+      <option value="geojson_url">GeoJSON (enlace directo)</option>
       <option value="file">GeoJSON (archivo del teléfono)</option>
-      <option value="urlgj">GeoJSON / WFS (enlace)</option>
-      <option value="wms">WMS (enlace)</option>
     </select>
     <div id="capForm"></div>
-    <div class="nota">Las capas vectoriales deben estar en <b>WGS84 (lon/lat)</b>. WMS se pide en Web Mercator. Shapefile todavía no; convertilo a GeoJSON (ej. en QGIS o mapshaper.org) e importalo como archivo.</div>
+    <div class="nota">Pegá el enlace del <b>servicio</b> WMS/WFS (el mismo que usás en QGIS) y tocá <b>Escanear</b>: la app lista las capas disponibles para elegir. Las descargas van por HTTP nativo, así que sirve aunque el servidor no permita CORS. Vectores en WGS84. Shapefile: convertilo a GeoJSON (QGIS / mapshaper.org).</div>
   `);
   document.querySelectorAll('[data-tg]').forEach(b=> b.onclick = ()=> toggleCapa(b.dataset.tg));
   document.querySelectorAll('[data-bc]').forEach(b=> b.onclick = ()=> borrarCapa(b.dataset.bc));
@@ -1765,23 +1841,45 @@ function panelCapas(){
       cf.innerHTML = `<input type="file" id="capFile" accept=".geojson,.json,application/geo+json,application/json" style="margin-top:8px">
         <button class="ancho" id="capAdd">Agregar archivo</button>`;
       document.getElementById('capAdd').onclick = ()=>{ const f=document.getElementById('capFile').files[0]; if(!f){toast('Elegí un archivo.');return;} agregarCapaArchivo(f); };
-    } else if(sel.value==='urlgj'){
+    } else if(sel.value==='geojson_url'){
       cf.innerHTML = `<label>Nombre</label><input id="capNom" placeholder="Fincas">
-        <label>URL que devuelve GeoJSON</label><input id="capUrl" placeholder="https://.../wfs?...&outputFormat=application/json&srsName=EPSG:4326">
+        <label>URL que devuelve GeoJSON</label><input id="capUrl" placeholder="https://.../algo.geojson">
         <button class="ancho" id="capAdd">Descargar y agregar</button>`;
       document.getElementById('capAdd').onclick = ()=> agregarCapaURL(document.getElementById('capNom').value.trim(), document.getElementById('capUrl').value.trim());
+    } else if(sel.value==='wfs'){
+      cf.innerHTML = `<label>URL del servicio WFS</label><input id="capUrl" placeholder="https://.../wfs o /ows">
+        <button class="ancho borde" id="capScan">Escanear capas</button>
+        <div id="capLista"></div>`;
+      document.getElementById('capScan').onclick = ()=> escanearYListar('wfs');
     } else {
-      cf.innerHTML = `<label>Nombre</label><input id="capNom" placeholder="Ortofoto">
-        <label>URL del servicio WMS</label><input id="capUrl" placeholder="https://.../wms">
-        <label>Capa (parámetro LAYERS)</label><input id="capLyr" placeholder="ORTOFOTO_2017">
-        <label>Versión</label><select id="capVer"><option>1.3.0</option><option>1.1.1</option></select>
-        <button class="ancho" id="capAdd">Agregar WMS</button>`;
-      document.getElementById('capAdd').onclick = ()=> agregarCapaWMS(
-        document.getElementById('capNom').value.trim(), document.getElementById('capUrl').value.trim(),
-        document.getElementById('capLyr').value.trim(), document.getElementById('capVer').value);
+      cf.innerHTML = `<label>URL del servicio WMS</label><input id="capUrl" placeholder="https://.../wms o /ows">
+        <button class="ancho borde" id="capScan">Escanear capas</button>
+        <div id="capLista"></div>`;
+      document.getElementById('capScan').onclick = ()=> escanearYListar('wms');
     }
   };
   sel.onchange = render; render();
+}
+async function escanearYListar(tipo){
+  const url = document.getElementById('capUrl').value.trim();
+  if(!url){ toast('Pegá la URL del servicio.'); return; }
+  const cont = document.getElementById('capLista');
+  cont.innerHTML = '<div class="k" style="margin-top:8px">Escaneando…</div>';
+  try{
+    const capas = tipo==='wms' ? await escanearWMS(url) : await escanearWFS(url);
+    if(!capas.length){ cont.innerHTML = '<div class="nota" style="border-color:var(--sangre)">No se encontraron capas. ¿La URL es del servicio '+tipo.toUpperCase()+'?</div>'; return; }
+    cont.innerHTML = `<label>Capas disponibles (${capas.length})</label>
+      <select id="capSel">${capas.map(c=>`<option value="${c.name.replace(/"/g,'&quot;')}">${(c.title||c.name).slice(0,60)}</option>`).join('')}</select>
+      <button class="ancho" id="capAddSel">Agregar capa seleccionada</button>`;
+    document.getElementById('capAddSel').onclick = ()=>{
+      const name = document.getElementById('capSel').value;
+      const title = document.getElementById('capSel').selectedOptions[0].textContent;
+      if(tipo==='wms') agregarCapaWMS(title, url, name, '1.3.0');
+      else agregarCapaWFS(title, url, name);
+    };
+  }catch(e){
+    cont.innerHTML = '<div class="nota" style="border-color:var(--sangre)">No se pudo escanear: '+((e&&e.message)||e)+'. Verificá la URL del servicio.</div>';
+  }
 }
 
 /* --- diagnosticos gnss (F0) --- */
