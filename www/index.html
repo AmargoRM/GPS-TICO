@@ -105,6 +105,13 @@ label{display:block;font-size:9px;letter-spacing:.14em;text-transform:uppercase;
 .atbl{width:100%;border-collapse:collapse;font-size:11px;font-family:var(--mono)}
 .atbl th,.atbl td{padding:4px 7px;border-bottom:1px solid var(--cauce);text-align:left;white-space:nowrap}
 .atbl th{color:var(--musgo);font-weight:600;position:sticky;top:0;background:var(--lecho)}
+.flot[data-on="1"]{background:var(--fix);color:var(--abismo);border-color:var(--fix)}
+#herramienta{position:absolute;left:10px;right:10px;bottom:10px;background:rgba(18,32,35,.94);border:1px solid var(--fix);border-radius:10px;padding:9px 11px;display:none;backdrop-filter:blur(6px);z-index:6}
+#herramienta.on{display:block}
+#herrTexto{font-family:var(--mono);font-size:13px;color:var(--niebla);line-height:1.4}
+#herrBotones{display:flex;gap:6px;margin-top:8px;flex-wrap:wrap}
+#herrBotones button{background:var(--cauce);border:none;color:var(--niebla);border-radius:6px;padding:7px 10px;font-size:12px;font-family:var(--ui)}
+#herrBotones button.pri{background:var(--fix);color:var(--abismo);font-weight:600}
 </style>
 </head>
 <body>
@@ -131,6 +138,12 @@ label{display:block;font-size:9px;letter-spacing:.14em;text-transform:uppercase;
   <div id="capaBtns">
     <button class="flot" id="btnCapa">SATÉLITE</button>
     <button class="flot" id="btnCentrar">◎</button>
+    <button class="flot" id="btnMedir" title="Medir">📏</button>
+    <button class="flot" id="btnNav" title="Navegar">🧭</button>
+  </div>
+  <div id="herramienta">
+    <div id="herrTexto">—</div>
+    <div id="herrBotones"></div>
   </div>
   <div id="toast"></div>
 </div>
@@ -688,6 +701,8 @@ function dibujar(){
     ctx.strokeStyle = 'rgba(10,18,20,.9)'; ctx.lineWidth = 3;
     ctx.strokeText(p.nom, s.x, s.y-11); ctx.fillText(p.nom, s.x, s.y-11);
   }
+  // herramientas: medición y navegación
+  dibujarHerramientas(aPant);
   // posición actual
   if(S.fix){
     const c = S.fix.coords, s = aPant(c.latitude, c.longitude);
@@ -766,7 +781,11 @@ cv.addEventListener('pointermove', e=>{
     const dt = Date.now() - tapInicio.t;
     if(mov < 16 && dt < 500){
       const r = cv.getBoundingClientRect();
-      consultarEnPantalla(e.clientX - r.left, e.clientY - r.top);
+      const px = e.clientX - r.left, py = e.clientY - r.top;
+      const ll = pantallaALatLon(px, py);
+      if(modoMapa==='medir' && ll){ medicion.pts.push(ll); actualizarHerramienta(); pedirDibujo(); }
+      else if(modoMapa==='navegar' && ll){ navDestino = ll; navRuta = null; actualizarHerramienta(); pedirDibujo(); }
+      else consultarEnPantalla(px, py);
     }
   }
   tapInicio = null;
@@ -932,7 +951,53 @@ async function arrancarGPS(){
   await aplicarFuente();
   // Importar lo que haya grabado el widget en segundo plano.
   await importarPendientesWidget();
-  document.addEventListener('visibilitychange', ()=>{ if(!document.hidden) importarPendientesWidget(); });
+  document.addEventListener('visibilitychange', ()=>{ if(!document.hidden){ importarPendientesWidget(); consumirArchivoAbierto(); } });
+  // Archivo con el que se abrió la app (GeoJSON/GPX).
+  if(P){ await P.addListener('fileOpened', (ev)=> abrirArchivoImportado(ev)); }
+  await consumirArchivoAbierto();
+}
+async function consumirArchivoAbierto(){
+  const P = pluginGnss(); if(!P || !P.consumePendingFile) return;
+  try{ const f = await P.consumePendingFile(); if(f && f.text) abrirArchivoImportado(f); }catch(e){}
+}
+async function abrirArchivoImportado(f){
+  if(!f || !f.text) return;
+  const nombre = (f.name||'archivo').replace(/\.(geojson|json|gpx)$/i,'');
+  const esGpx = f.kind==='gpx' || /^\s*<\?xml|<gpx/i.test(f.text);
+  try{
+    if(esGpx){ await importarGPX(nombre, f.text); }
+    else{ const gj = JSON.parse(f.text); await guardarCapaVector(nombre, gj); }
+  }catch(e){ toast('No se pudo abrir el archivo (¿formato válido?).'); }
+}
+async function importarGPX(nombre, xml){
+  const doc = new DOMParser().parseFromString(xml, 'application/xml');
+  const num = (el,a)=> parseFloat(el.getAttribute(a));
+  const txt = (el,tag)=>{ const n=el.getElementsByTagName(tag)[0]; return n?n.textContent.trim():''; };
+  await (async()=>{ if(!S.proy){ const proy={id:nid(),nom:(nombre||'Importado').slice(0,40),pts:[],tracks:[]}; await dbPut('proyectos',proy); S.proy=proy; document.getElementById('proyBtn').querySelector('.val').textContent=proy.nom; } })();
+  let nP=0, nT=0;
+  // waypoints -> puntos
+  const wpts = doc.getElementsByTagName('wpt');
+  for(let i=0;i<wpts.length;i++){
+    const w=wpts[i]; const lat=num(w,'lat'), lon=num(w,'lon'); if(isNaN(lat)||isNaN(lon)) continue;
+    const ele=parseFloat(txt(w,'ele'));
+    const n=S.puntos.length+1;
+    const p={ id:nid(), proy:S.proy.id, nom:(txt(w,'name')||('P'+String(n).padStart(3,'0'))), desc:txt(w,'desc'),
+              lat, lon, alt:(isNaN(ele)?null:ele), altElip:(isNaN(ele)?null:ele), altOrto:null, exac:null, fuente:'importado', promediado:false, t:Date.now() };
+    await dbPut('puntos', p); S.puntos.push(p); nP++;
+  }
+  // tracks
+  const trks = doc.getElementsByTagName('trk');
+  for(let i=0;i<trks.length;i++){
+    const tk=trks[i]; const segs=tk.getElementsByTagName('trkpt'); const pts=[];
+    for(let j=0;j<segs.length;j++){ const s=segs[j]; const lat=num(s,'lat'), lon=num(s,'lon'); if(isNaN(lat)||isNaN(lon)) continue; const ele=parseFloat(txt(s,'ele')); pts.push({lat,lon,alt:(isNaN(ele)?null:ele),t:Date.now()}); }
+    if(pts.length<2) continue;
+    let dist=0; for(let j=1;j<pts.length;j++) dist+=distM(pts[j-1].lat,pts[j-1].lon,pts[j].lat,pts[j].lon);
+    const tr={ id:nid(), proy:S.proy.id, nom:(txt(tk,'name')||('Track '+(nT+1))), pts, dist, ini:Date.now(),
+               geojson:{type:'Feature',geometry:{type:'LineString',coordinates:pts.map(p=>[p.lon,p.lat])},properties:{}} };
+    await dbPut('tracks', tr); nT++;
+  }
+  if(S.proy) await cargarProyecto(S.proy.id); dibujar();
+  toast(`GPX importado: ${nP} puntos · ${nT} track(s).`);
 }
 // Trae a IndexedDB el track y los puntos que el servicio nativo (widget) grabó.
 async function importarPendientesWidget(){
@@ -1025,6 +1090,7 @@ function alFix(pos){
     geoide:pos.geoide, hdop:ultimoHdop, cn0:ultimoCn0Mean
   });
   if(S.seguir){ S.centro.lat = c.latitude; S.centro.lon = c.longitude; }
+  if(modoMapa==='navegar' && navDestino) actualizarHerramienta();
   pedirDibujo();
 }
 function alErrorGPS(e){
@@ -1337,6 +1403,8 @@ document.getElementById('btnCentrar').onclick = ()=>{
   S.centro.lat = S.fix.coords.latitude; S.centro.lon = S.fix.coords.longitude;
   dibujar();
 };
+document.getElementById('btnMedir').onclick = ()=> setModoMapa('medir');
+document.getElementById('btnNav').onclick   = ()=> setModoMapa('navegar');
 
 /* --- marcar punto --- */
 document.getElementById('btnWp').onclick = ()=>{
@@ -1944,13 +2012,14 @@ function pantallaALatLon(px,py){ if(!ultimoT) return null; const t=ultimoT; cons
 function distSegPx(px,py,a,b){ const dx=b.x-a.x,dy=b.y-a.y,l2=dx*dx+dy*dy; let t=l2?((px-a.x)*dx+(py-a.y)*dy)/l2:0; t=Math.max(0,Math.min(1,t)); return Math.hypot(px-(a.x+t*dx), py-(a.y+t*dy)); }
 function puntoEnAnillo(lon,lat,ring){ let d=false; for(let i=0,j=ring.length-1;i<ring.length;j=i++){ const xi=ring[i][0],yi=ring[i][1],xj=ring[j][0],yj=ring[j][1]; if(((yi>lat)!=(yj>lat)) && (lon<(xj-xi)*(lat-yi)/(yj-yi)+xi)) d=!d; } return d; }
 function puntoEnPolig(lon,lat,rings){ let dentro=false; for(const r of rings){ if(puntoEnAnillo(lon,lat,r)) dentro=!dentro; } return dentro; }
+const TOL_PUNTO = 26, TOL_LINEA = 16;   // radios de acierto en px (dedo)
 function hitGeom(g, px, py, ll){
   if(!g) return false;
   const P = c=> latlonAPantalla(c[1],c[0]);
   switch(g.type){
-    case 'Point': { const p=P(g.coordinates); return !!p && Math.hypot(px-p.x,py-p.y)<14; }
-    case 'MultiPoint': return g.coordinates.some(c=>{ const p=P(c); return !!p && Math.hypot(px-p.x,py-p.y)<14; });
-    case 'LineString': { const pts=g.coordinates.map(P); for(let i=1;i<pts.length;i++){ if(pts[i-1]&&pts[i]&&distSegPx(px,py,pts[i-1],pts[i])<10) return true; } return false; }
+    case 'Point': { const p=P(g.coordinates); return !!p && Math.hypot(px-p.x,py-p.y)<TOL_PUNTO; }
+    case 'MultiPoint': return g.coordinates.some(c=>{ const p=P(c); return !!p && Math.hypot(px-p.x,py-p.y)<TOL_PUNTO; });
+    case 'LineString': { const pts=g.coordinates.map(P); for(let i=1;i<pts.length;i++){ if(pts[i-1]&&pts[i]&&distSegPx(px,py,pts[i-1],pts[i])<TOL_LINEA) return true; } return false; }
     case 'MultiLineString': return g.coordinates.some(l=> hitGeom({type:'LineString',coordinates:l},px,py,ll));
     case 'Polygon': return puntoEnPolig(ll.lon,ll.lat,g.coordinates);
     case 'MultiPolygon': return g.coordinates.some(poly=> puntoEnPolig(ll.lon,ll.lat,poly));
@@ -1958,9 +2027,105 @@ function hitGeom(g, px, py, ll){
   }
   return false;
 }
+/* --- herramientas de mapa: medición y navegación --- */
+let modoMapa = 'consulta';   // 'consulta' | 'medir' | 'navegar'
+let medicion = { pts:[], unidad:'m' };
+let navDestino = null;       // {lat,lon}
+let navRuta = null;          // { coords:[[lon,lat]...], dist, dur }
+
+function fmtDist(m, unidad){
+  if(unidad==='km' || (unidad==null && m>=1000)) return (m/1000).toFixed(m>=10000?1:2)+' km';
+  return m.toFixed(m<100?1:0)+' m';
+}
+function setModoMapa(m){
+  modoMapa = (modoMapa===m) ? 'consulta' : m;
+  document.getElementById('btnMedir').dataset.on = modoMapa==='medir' ? '1' : '0';
+  document.getElementById('btnNav').dataset.on   = modoMapa==='navegar' ? '1' : '0';
+  if(modoMapa==='medir' && !medicion.pts.length) toast('Tocá el mapa para agregar puntos de medición.');
+  if(modoMapa==='navegar' && !navDestino) toast('Tocá un punto de destino en el mapa.');
+  actualizarHerramienta(); pedirDibujo();
+}
+function actualizarHerramienta(){
+  const barra = document.getElementById('herramienta');
+  const txt = document.getElementById('herrTexto');
+  const btns = document.getElementById('herrBotones');
+  if(modoMapa==='medir'){
+    barra.classList.add('on');
+    let d = 0; for(let i=1;i<medicion.pts.length;i++) d += distM(medicion.pts[i-1].lat, medicion.pts[i-1].lon, medicion.pts[i].lat, medicion.pts[i].lon);
+    txt.innerHTML = `<b>Medición</b> · ${medicion.pts.length} punto(s)<br>Distancia: <b>${fmtDist(d, medicion.unidad)}</b>`;
+    btns.innerHTML = `<button id="hUnidad">${medicion.unidad==='km'?'m':'km'}</button><button id="hDeshacer">Deshacer</button><button id="hLimpiar">Limpiar</button><button id="hSalir">Salir</button>`;
+    document.getElementById('hUnidad').onclick = ()=>{ medicion.unidad = medicion.unidad==='km'?'m':'km'; actualizarHerramienta(); };
+    document.getElementById('hDeshacer').onclick = ()=>{ medicion.pts.pop(); actualizarHerramienta(); pedirDibujo(); };
+    document.getElementById('hLimpiar').onclick = ()=>{ medicion.pts = []; actualizarHerramienta(); pedirDibujo(); };
+    document.getElementById('hSalir').onclick = ()=> setModoMapa('medir');
+  } else if(modoMapa==='navegar'){
+    barra.classList.add('on');
+    let info = 'Tocá un punto de destino.';
+    if(navDestino){
+      let recta = S.fix ? distM(S.fix.coords.latitude, S.fix.coords.longitude, navDestino.lat, navDestino.lon) : null;
+      info = `<b>Destino</b> ${navDestino.lat.toFixed(5)}, ${navDestino.lon.toFixed(5)}<br>` +
+             (recta!=null ? `En línea recta: <b>${fmtDist(recta)}</b>` : 'Esperando posición GPS…');
+      if(navRuta) info += `<br>Por calles: <b>${fmtDist(navRuta.dist)}</b> · ${Math.round(navRuta.dur/60)} min`;
+    }
+    txt.innerHTML = info;
+    btns.innerHTML = `<button class="pri" id="hRuta">Ruta por calles</button><button id="hQuitar">Quitar destino</button><button id="hSalir">Salir</button>`;
+    document.getElementById('hRuta').onclick = calcularRutaCalles;
+    document.getElementById('hQuitar').onclick = ()=>{ navDestino=null; navRuta=null; actualizarHerramienta(); pedirDibujo(); };
+    document.getElementById('hSalir').onclick = ()=> setModoMapa('navegar');
+  } else {
+    barra.classList.remove('on');
+  }
+}
+async function calcularRutaCalles(){
+  if(!navDestino){ toast('Tocá un destino primero.'); return; }
+  if(!S.fix){ toast('Sin posición GPS todavía.'); return; }
+  const o = S.fix.coords;
+  mostrarCargando('Calculando ruta…');
+  try{
+    // OSRM público (a pie). Requiere internet.
+    const url = `https://router.project-osrm.org/route/v1/foot/${o.longitude},${o.latitude};${navDestino.lon},${navDestino.lat}?overview=full&geometries=geojson`;
+    const r = await httpGet(url);
+    const j = JSON.parse(bytesATexto(r.bytes));
+    if(j && j.routes && j.routes.length){
+      const rt = j.routes[0];
+      navRuta = { coords: rt.geometry.coordinates, dist: rt.distance, dur: rt.duration };
+      actualizarHerramienta(); pedirDibujo();
+    } else { toast('No se encontró ruta por calles.'); }
+  }catch(e){ toast('No se pudo calcular la ruta (requiere internet).'); }
+  finally{ ocultarCargando(); }
+}
+// Dibuja medición y navegación sobre el mapa.
+function dibujarHerramientas(aPant){
+  // Medición: polilínea + vértices.
+  if(medicion.pts.length){
+    ctx.strokeStyle = '#4FD1C5'; ctx.lineWidth = 3; ctx.setLineDash([]);
+    ctx.beginPath();
+    medicion.pts.forEach((p,i)=>{ const s=aPant(p.lat,p.lon); if(i===0)ctx.moveTo(s.x,s.y); else ctx.lineTo(s.x,s.y); });
+    ctx.stroke();
+    for(const p of medicion.pts){ const s=aPant(p.lat,p.lon); ctx.beginPath(); ctx.arc(s.x,s.y,5,0,7); ctx.fillStyle='#4FD1C5'; ctx.fill(); ctx.lineWidth=1.5; ctx.strokeStyle='#0A1214'; ctx.stroke(); }
+  }
+  // Navegación: ruta por calles (si hay) + línea recta al destino.
+  if(navRuta && navRuta.coords){
+    ctx.strokeStyle = '#6FCF6F'; ctx.lineWidth = 4; ctx.setLineDash([]);
+    ctx.beginPath();
+    navRuta.coords.forEach((c,i)=>{ const s=aPant(c[1],c[0]); if(i===0)ctx.moveTo(s.x,s.y); else ctx.lineTo(s.x,s.y); });
+    ctx.stroke();
+  }
+  if(navDestino){
+    const d = aPant(navDestino.lat, navDestino.lon);
+    if(S.fix){
+      const o = aPant(S.fix.coords.latitude, S.fix.coords.longitude);
+      ctx.strokeStyle = '#E0A458'; ctx.lineWidth = 2; ctx.setLineDash([8,6]);
+      ctx.beginPath(); ctx.moveTo(o.x,o.y); ctx.lineTo(d.x,d.y); ctx.stroke();
+      ctx.setLineDash([]);
+    }
+    ctx.beginPath(); ctx.arc(d.x,d.y,7,0,7); ctx.fillStyle='#E0A458'; ctx.fill();
+    ctx.lineWidth=2; ctx.strokeStyle='#0A1214'; ctx.stroke();
+  }
+}
 function consultarEnPantalla(px,py){
   const ll = pantallaALatLon(px,py); if(!ll) return;
-  // 1) Capas vectoriales (GeoJSON / WFS): consulta local.
+  // 1) Capas vectoriales (GeoJSON / WFS): acierto directo.
   for(let i=S.capas.length-1;i>=0;i--){
     const c = S.capas[i];
     if(!c.visible || c.tipo==='wms' || c.consultable===false || !c.geojson) continue;
@@ -1968,13 +2133,54 @@ function consultarEnPantalla(px,py){
     const encontrados = feats.filter(f=> hitGeom(f&&f.geometry, px, py, ll));
     if(encontrados.length){ mostrarAtributos(c, encontrados); return; }
   }
-  // 2) Capas WMS (imagen): se le pregunta al servidor con GetFeatureInfo.
+  // 2) Punto del proyecto (marcado o promediado).
+  let mejorP=null, mejorD=30;
+  for(const p of S.puntos){ const s=latlonAPantalla(p.lat,p.lon); if(!s) continue; const d=Math.hypot(px-s.x,py-s.y); if(d<mejorD){ mejorD=d; mejorP=p; } }
+  if(mejorP){ mostrarPunto(mejorP); return; }
+  // 3) Elemento vectorial MÁS CERCANO (vértice) dentro de ~34px, por si el dedo cayó cerca.
+  let mejor=null, mejorDist=34, mejorCapa=null;
+  for(let i=S.capas.length-1;i>=0;i--){
+    const c = S.capas[i];
+    if(!c.visible || c.tipo==='wms' || c.consultable===false || !c.geojson) continue;
+    const feats = c.geojson.type==='FeatureCollection' ? (c.geojson.features||[]) : c.geojson.type==='Feature' ? [c.geojson] : [];
+    for(const f of feats){
+      const d = distVerticesPx(f && f.geometry, px, py);
+      if(d < mejorDist){ mejorDist = d; mejor = f; mejorCapa = c; }
+    }
+  }
+  if(mejor){ mostrarAtributos(mejorCapa, [mejor]); return; }
+  // 4) WMS: preguntar al servidor.
   for(let i=S.capas.length-1;i>=0;i--){
     const c = S.capas[i];
     if(!c.visible || c.tipo!=='wms' || c.consultable===false) continue;
-    consultarWMS(c, px, py);
-    return;
+    consultarWMS(c, px, py); return;
   }
+}
+// Distancia mínima (px) del toque a cualquier vértice de la geometría.
+function distVerticesPx(g, px, py){
+  if(!g) return Infinity;
+  let min = Infinity;
+  const rec = coords=>{
+    if(typeof coords[0]==='number'){ const s=latlonAPantalla(coords[1],coords[0]); if(s){ const d=Math.hypot(px-s.x,py-s.y); if(d<min) min=d; } }
+    else for(const c of coords) rec(c);
+  };
+  if(g.type==='GeometryCollection'){ for(const gg of (g.geometries||[])) min=Math.min(min, distVerticesPx(gg,px,py)); }
+  else if(g.coordinates) rec(g.coordinates);
+  return min;
+}
+function mostrarPunto(p){
+  const f = fmtCoord(p.lat, p.lon, S.modo);
+  const rows = [
+    ['Nombre', p.nom], ['Descripción', p.desc||''],
+    [PROY[S.modo].nom, f.a+'  '+f.b],
+    ['Exactitud', (p.exac!=null?p.exac.toFixed(1)+' m':'—')],
+    ['Altura orto', (p.altOrto!=null?p.altOrto.toFixed(1)+' m':'—')],
+    ['Altura elip', (p.altElip!=null?p.altElip.toFixed(1)+' m':(p.alt!=null?p.alt.toFixed(1)+' m':'—'))],
+    ['Fuente', p.fuente||'fused'],
+    ['Tipo', p.promediado?('promediado · '+(p.muestras||'?')+' muestras · σ'+(p.desvStd!=null?p.desvStd.toFixed(2):'?')+'m'):'instantáneo'],
+    ['Fecha', new Date(p.t).toLocaleString('es-CR')]
+  ];
+  abrirPanel('Punto · '+p.nom, rows.map(([k,v])=>`<div class="res"><div class="k">${escHtml(k)}</div><div class="v" style="font-size:12px;word-break:break-word">${escHtml(v)}</div></div>`).join(''));
 }
 function lon2merc(lon){ return lon*MERC_MAX/180; }
 function lat2merc(lat){ const y = Math.log(Math.tan((90+lat)*Math.PI/360))/(Math.PI/180); return y*MERC_MAX/180; }

@@ -15,6 +15,7 @@ public class MainActivity extends BridgeActivity {
         // Acción del widget en arranque en frío: se guarda y JS la consume al iniciar.
         String action = getIntent() != null ? getIntent().getStringExtra("widget_action") : null;
         if (action != null) WidgetActionBridge.setPending(action);
+        manejarArchivo(getIntent());
     }
 
     @Override
@@ -24,5 +25,45 @@ public class MainActivity extends BridgeActivity {
         // App ya viva (arranque en caliente): entregar la acción al plugin → JS.
         String action = intent != null ? intent.getStringExtra("widget_action") : null;
         if (action != null) WidgetActionBridge.deliver(action);
+        manejarArchivo(intent);
+    }
+
+    // Abrió un archivo con GPS TICO (GeoJSON / GPX): leerlo y pasarlo a JS.
+    private void manejarArchivo(Intent intent) {
+        if (intent == null) return;
+        if (!Intent.ACTION_VIEW.equals(intent.getAction())) return;
+        android.net.Uri uri = intent.getData();
+        if (uri == null) return;
+        try {
+            String nombre = nombreDe(uri);
+            String kind = (nombre != null && nombre.toLowerCase().endsWith(".gpx")) ? "gpx" : "geojson";
+            java.io.InputStream in = getContentResolver().openInputStream(uri);
+            if (in == null) return;
+            java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
+            byte[] buf = new byte[8192]; int n;
+            while ((n = in.read(buf)) > 0) bos.write(buf, 0, n);
+            in.close();
+            String texto = new String(bos.toByteArray(), "UTF-8");
+            // Si no había extensión clara, inferir por contenido.
+            if (kind.equals("geojson") && texto.contains("<gpx")) kind = "gpx";
+            FileOpenBridge.set(nombre != null ? nombre : "archivo", kind, texto);
+        } catch (Exception ignored) {}
+    }
+
+    private String nombreDe(android.net.Uri uri) {
+        String nombre = null;
+        try {
+            if ("content".equals(uri.getScheme())) {
+                android.database.Cursor c = getContentResolver().query(uri, null, null, null, null);
+                if (c != null) {
+                    int i = c.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME);
+                    if (c.moveToFirst() && i >= 0) nombre = c.getString(i);
+                    c.close();
+                }
+            } else {
+                nombre = uri.getLastPathSegment();
+            }
+        } catch (Exception ignored) {}
+        return nombre;
     }
 }

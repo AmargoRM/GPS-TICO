@@ -33,13 +33,30 @@ public class GnssPlugin extends Plugin {
         locationManager = (LocationManager) getContext().getSystemService(android.content.Context.LOCATION_SERVICE);
         TrackServiceBridge.register(this);
         WidgetActionBridge.register(this);
+        FileOpenBridge.register(this);
     }
 
     @Override
     protected void handleOnDestroy() {
         TrackServiceBridge.unregister(this);
         WidgetActionBridge.unregister(this);
+        FileOpenBridge.unregister(this);
         super.handleOnDestroy();
+    }
+
+    // ---- Abrir archivos GeoJSON/GPX asociados a la app ----
+    public void emitFileOpened(String name, String kind, String text) {
+        JSObject o = new JSObject();
+        o.put("name", name); o.put("kind", kind); o.put("text", text);
+        notifyListeners("fileOpened", o);
+    }
+
+    @PluginMethod
+    public void consumePendingFile(PluginCall call) {
+        JSObject o = new JSObject();
+        String[] f = FileOpenBridge.consume();
+        if (f != null) { o.put("name", f[0]); o.put("kind", f[1]); o.put("text", f[2]); }
+        call.resolve(o);
     }
 
     // ---- Widget de la pantalla de inicio ----
