@@ -59,6 +59,21 @@ public class GnssPlugin extends Plugin {
         call.resolve(o);
     }
 
+    // Abre una app externa (Waze, Maps, navegador) con una URL/intent.
+    @PluginMethod
+    public void abrirExterno(PluginCall call) {
+        String url = call.getString("url");
+        if (url == null || url.isEmpty()) { call.reject("URL vacía"); return; }
+        try {
+            Intent i = new Intent(Intent.ACTION_VIEW, android.net.Uri.parse(url));
+            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            getContext().startActivity(i);
+            call.resolve();
+        } catch (Exception e) {
+            call.reject("No hay app para abrir eso: " + e.getMessage());
+        }
+    }
+
     // ---- Widget de la pantalla de inicio ----
 
     // Emite la acción del widget a JS (arranque en caliente).

@@ -748,12 +748,24 @@ function trazar(pts, aPant){
 let toques = new Map(), ultDist = 0, arrastrando = false;
 let tapInicio = null;   // para distinguir un toque (consulta) de un arrastre
 let uso_movio_mapa = false;  // el usuario interactuó con el mapa antes del primer fix
+let lpTimer = null;     // temporizador de clic sostenido (chincheta)
+function cancelarLongPress(){ if(lpTimer){ clearTimeout(lpTimer); lpTimer = null; } }
 cv.addEventListener('pointerdown', e=>{
   cv.setPointerCapture(e.pointerId);
   toques.set(e.pointerId, {x:e.clientX, y:e.clientY});
   if(toques.size===1) tapInicio = {x:e.clientX, y:e.clientY, t:Date.now()};
   else tapInicio = null;
   if(toques.size===2){ const [a,b]=[...toques.values()]; ultDist = Math.hypot(a.x-b.x, a.y-b.y); }
+  // Clic sostenido (600 ms) con un solo dedo = poner chincheta.
+  cancelarLongPress();
+  if(toques.size===1){
+    const dx0 = e.clientX, dy0 = e.clientY;
+    lpTimer = setTimeout(()=>{
+      lpTimer = null;
+      const r = cv.getBoundingClientRect();
+      ponerChincheta(dx0 - r.left, dy0 - r.top);
+    }, 600);
+  }
   // Si el usuario explora el mapa, ocultar "buscando GPS" y no robarle el encuadre luego.
   const cg = document.getElementById('cargaGps');
   if(cg && cg.classList.contains('on')){ cg.classList.remove('on'); uso_movio_mapa = true; }
@@ -764,9 +776,10 @@ cv.addEventListener('pointermove', e=>{
   toques.set(e.pointerId, {x:e.clientX, y:e.clientY});
   if(toques.size===1){
     const dx = e.clientX-prev.x, dy = e.clientY-prev.y;
-    if(Math.abs(dx)+Math.abs(dy) > 2){ arrastrando = true; S.seguir = false; }
+    if(Math.abs(dx)+Math.abs(dy) > 2){ arrastrando = true; S.seguir = false; cancelarLongPress(); }
     mover(-dx, -dy);
   } else if(toques.size===2){
+    cancelarLongPress();
     const [a,b] = [...toques.values()];
     const d = Math.hypot(a.x-b.x, a.y-b.y);
     if(ultDist>0){ S.zoom = Math.max(2, Math.min(19, S.zoom + Math.log2(d/ultDist))); }
@@ -788,7 +801,7 @@ cv.addEventListener('pointermove', e=>{
       else consultarEnPantalla(px, py);
     }
   }
-  tapInicio = null;
+  tapInicio = null; cancelarLongPress();
   toques.delete(e.pointerId); ultDist = 0;
   setTimeout(()=> arrastrando = false, 50);
 }));
@@ -966,7 +979,7 @@ async function abrirArchivoImportado(f){
   const esGpx = f.kind==='gpx' || /^\s*<\?xml|<gpx/i.test(f.text);
   try{
     if(esGpx){ await importarGPX(nombre, f.text); }
-    else{ const gj = JSON.parse(f.text); await guardarCapaVector(nombre, gj); }
+    else{ const gj = JSON.parse(f.text); const capa = await guardarCapaVector(nombre, gj, true); if(capa) toast('GeoJSON cargado como capa: '+capa.nombre); }
   }catch(e){ toast('No se pudo abrir el archivo (¿formato válido?).'); }
 }
 async function importarGPX(nombre, xml){
@@ -1960,18 +1973,31 @@ async function agregarCapaWFS(nombre, base, typeName){
   }catch(e){ toast('No se pudo descargar el WFS: '+(e.message||e)); }
 }
 
-async function guardarCapaVector(nombre, gj){
+async function guardarCapaVector(nombre, gj, silencioso){
   // Normaliza a FeatureCollection (acepta Feature o geometría suelta).
   let fc = gj;
-  if(!gj || !gj.type){ toast('El contenido no es GeoJSON válido.'); return; }
+  if(!gj || !gj.type){ toast('El contenido no es GeoJSON válido.'); return null; }
   if(gj.type !== 'FeatureCollection'){
     fc = { type:'FeatureCollection', features: gj.type==='Feature' ? [gj] : [{type:'Feature',geometry:gj,properties:{}}] };
   }
   const capa = { id:nid(), nombre:(nombre||'Capa').slice(0,40), tipo:'geojson', visible:true, consultable:true,
                  color: colorCapa(S.capas.length), geojson: fc };
-  await dbPut('capas', capa); S.capas.push(capa); dibujar();
+  await dbPut('capas', capa); S.capas.push(capa);
   toast(`Capa "${capa.nombre}": ${(fc.features||[]).length} elementos.`);
-  panelCapas();
+  if(silencioso){ centrarEnCapa(capa); dibujar(); }
+  else { dibujar(); panelCapas(); }
+  return capa;
+}
+// Centra el mapa en la caja envolvente de una capa vectorial.
+function centrarEnCapa(capa){
+  const feats = capa.geojson.type==='FeatureCollection' ? (capa.geojson.features||[]) : [capa.geojson];
+  let b=[Infinity,Infinity,-Infinity,-Infinity];
+  for(const f of feats){ if(!f||!f.geometry) continue; const bb=bboxGeom(f.geometry); if(bb[0]<b[0])b[0]=bb[0]; if(bb[1]<b[1])b[1]=bb[1]; if(bb[2]>b[2])b[2]=bb[2]; if(bb[3]>b[3])b[3]=bb[3]; }
+  if(!isFinite(b[0])) return;
+  S.centro.lon = (b[0]+b[2])/2; S.centro.lat = (b[1]+b[3])/2; S.seguir = false;
+  // Ajustar zoom aproximado al ancho de la caja.
+  const anchoLon = Math.max(1e-4, b[2]-b[0]);
+  S.zoom = Math.max(3, Math.min(18, Math.log2(360/anchoLon) + 0.5));
 }
 function agregarCapaArchivo(file){
   mostrarCargando('Leyendo archivo…');
@@ -2027,9 +2053,11 @@ function hitGeom(g, px, py, ll){
   }
   return false;
 }
-/* --- herramientas de mapa: medición y navegación --- */
+/* --- herramientas de mapa: medición, navegación y chincheta --- */
 let modoMapa = 'consulta';   // 'consulta' | 'medir' | 'navegar'
 let medicion = { pts:[], unidad:'m' };
+let chincheta = null;        // {lat,lon} referencia manual
+let chinchetaBuf = 0;        // radio del buffer en metros (0 = sin buffer)
 let navDestino = null;       // {lat,lon}
 let navRuta = null;          // { coords:[[lon,lat]...], dist, dur }
 
@@ -2122,6 +2150,93 @@ function dibujarHerramientas(aPant){
     ctx.beginPath(); ctx.arc(d.x,d.y,7,0,7); ctx.fillStyle='#E0A458'; ctx.fill();
     ctx.lineWidth=2; ctx.strokeStyle='#0A1214'; ctx.stroke();
   }
+  // Chincheta manual + buffer circular.
+  if(chincheta){
+    if(chinchetaBuf>0){
+      const circ = circuloGeo(chincheta.lat, chincheta.lon, chinchetaBuf, 72);
+      ctx.beginPath();
+      circ.forEach((c,i)=>{ const s=aPant(c[1],c[0]); if(i===0)ctx.moveTo(s.x,s.y); else ctx.lineTo(s.x,s.y); });
+      ctx.closePath();
+      ctx.fillStyle = 'rgba(199,81,70,.14)'; ctx.fill();
+      ctx.strokeStyle = '#C75146'; ctx.lineWidth = 2; ctx.stroke();
+    }
+    const s = aPant(chincheta.lat, chincheta.lon);
+    // Pin: círculo con "pata".
+    ctx.beginPath(); ctx.moveTo(s.x, s.y); ctx.lineTo(s.x-6, s.y-12); ctx.lineTo(s.x+6, s.y-12); ctx.closePath();
+    ctx.fillStyle = '#C75146'; ctx.fill();
+    ctx.beginPath(); ctx.arc(s.x, s.y-16, 8, 0, 7); ctx.fillStyle = '#C75146'; ctx.fill();
+    ctx.lineWidth = 2; ctx.strokeStyle = '#0A1214'; ctx.stroke();
+    ctx.beginPath(); ctx.arc(s.x, s.y-16, 3, 0, 7); ctx.fillStyle = '#0A1214'; ctx.fill();
+  }
+}
+// Círculo geográfico (buffer) de radio R metros alrededor de un punto.
+function circuloGeo(lat, lon, R, n){
+  n = n || 64; const pts = [];
+  const dR = R/6371000, la = lat*D2R, lo = lon*D2R;
+  for(let i=0;i<=n;i++){
+    const brg = 2*Math.PI*i/n;
+    const la2 = Math.asin(Math.sin(la)*Math.cos(dR) + Math.cos(la)*Math.sin(dR)*Math.cos(brg));
+    const lo2 = lo + Math.atan2(Math.sin(brg)*Math.sin(dR)*Math.cos(la), Math.cos(dR)-Math.sin(la)*Math.sin(la2));
+    pts.push([lo2*R2D, la2*R2D]);
+  }
+  return pts;
+}
+function ponerChincheta(px, py){
+  const ll = pantallaALatLon(px, py); if(!ll) return;
+  chincheta = { lat:ll.lat, lon:ll.lon };
+  if(navigator.vibrate){ try{ navigator.vibrate(35); }catch(e){} }
+  pedirDibujo(); panelChincheta();
+}
+function panelChincheta(){
+  if(!chincheta) return;
+  const f = fmtCoord(chincheta.lat, chincheta.lon, S.modo);
+  const distGps = S.fix ? distM(S.fix.coords.latitude, S.fix.coords.longitude, chincheta.lat, chincheta.lon) : null;
+  abrirPanel('Chincheta', `
+    <div class="res"><div class="k">${PROY[S.modo].nom}</div><div class="v">${f.a}<br>${f.b}</div></div>
+    ${distGps!=null?`<div class="res"><div class="k">Distancia desde tu GPS</div><div class="v">${fmtDist(distGps)}</div></div>`:''}
+    <label>Buffer (radio en metros)</label>
+    <input id="chBuf" type="number" step="1" min="0" value="${chinchetaBuf||''}" placeholder="ej. 50">
+    <div class="grid2">
+      <button class="ancho" id="chBufOk">Dibujar buffer</button>
+      <button class="ancho borde" id="chBufNo">Quitar buffer</button>
+    </div>
+    <button class="ancho" id="chNav">Navegar aquí (en la app)</button>
+    <div class="grid2">
+      <button class="ancho borde" id="chWaze">Abrir en Waze</button>
+      <button class="ancho borde" id="chMaps">Abrir en Maps</button>
+    </div>
+    <div class="grid2">
+      <button class="ancho borde" id="chGuardar">Guardar como punto</button>
+      <button class="ancho borde" id="chQuitar">Quitar chincheta</button>
+    </div>
+  `);
+  document.getElementById('chBufOk').onclick = ()=>{ chinchetaBuf = Math.max(0, parseFloat(document.getElementById('chBuf').value)||0); pedirDibujo(); toast(chinchetaBuf?('Buffer de '+fmtDist(chinchetaBuf)):'Sin buffer'); };
+  document.getElementById('chBufNo').onclick = ()=>{ chinchetaBuf = 0; document.getElementById('chBuf').value=''; pedirDibujo(); };
+  document.getElementById('chNav').onclick = ()=>{ navDestino = { lat:chincheta.lat, lon:chincheta.lon }; navRuta = null; setModoMapaForzar('navegar'); cerrarPanel(); };
+  document.getElementById('chWaze').onclick = ()=> abrirEnWaze(chincheta.lat, chincheta.lon);
+  document.getElementById('chMaps').onclick = ()=> abrirEnMaps(chincheta.lat, chincheta.lon);
+  document.getElementById('chGuardar').onclick = async ()=>{ await guardarChinchetaComoPunto(); cerrarPanel(); };
+  document.getElementById('chQuitar').onclick = ()=>{ chincheta=null; chinchetaBuf=0; cerrarPanel(); pedirDibujo(); };
+}
+function setModoMapaForzar(m){ modoMapa = m; document.getElementById('btnMedir').dataset.on = m==='medir'?'1':'0'; document.getElementById('btnNav').dataset.on = m==='navegar'?'1':'0'; actualizarHerramienta(); pedirDibujo(); }
+async function guardarChinchetaComoPunto(){
+  if(!S.proy){ const proy={id:nid(),nom:'Temporal '+new Date().toLocaleDateString('es-CR'),pts:[],tracks:[]}; await dbPut('proyectos',proy); S.proy=proy; document.getElementById('proyBtn').querySelector('.val').textContent=proy.nom; }
+  const n = S.puntos.length+1;
+  const p = { id:nid(), proy:S.proy.id, nom:'REF'+String(n).padStart(3,'0'), desc:'(chincheta)', lat:chincheta.lat, lon:chincheta.lon, alt:null, altElip:null, altOrto:null, exac:null, fuente:'manual', promediado:false, t:Date.now() };
+  await dbPut('puntos', p); S.puntos.push(p); dibujar();
+  toast('Punto de referencia guardado: '+p.nom);
+}
+function abrirEnWaze(lat, lon){
+  const url = `https://waze.com/ul?ll=${lat},${lon}&navigate=yes`;
+  const P = pluginGnss();
+  if(P && P.abrirExterno){ P.abrirExterno({url}).catch(()=> toast('No se pudo abrir Waze.')); }
+  else window.open(url, '_system');
+}
+function abrirEnMaps(lat, lon){
+  const url = `geo:${lat},${lon}?q=${lat},${lon}(Destino)`;
+  const P = pluginGnss();
+  if(P && P.abrirExterno){ P.abrirExterno({url}).catch(()=> P.abrirExterno({url:`https://www.google.com/maps/dir/?api=1&destination=${lat},${lon}`}).catch(()=>toast('No se pudo abrir Maps.'))); }
+  else window.open(url, '_system');
 }
 function consultarEnPantalla(px,py){
   const ll = pantallaALatLon(px,py); if(!ll) return;
@@ -2225,14 +2340,21 @@ async function consultarWMS(capa, px, py){
 function escHtml(s){ return String(s==null?'':s).replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c])); }
 function fmtVal(v){ if(v==null) return ''; if(typeof v==='object') return JSON.stringify(v); return String(v); }
 function mostrarAtributos(capa, feats){
-  const f = feats[0];
+  // Preferir un elemento que tenga atributos.
+  const f = feats.find(x=> x && x.properties && Object.keys(x.properties).length) || feats[0];
   const props = (f && f.properties) || {};
   const claves = Object.keys(props);
-  const filas = claves.length
-    ? claves.map(k=>`<div class="res"><div class="k">${escHtml(k)}</div><div class="v" style="font-size:12px;word-break:break-word">${escHtml(fmtVal(props[k]))}</div></div>`).join('')
-    : '<div class="vacio">Este elemento no tiene atributos.</div>';
+  let filas = claves.map(k=>`<div class="res"><div class="k">${escHtml(k)}</div><div class="v" style="font-size:12px;word-break:break-word">${escHtml(fmtVal(props[k]))}</div></div>`).join('');
+  // Siempre mostrar la geometría, aunque no haya atributos.
+  const g = f && f.geometry;
+  if(g){
+    let coordTxt = '';
+    if(g.type==='Point' && g.coordinates) coordTxt = g.coordinates[1].toFixed(6)+', '+g.coordinates[0].toFixed(6);
+    filas += `<div class="res"><div class="k">Geometría</div><div class="v" style="font-size:12px">${escHtml(g.type)}${coordTxt?' · '+coordTxt:''}</div></div>`;
+  }
+  if(!claves.length) filas = `<div class="nota">Este elemento no trae atributos; abajo su geometría.</div>` + filas;
   abrirPanel('Atributos · '+capa.nombre, `
-    ${feats.length>1?`<div class="nota">${feats.length} elementos en este punto; se muestra el primero.</div>`:''}
+    ${feats.length>1?`<div class="nota">${feats.length} elementos aquí; se muestra uno.</div>`:''}
     ${filas}
     <button class="ancho borde" id="atTabla">Ver tabla completa de la capa</button>
   `);

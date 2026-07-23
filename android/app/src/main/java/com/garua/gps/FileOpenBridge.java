@@ -16,13 +16,17 @@ public final class FileOpenBridge {
     public static void register(GnssPlugin p) { plugin = p; }
     public static void unregister(GnssPlugin p) { if (plugin == p) plugin = null; }
 
-    public static void set(String name, String kind, String text) {
+    // Arranque en frío: se guarda hasta que JS lo pida con consume().
+    public static void setPending(String name, String kind, String text) {
         if (text == null) return;
-        if (plugin != null) {
-            plugin.emitFileOpened(name, kind, text);
-        } else {
-            pendingName = name; pendingKind = kind; pendingText = text;
-        }
+        pendingName = name; pendingKind = kind; pendingText = text;
+    }
+
+    // Arranque en caliente: si el plugin (y JS) están listos, emite; si no, guarda.
+    public static void deliver(String name, String kind, String text) {
+        if (text == null) return;
+        if (plugin != null) plugin.emitFileOpened(name, kind, text);
+        else setPending(name, kind, text);
     }
 
     public static String[] consume() {

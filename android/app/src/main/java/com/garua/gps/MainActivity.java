@@ -15,7 +15,7 @@ public class MainActivity extends BridgeActivity {
         // Acción del widget en arranque en frío: se guarda y JS la consume al iniciar.
         String action = getIntent() != null ? getIntent().getStringExtra("widget_action") : null;
         if (action != null) WidgetActionBridge.setPending(action);
-        manejarArchivo(getIntent());
+        manejarArchivo(getIntent(), true);   // frío: guardar pendiente
     }
 
     @Override
@@ -25,11 +25,11 @@ public class MainActivity extends BridgeActivity {
         // App ya viva (arranque en caliente): entregar la acción al plugin → JS.
         String action = intent != null ? intent.getStringExtra("widget_action") : null;
         if (action != null) WidgetActionBridge.deliver(action);
-        manejarArchivo(intent);
+        manejarArchivo(intent, false);       // caliente: entregar al plugin
     }
 
     // Abrió un archivo con GPS TICO (GeoJSON / GPX): leerlo y pasarlo a JS.
-    private void manejarArchivo(Intent intent) {
+    private void manejarArchivo(Intent intent, boolean frio) {
         if (intent == null) return;
         if (!Intent.ACTION_VIEW.equals(intent.getAction())) return;
         android.net.Uri uri = intent.getData();
@@ -44,9 +44,10 @@ public class MainActivity extends BridgeActivity {
             while ((n = in.read(buf)) > 0) bos.write(buf, 0, n);
             in.close();
             String texto = new String(bos.toByteArray(), "UTF-8");
-            // Si no había extensión clara, inferir por contenido.
             if (kind.equals("geojson") && texto.contains("<gpx")) kind = "gpx";
-            FileOpenBridge.set(nombre != null ? nombre : "archivo", kind, texto);
+            String nom = nombre != null ? nombre : "archivo";
+            if (frio) FileOpenBridge.setPending(nom, kind, texto);
+            else FileOpenBridge.deliver(nom, kind, texto);
         } catch (Exception ignored) {}
     }
 
