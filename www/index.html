@@ -612,7 +612,15 @@ function dibujarGeom(g, aPant, est){
   const color = est.color, gr = est.grosor||2, sim = est.punto||'circulo', r = est.tam||5, fa = est.fillAlpha!=null?est.fillAlpha:0.2;
   const linea = (coords, cerrar)=>{
     ctx.beginPath();
-    for(let i=0;i<coords.length;i++){ const p = aPant(coords[i][1], coords[i][0]); if(i===0) ctx.moveTo(p.x,p.y); else ctx.lineTo(p.x,p.y); }
+    // Decimación en pantalla: salta vértices a menos de ~0.8 px del anterior
+    // dibujado. No altera los datos; sólo acelera el trazo de capas densas.
+    let lx=0, ly=0, primero=true;
+    const n = coords.length;
+    for(let i=0;i<n;i++){
+      const p = aPant(coords[i][1], coords[i][0]);
+      if(primero){ ctx.moveTo(p.x,p.y); lx=p.x; ly=p.y; primero=false; }
+      else if(i===n-1 || Math.abs(p.x-lx)+Math.abs(p.y-ly) >= 0.8){ ctx.lineTo(p.x,p.y); lx=p.x; ly=p.y; }
+    }
     if(cerrar){ ctx.closePath(); if(fa>0){ ctx.fillStyle = hexRGBA(color, fa); ctx.fill(); } }
     ctx.strokeStyle = color; ctx.lineWidth = gr; ctx.stroke();
   };
@@ -792,10 +800,12 @@ function dibujar(){
 }
 function trazar(pts, aPant){
   ctx.beginPath();
-  let primero = true;
-  for(const p of pts){
-    const s = aPant(p.lat, p.lon);
-    if(primero){ ctx.moveTo(s.x, s.y); primero = false; } else ctx.lineTo(s.x, s.y);
+  // Decimación en pantalla: salta puntos a <0.8 px del anterior (tracks largos).
+  let lx=0, ly=0, primero=true; const n=pts.length;
+  for(let i=0;i<n;i++){
+    const s = aPant(pts[i].lat, pts[i].lon);
+    if(primero){ ctx.moveTo(s.x, s.y); lx=s.x; ly=s.y; primero=false; }
+    else if(i===n-1 || Math.abs(s.x-lx)+Math.abs(s.y-ly) >= 0.8){ ctx.lineTo(s.x, s.y); lx=s.x; ly=s.y; }
   }
   ctx.stroke();
 }
@@ -1033,6 +1043,7 @@ async function consumirArchivoAbierto(){
 }
 async function abrirArchivoImportado(f){
   if(!f || !f.text) return;
+  if(!chequearTamano(f.text.length)) return;   // evita OOM con archivos enormes
   const nombre = (f.name||'archivo').replace(/\.(geojson|json|gpx|kml)$/i,'');
   const t = f.text;
   const esGpx = f.kind==='gpx' || /<gpx[\s>]/i.test(t);
@@ -1907,7 +1918,7 @@ function panelExport(){
                     p.desvStd!=null?p.desvStd.toFixed(2):'', p.hdopMedio!=null?p.hdopMedio.toFixed(2):'',
                     p.cn0Medio!=null?p.cn0Medio.toFixed(1):'', p.duracion!=null?p.duracion:'' ];
       const base = [p.nom, ...c, orto, elip, p.geoide!=null?p.geoide.toFixed(1):'', p.altOrtoFuente||'',
-                    p.exac.toFixed(1), p.vexac!=null?p.vexac.toFixed(1):'', p.fuente||'fused', ...cal,
+                    p.exac!=null?p.exac.toFixed(1):'', p.vexac!=null?p.vexac.toFixed(1):'', p.fuente||'fused', ...cal,
                     new Date(p.t).toISOString(), p.desc||''];
       if(m!=='geo') base.push(PROY[m].epsg);
       return base.map(v=>`"${String(v).replace(/"/g,'""')}"`).join(',');
@@ -2374,6 +2385,7 @@ async function agregarCapaWFS(nombre, base, typeName){
   try{
     const r = await httpGet(urlWfsGeoJSON(base, typeName));
     if(r.status<200||r.status>=400) throw new Error('HTTP '+r.status);
+    if(r.bytes && !chequearTamano(r.bytes.length||r.bytes.byteLength||0)) return;
     const txt = bytesATexto(r.bytes);
     let gj;
     try{ gj = JSON.parse(txt); }
@@ -2714,8 +2726,22 @@ async function importarShapefileZip(nombre, buf){
   await guardarCapaVector(nombre + suf, gj);
 }
 
+// Límite de tamaño para no desbordar la memoria del WebView (crash por OOM).
+const CAPA_MB = 1048576;
+const CAPA_WARN = 12*CAPA_MB, CAPA_MAX = 45*CAPA_MB;
+function chequearTamano(bytes){
+  const mb = Math.round(bytes/CAPA_MB);
+  if(bytes > CAPA_MAX){
+    toast('Capa demasiado pesada ('+mb+' MB). Máx ~45 MB: simplificala en mapshaper.org o QGIS, dividila por zona, o cargala como servicio WFS/WMS.');
+    return false;
+  }
+  if(bytes > CAPA_WARN) toast('Capa grande ('+mb+' MB): la carga y el mapa pueden ir lentos.');
+  return true;
+}
+
 // Importa una capa desde un archivo del teléfono: GeoJSON, KML, KMZ, SHP o ZIP.
 async function agregarCapaArchivo(file){
+  if(file && file.size!=null && !chequearTamano(file.size)) return;
   const nombre = file.name.replace(/\.(geojson|json|kml|kmz|shp|zip)$/i,'');
   const ext = (file.name.split('.').pop()||'').toLowerCase();
   mostrarCargando('Leyendo archivo…');
@@ -2745,6 +2771,7 @@ async function agregarCapaURL(nombre, url){
   try{
     const r = await httpGet(url);
     if(r.status<200||r.status>=400) throw new Error('HTTP '+r.status);
+    if(r.bytes && !chequearTamano(r.bytes.length||r.bytes.byteLength||0)) return;
     let gj;
     try{ gj = JSON.parse(bytesATexto(r.bytes)); }
     catch(e){ toast('La URL no devolvió GeoJSON. Si es un servicio WFS/WMS, usá esa opción para escanear capas.'); return; }
