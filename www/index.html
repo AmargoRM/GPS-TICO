@@ -368,7 +368,7 @@ function distM(a1,o1,a2,o2){
 let DB = null;
 function abrirDB(){
   return new Promise((ok, mal)=>{
-    const r = indexedDB.open('garua-campo', 3);
+    const r = indexedDB.open('garua-campo', 4);
     r.onupgradeneeded = ()=>{
       const d = r.result;
       if(!d.objectStoreNames.contains('proyectos')) d.createObjectStore('proyectos',{keyPath:'id'});
@@ -378,6 +378,7 @@ function abrirDB(){
       if(!d.objectStoreNames.contains('conf'))      d.createObjectStore('conf');
       if(!d.objectStoreNames.contains('capas'))     d.createObjectStore('capas',{keyPath:'id'}); // capas del usuario (F: capas)
       if(!d.objectStoreNames.contains('zonas'))     d.createObjectStore('zonas',{keyPath:'id'}); // zonas de mapa sin conexión (parches)
+      if(!d.objectStoreNames.contains('bigprops'))  d.createObjectStore('bigprops'); // atributos de capas grandes (por chunks: clave "id:chunk")
     };
     r.onsuccess = ()=>{ DB = r.result; ok(DB); };
     r.onerror = ()=> mal(r.error);
@@ -564,7 +565,9 @@ function bboxGeom(g){
 // recortando por el área visible para rendir con capas grandes.
 function dibujarCapasVector(aPant, vista){
   for(const capa of S.capas){
-    if(!capa.visible || capa.tipo==='wms' || !capa.geojson) continue;
+    if(!capa.visible) continue;
+    if(capa.tipo==='big'){ try{ dibujarBig(capa, aPant, vista); }catch(e){} continue; }
+    if(capa.tipo==='wms' || !capa.geojson) continue;
     const fc = capa.geojson;
     const feats = fc.type==='FeatureCollection' ? (fc.features||[])
                 : fc.type==='Feature' ? [fc] : [];
@@ -2177,6 +2180,7 @@ function itemsLeyendaEnVista(){
   for(const c of S.capas){
     if(!c.visible) continue;
     if(c.tipo==='wms'){ items.push({ color:'#8899AA', nombre:c.nombre, tipo:'wms' }); continue; }
+    if(c.tipo==='big'){ const bb=c.bb; if(bb && !(bb[2]<b.w||bb[0]>b.e||bb[3]<b.s||bb[1]>b.n)) items.push({ color:c.color||'#E0A458', nombre:c.nombre, tipo:'big' }); continue; }
     const feats = c.geojson&&c.geojson.features || [];
     let dentro=false;
     for(const f of feats){ if(!f||!f.geometry) continue; if(!f._bbox) f._bbox=bboxGeom(f.geometry); if(inter(f._bbox)){ dentro=true; break; } }
@@ -2514,6 +2518,12 @@ function panelProyeccion(capaId){
 }
 // Centra el mapa en la caja envolvente de una capa vectorial.
 function centrarEnCapa(capa){
+  if(capa.tipo==='big'){
+    const b=capa.bb; if(!b || !isFinite(b[0])) return;
+    S.centro.lon=(b[0]+b[2])/2; S.centro.lat=(b[1]+b[3])/2; S.seguir=false;
+    const anchoLon=Math.max(1e-4, b[2]-b[0]); S.zoom=Math.max(3, Math.min(18, Math.log2(360/anchoLon)+0.5));
+    return;
+  }
   const feats = capa.geojson.type==='FeatureCollection' ? (capa.geojson.features||[]) : [capa.geojson];
   let b=[Infinity,Infinity,-Infinity,-Infinity];
   for(const f of feats){ if(!f||!f.geometry) continue; const bb=bboxGeom(f.geometry); if(bb[0]<b[0])b[0]=bb[0]; if(bb[1]<b[1])b[1]=bb[1]; if(bb[2]>b[2])b[2]=bb[2]; if(bb[3]>b[3])b[3]=bb[3]; }
@@ -2726,6 +2736,264 @@ async function importarShapefileZip(nombre, buf){
   await guardarCapaVector(nombre + suf, gj);
 }
 
+/* =======================================================================
+   CAPAS GRANDES (GeoJSON de 80 MB o más)
+   - Lectura en streaming: no se carga todo el archivo ni se crea un objeto
+     JS gigante (evita el pico de memoria que crasheaba la app).
+   - Geometría en typed arrays compactos: coordenadas como deltas Float32
+     respecto a un origen (≈5× menos RAM que objetos JS).
+   - Índice espacial por grilla: dibuja/consulta sólo lo visible.
+   - Atributos en IndexedDB (store 'bigprops') por chunks; se leen al tocar.
+   ======================================================================= */
+const BIG_UMBRAL = 8*1048576;      // GeoJSON de archivo > 8 MB usa este motor
+const BIG_MAX    = 400*1048576;    // tope duro razonable
+const PROP_CHUNK = 1000;           // atributos por chunk en IndexedDB
+
+// Escáner de objetos JSON balanceado (respeta comillas y escapes).
+function _scanObjeto(buf, start){
+  let depth=0, inStr=false, esc=false;
+  for(let i=start;i<buf.length;i++){ const ch=buf[i];
+    if(inStr){ if(esc) esc=false; else if(ch==='\\') esc=true; else if(ch==='"') inStr=false; }
+    else if(ch==='"') inStr=true; else if(ch==='{') depth++; else if(ch==='}'){ if(--depth===0) return i+1; }
+  }
+  return -1;
+}
+// Genera los features de un FeatureCollection sin cargar todo en memoria.
+async function* streamFeatures(file){
+  const reader = file.stream().pipeThrough(new TextDecoderStream()).getReader();
+  let buf='', done=false;
+  const fill = async ()=>{ if(done) return false; const r=await reader.read(); if(r.done){ done=true; return false; } buf += r.value; return true; };
+  while(true){                       // ubicar el arreglo "features" [
+    const k = buf.indexOf('"features"');
+    if(k>=0){ const b = buf.indexOf('[', k); if(b>=0){ buf = buf.slice(b+1); break; } }
+    if(buf.length > (1<<20)) buf = buf.slice(-16);
+    if(!await fill()) return;
+  }
+  let p=0;
+  while(true){
+    while(p<buf.length){ const ch=buf[p]; if(ch===' '||ch==='\n'||ch==='\r'||ch==='\t'||ch===',') p++; else break; }
+    if(p>=buf.length){ buf=buf.slice(p); p=0; if(!await fill()) return; continue; }
+    const ch=buf[p];
+    if(ch===']') return;
+    if(ch==='{'){
+      let end=_scanObjeto(buf,p);
+      while(end<0){ buf=buf.slice(p); p=0; if(!await fill()) return; end=_scanObjeto(buf,p); }
+      let feat=null; try{ feat=JSON.parse(buf.slice(p,end)); }catch(e){}
+      if(feat) yield feat;
+      p=end;
+      if(p > (1<<20)){ buf=buf.slice(p); p=0; }
+    } else p++;
+  }
+}
+// Primera coordenada de una geometría (para muestrear proyección/origen).
+function _primeraCoordGeom(g){
+  if(!g) return null;
+  let hit=null; const rec=a=>{ if(hit) return; if(typeof a[0]==='number') hit=a; else for(const x of a){ rec(x); if(hit) return; } };
+  if(g.type==='GeometryCollection'){ for(const gg of (g.geometries||[])){ if(gg&&gg.coordinates) rec(gg.coordinates); if(hit) break; } }
+  else if(g.coordinates) rec(g.coordinates);
+  return hit;
+}
+// --- constructor de geometría compacta ---
+function _nuevoBuilder(ox, oy){
+  return { ox, oy, conv:null, coords:new Float32Array(4096), cn:0,
+           partStart:[], featPartStart:[], featType:[], featBBox:[],
+           bb:[Infinity,Infinity,-Infinity,-Infinity] };
+}
+function _pushCoord(B, lon, lat){
+  if(B.cn+2 > B.coords.length){ const n=new Float32Array(B.coords.length*2); n.set(B.coords); B.coords=n; }
+  B.coords[B.cn++] = lon - B.ox; B.coords[B.cn++] = lat - B.oy;
+}
+function _addParte(B, verts, bbox){
+  B.partStart.push(B.cn>>1);
+  for(const c of verts){ let lon=c[0], lat=c[1]; if(B.conv){ const w=B.conv(lon,lat); lon=w[0]; lat=w[1]; }
+    _pushCoord(B, lon, lat);
+    if(lon<bbox[0])bbox[0]=lon; if(lat<bbox[1])bbox[1]=lat; if(lon>bbox[2])bbox[2]=lon; if(lat>bbox[3])bbox[3]=lat;
+  }
+}
+function _addGeom(B, g, bbox){
+  let type=0;
+  switch(g && g.type){
+    case 'Point': type=1; _addParte(B,[g.coordinates],bbox); break;
+    case 'MultiPoint': type=1; _addParte(B,g.coordinates,bbox); break;
+    case 'LineString': type=2; _addParte(B,g.coordinates,bbox); break;
+    case 'MultiLineString': type=2; for(const l of g.coordinates) _addParte(B,l,bbox); break;
+    case 'Polygon': type=3; for(const r of g.coordinates) _addParte(B,r,bbox); break;
+    case 'MultiPolygon': type=3; for(const poly of g.coordinates) for(const r of poly) _addParte(B,r,bbox); break;
+    case 'GeometryCollection': for(const gg of (g.geometries||[])){ const t=_addGeom(B,gg,bbox); if(!type)type=t; } break;
+  }
+  return type;
+}
+function _addFeatureBig(B, feat){
+  const g = feat && feat.geometry; if(!g || !g.coordinates && g.type!=='GeometryCollection') return false;
+  const marcaPart = B.partStart.length, marcaCn = B.cn;
+  B.featPartStart.push(B.partStart.length);
+  const bbox=[Infinity,Infinity,-Infinity,-Infinity];
+  const type=_addGeom(B, g, bbox);
+  if(!type || !isFinite(bbox[0])){ B.featPartStart.pop(); B.partStart.length=marcaPart; B.cn=marcaCn; return false; }
+  B.featType.push(type);
+  B.featBBox.push(bbox[0],bbox[1],bbox[2],bbox[3]);
+  if(bbox[0]<B.bb[0])B.bb[0]=bbox[0]; if(bbox[1]<B.bb[1])B.bb[1]=bbox[1]; if(bbox[2]>B.bb[2])B.bb[2]=bbox[2]; if(bbox[3]>B.bb[3])B.bb[3]=bbox[3];
+  return true;
+}
+function _construirGrid(featBBox, nFeats, bb){
+  const cols=Math.max(1,Math.min(256, Math.round(Math.sqrt(nFeats||1)))), rows=cols;
+  const w=Math.max(1e-9, bb[2]-bb[0]), h=Math.max(1e-9, bb[3]-bb[1]);
+  const cellW=w/cols, cellH=h/rows;
+  const tmp=new Array(cols*rows); for(let i=0;i<tmp.length;i++) tmp[i]=[];
+  for(let fi=0; fi<nFeats; fi++){ const b=fi*4;
+    let c0=Math.floor((featBBox[b]-bb[0])/cellW),  c1=Math.floor((featBBox[b+2]-bb[0])/cellW);
+    let r0=Math.floor((featBBox[b+1]-bb[1])/cellH), r1=Math.floor((featBBox[b+3]-bb[1])/cellH);
+    c0=Math.max(0,Math.min(cols-1,c0)); c1=Math.max(0,Math.min(cols-1,c1));
+    r0=Math.max(0,Math.min(rows-1,r0)); r1=Math.max(0,Math.min(rows-1,r1));
+    for(let ry=r0;ry<=r1;ry++) for(let cx=c0;cx<=c1;cx++) tmp[ry*cols+cx].push(fi);
+  }
+  const cells=tmp.map(a=> a.length?Int32Array.from(a):null);
+  return { cols, rows, gx0:bb[0], gy0:bb[1], cellW, cellH, cells };
+}
+function _finalizarBig(B, id, nombre, proyFuente, nFeats){
+  const coords = B.coords.slice(0, B.cn);
+  const nParts = B.partStart.length;
+  const partStart = new Int32Array(nParts+1); partStart.set(Int32Array.from(B.partStart)); partStart[nParts]=B.cn>>1;
+  const fps = new Int32Array(B.featPartStart.length+1); fps.set(Int32Array.from(B.featPartStart)); fps[B.featPartStart.length]=nParts;
+  const featType = Uint8Array.from(B.featType);
+  const featBBox = Float32Array.from(B.featBBox);
+  const bb = [B.bb[0],B.bb[1],B.bb[2],B.bb[3]];
+  const grid = _construirGrid(featBBox, nFeats, bb);
+  return { id, nombre:(nombre||'Capa').slice(0,40), tipo:'big', visible:true, consultable:true,
+           color: colorCapa(S.capas.length), proyFuente, nFeats,
+           ox:B.ox, oy:B.oy, coords, partStart, featPartStart:fps, featType, featBBox, bb, grid };
+}
+// Importa un GeoJSON grande con el motor compacto.
+async function importarGeoJSONGrande(nombre, file){
+  mostrarCargando('Leyendo capa grande…');
+  try{
+    const id = nid();
+    let B=null, proyFuente='geo', dentroCR=false, detHecha=false, nFeats=0;
+    let props=[], chunkIdx=0;
+    const flush = async ()=>{ if(props.length){ await dbPut('bigprops', props, id+':'+chunkIdx); chunkIdx++; props=[]; } };
+    for await (const feat of streamFeatures(file)){
+      const g = feat && feat.geometry; if(!g) continue;
+      const first = _primeraCoordGeom(g); if(!first) continue;
+      if(!detHecha){
+        detHecha=true;
+        let conv=null; const x=first[0], y=first[1];
+        if(Math.abs(x)>180 || Math.abs(y)>90){
+          let m='crtm05';
+          for(const mm of PROY_TICAS){ try{ const w=haciaWgs(x,y,mm); if(w.lat>=CR_BBOX.latMin&&w.lat<=CR_BBOX.latMax&&w.lon>=CR_BBOX.lonMin&&w.lon<=CR_BBOX.lonMax){ m=mm; dentroCR=true; break; } }catch(e){} }
+          proyFuente=m; conv=(a,b)=>{ const w=haciaWgs(a,b,m); return [w.lon,w.lat]; };
+        }
+        const o = conv?conv(x,y):[x,y];
+        B=_nuevoBuilder(o[0], o[1]); B.conv=conv;
+      }
+      if(_addFeatureBig(B, feat)){
+        props.push(feat.properties||{});
+        nFeats++;
+        if(props.length>=PROP_CHUNK) await flush();
+        if((nFeats & 8191)===0){ const el=document.getElementById('cargandoTxt'); if(el) el.textContent='Leyendo capa grande… '+nFeats+' elem.'; }
+      }
+    }
+    await flush();
+    if(!B || !nFeats){ toast('No se encontraron elementos en el GeoJSON.'); return; }
+    const capa = _finalizarBig(B, id, nombre, proyFuente, nFeats);
+    await dbPut('capas', capa); S.capas.push(capa);
+    centrarEnCapa(capa); dibujar(); panelCapas();
+    toast(`Capa "${capa.nombre}": ${nFeats} elementos`+(proyFuente!=='geo'?(dentroCR?' · '+proyFuente.toUpperCase()+'→WGS84':' · asumí CRTM05'):''));
+  }catch(e){ toast('No se pudo importar la capa grande: '+(e.message||e)); }
+  finally{ ocultarCargando(); }
+}
+// --- dibujo de una capa grande (con culling por grilla y decimación) ---
+function bigCandidatos(capa, v){
+  const G=capa.grid, fb=capa.featBBox, out=new Set();
+  let c0=Math.floor((v.oLon-G.gx0)/G.cellW), c1=Math.floor((v.eLon-G.gx0)/G.cellW);
+  let r0=Math.floor((v.sLat-G.gy0)/G.cellH), r1=Math.floor((v.nLat-G.gy0)/G.cellH);
+  c0=Math.max(0,c0); r0=Math.max(0,r0); c1=Math.min(G.cols-1,c1); r1=Math.min(G.rows-1,r1);
+  if(c1<0||r1<0||c0>G.cols-1||r0>G.rows-1) return out;
+  for(let ry=r0;ry<=r1;ry++) for(let cx=c0;cx<=c1;cx++){ const cell=G.cells[ry*G.cols+cx]; if(!cell) continue;
+    for(let k=0;k<cell.length;k++){ const fi=cell[k], b=fi*4;
+      if(fb[b+2]<v.oLon||fb[b]>v.eLon||fb[b+3]<v.sLat||fb[b+1]>v.nLat) continue; out.add(fi);
+    } }
+  return out;
+}
+function bigCandidatosPunto(capa, ll){
+  const G=capa.grid, out=new Set();
+  const cx=Math.floor((ll.lon-G.gx0)/G.cellW), ry=Math.floor((ll.lat-G.gy0)/G.cellH);
+  for(let y=ry-1;y<=ry+1;y++) for(let x=cx-1;x<=cx+1;x++){
+    if(x<0||y<0||x>=G.cols||y>=G.rows) continue; const cell=G.cells[y*G.cols+x]; if(!cell) continue;
+    for(let k=0;k<cell.length;k++) out.add(cell[k]);
+  }
+  return out;
+}
+function dibujarBig(capa, aPant, vista){
+  const est=estiloCapa(capa);
+  const color=est.color, gr=est.grosor||2, sim=est.punto||'circulo', rad=est.tam||5, fa=est.fillAlpha!=null?est.fillAlpha:0.2;
+  const co=capa.coords, ox=capa.ox, oy=capa.oy, ps=capa.partStart, fps=capa.featPartStart, ft=capa.featType;
+  const cand = bigCandidatos(capa, vista);
+  const trazarParte=(v0,v1,cerrar,path)=>{
+    let primero=true,lx=0,ly=0;
+    for(let v=v0; v<v1; v++){ const s=aPant(co[v*2+1]+oy, co[v*2]+ox);
+      if(primero){ path.moveTo(s.x,s.y); lx=s.x;ly=s.y;primero=false; }
+      else if(v===v1-1 || Math.abs(s.x-lx)+Math.abs(s.y-ly)>=0.8){ path.lineTo(s.x,s.y); lx=s.x;ly=s.y; } }
+    if(cerrar) path.closePath();
+  };
+  ctx.lineWidth=gr; ctx.strokeStyle=color;
+  for(const fi of cand){
+    const type=ft[fi], pa=fps[fi], pb=fps[fi+1];
+    if(type===1){
+      for(let pp=pa; pp<pb; pp++){ for(let v=ps[pp]; v<ps[pp+1]; v++) dibujarSimbolo(aPant(co[v*2+1]+oy, co[v*2]+ox), sim, color, rad, gr); }
+    } else if(type===2){
+      const path=new Path2D(); for(let pp=pa; pp<pb; pp++) trazarParte(ps[pp], ps[pp+1], false, path); ctx.stroke(path);
+    } else {
+      const path=new Path2D(); for(let pp=pa; pp<pb; pp++) trazarParte(ps[pp], ps[pp+1], true, path);
+      if(fa>0){ ctx.fillStyle=hexRGBA(color,fa); ctx.fill(path,'evenodd'); } ctx.stroke(path);
+    }
+  }
+}
+// --- consulta táctil de capas grandes ---
+function bigPuntoEnPolig(capa, fi, lon, lat){
+  const co=capa.coords, ox=capa.ox, oy=capa.oy, ps=capa.partStart, fps=capa.featPartStart;
+  let inside=false;
+  for(let pp=fps[fi]; pp<fps[fi+1]; pp++){ const v0=ps[pp], v1=ps[pp+1];
+    for(let a=v0, b=v1-1; a<v1; b=a++){
+      const xi=co[a*2]+ox, yi=co[a*2+1]+oy, xj=co[b*2]+ox, yj=co[b*2+1]+oy;
+      if(((yi>lat)!=(yj>lat)) && (lon < (xj-xi)*(lat-yi)/(yj-yi)+xi)) inside=!inside;
+    } }
+  return inside;
+}
+function bigDistPx(capa, fi, px, py){
+  const co=capa.coords, ox=capa.ox, oy=capa.oy, ps=capa.partStart, fps=capa.featPartStart, esPt=capa.featType[fi]===1;
+  let m=Infinity;
+  for(let pp=fps[fi]; pp<fps[fi+1]; pp++){ let prev=null;
+    for(let v=ps[pp]; v<ps[pp+1]; v++){ const s=latlonAPantalla(co[v*2+1]+oy, co[v*2]+ox);
+      if(esPt){ const d=Math.hypot(px-s.x,py-s.y); if(d<m)m=d; }
+      else { if(prev){ const d=distSegPx(px,py,prev,s); if(d<m)m=d; } prev=s; } } }
+  return m;
+}
+function bigHitTest(px,py,ll,TOL){
+  for(let i=S.capas.length-1;i>=0;i--){ const capa=S.capas[i];
+    if(capa.tipo!=='big' || !capa.visible || capa.consultable===false) continue;
+    const b=capa.bb; if(ll.lon<b[0]||ll.lon>b[2]||ll.lat<b[1]||ll.lat>b[3]) continue;
+    let mejor=-1, mejorD=TOL;
+    for(const fi of bigCandidatosPunto(capa, ll)){
+      if(capa.featType[fi]===3 && bigPuntoEnPolig(capa, fi, ll.lon, ll.lat)) return {capa, fi};
+      let d=Infinity; try{ d=bigDistPx(capa, fi, px, py); }catch(e){}
+      if(d<mejorD){ mejorD=d; mejor=fi; }
+    }
+    if(mejor>=0) return {capa, fi:mejor};
+  }
+  return null;
+}
+async function mostrarAtributosBig(capa, fi){
+  let props={};
+  try{ const chunk=await dbGet('bigprops', capa.id+':'+Math.floor(fi/PROP_CHUNK)); if(chunk) props=chunk[fi%PROP_CHUNK]||{}; }catch(e){}
+  mostrarAtributos({ nombre:capa.nombre, tipo:'big' }, [{ properties:props, geometry:{ type:(capa.featType[fi]===1?'Point':capa.featType[fi]===2?'LineString':'Polygon') } }]);
+}
+async function _borrarBigProps(id){
+  return new Promise(ok=>{ try{
+    const store=tx('bigprops','readwrite'); const req=store.openCursor(IDBKeyRange.bound(id+':', id+':￿'));
+    req.onsuccess=()=>{ const c=req.result; if(c){ c.delete(); c.continue(); } else ok(); }; req.onerror=()=>ok();
+  }catch(e){ ok(); } });
+}
+
 // Límite de tamaño para no desbordar la memoria del WebView (crash por OOM).
 const CAPA_MB = 1048576;
 const CAPA_WARN = 12*CAPA_MB, CAPA_MAX = 45*CAPA_MB;
@@ -2741,14 +3009,23 @@ function chequearTamano(bytes){
 
 // Importa una capa desde un archivo del teléfono: GeoJSON, KML, KMZ, SHP o ZIP.
 async function agregarCapaArchivo(file){
-  if(file && file.size!=null && !chequearTamano(file.size)) return;
   const nombre = file.name.replace(/\.(geojson|json|kml|kmz|shp|zip)$/i,'');
   const ext = (file.name.split('.').pop()||'').toLowerCase();
+  // GeoJSON grande → motor compacto en streaming (soporta 80 MB y más).
+  if(ext==='geojson' || ext==='json'){
+    if(file.size!=null && file.size > BIG_MAX){ toast('Archivo enorme (> ~400 MB). Dividilo por zona.'); return; }
+    if(file.size!=null && file.size > BIG_UMBRAL){ await importarGeoJSONGrande(nombre, file); return; }
+    mostrarCargando('Leyendo archivo…');
+    try{ await guardarCapaVector(nombre, JSON.parse(await file.text())); }
+    catch(e){ toast('No se pudo importar: '+(e.message||e)); }
+    finally{ ocultarCargando(); }
+    return;
+  }
+  // Otros formatos (KML/KMZ/SHP/ZIP): guarda de tamaño clásica.
+  if(file && file.size!=null && !chequearTamano(file.size)) return;
   mostrarCargando('Leyendo archivo…');
   try{
-    if(ext==='geojson' || ext==='json'){
-      await guardarCapaVector(nombre, JSON.parse(await file.text()));
-    } else if(ext==='kml'){
+    if(ext==='kml'){
       await guardarCapaVector(nombre, kmlAGeoJSON(await file.text()));
     } else if(ext==='kmz'){
       const zip = await leerZip(await file.arrayBuffer());
@@ -3047,6 +3324,9 @@ function consultarEnPantalla(px,py){
     if(mejor && mejorDist===0) break;
   }
   if(mejor){ mostrarAtributos(mejorCapa, [mejor]); return; }
+  // 1b) Capas grandes (motor compacto).
+  const bh = bigHitTest(px, py, ll, TOL);
+  if(bh){ mostrarAtributosBig(bh.capa, bh.fi); return; }
   if(respaldo){ mostrarAtributos(respaldoCapa, [respaldo]); return; }
   // 2) Punto del proyecto (marcado o promediado).
   let mejorP=null, mejorD=30;
@@ -3133,12 +3413,13 @@ function mostrarAtributos(capa, feats){
     filas += `<div class="res"><div class="k">Geometría</div><div class="v" style="font-size:12px">${escHtml(g.type)}${coordTxt?' · '+coordTxt:''}</div></div>`;
   }
   if(!claves.length) filas = `<div class="nota">Este elemento no trae atributos; abajo su geometría.</div>` + filas;
+  const conTabla = capa.tipo!=='big' && capa.tipo!=='wms';
   abrirPanel('Atributos · '+capa.nombre, `
     ${feats.length>1?`<div class="nota">${feats.length} elementos aquí; se muestra uno.</div>`:''}
     ${filas}
-    <button class="ancho borde" id="atTabla">Ver tabla completa de la capa</button>
+    ${conTabla?`<button class="ancho borde" id="atTabla">Ver tabla completa de la capa</button>`:''}
   `);
-  document.getElementById('atTabla').onclick = ()=> tablaAtributos(capa.id);
+  if(conTabla){ const bt=document.getElementById('atTabla'); if(bt) bt.onclick = ()=> tablaAtributos(capa.id); }
 }
 function tablaAtributos(capaId){
   const c = S.capas.find(x=>x.id===capaId); if(!c||!c.geojson) return;
@@ -3218,18 +3499,24 @@ async function borrarCapa(id){
   const c = S.capas.find(x=>x.id===id);
   await dbDel('capas', id); S.capas = S.capas.filter(x=>x.id!==id);
   if(c && c.tipo==='wms'){ for(const k of Array.from(memTiles.keys())) if(k.startsWith('wms_'+id+'/')) memTiles.delete(k); }
+  if(c && c.tipo==='big'){ await _borrarBigProps(id); }
   dibujar(); panelCapas();
 }
 function panelCapas(){
   abrirPanel('Capas del proyecto', `
-    ${S.capas.length ? S.capas.map(c=>`<div class="fila">
+    ${S.capas.length ? S.capas.map(c=>{
+      const nElem = c.tipo==='wms' ? 'WMS' : c.tipo==='big' ? ('Grande · '+c.nFeats+' elem.') : 'Vector · '+((c.geojson&&c.geojson.features||[]).length)+' elem.';
+      return `<div class="fila">
         <div class="cuerpo"><div class="t"><span style="color:${c.color||'#8899AA'}">■</span> ${c.nombre}</div>
-          <div class="s">${c.tipo==='wms'?'WMS':'Vector · '+((c.geojson.features||[]).length)+' elem.'} · ${c.consultable===false?'🔒 solo vista':'🔍 consultable'}${c.proyFuente&&c.proyFuente!=='geo'?' · 🌐 '+(c.proyFuente==='crtm05'?'CRTM05':c.proyFuente==='ln'?'Lambert N':'Lambert S'):''}${c.etiqueta?' · 🏷 '+escHtml(c.etiqueta):''}</div></div>
+          <div class="s">${nElem} · ${c.consultable===false?'🔒 solo vista':'🔍 consultable'}${c.proyFuente&&c.proyFuente!=='geo'?' · 🌐 '+(c.proyFuente==='crtm05'?'CRTM05':c.proyFuente==='ln'?'Lambert N':'Lambert S'):''}${c.etiqueta?' · 🏷 '+escHtml(c.etiqueta):''}</div></div>
         <div style="display:flex;flex-direction:column;gap:4px">
           <button class="mini ${c.visible?'verde':''}" data-tg="${c.id}">${c.visible?'Ver':'off'}</button>
           <button class="mini ${c.consultable===false?'':'verde'}" data-tq="${c.id}">${c.consultable===false?'🔒':'🔍'}</button>
         </div>
-        ${c.tipo!=='wms'?`<div style="display:flex;flex-direction:column;gap:4px">
+        ${c.tipo==='big'?`<div style="display:flex;flex-direction:column;gap:4px">
+          <button class="mini" data-se="${c.id}" title="Estilo">🎨</button>
+          <button class="mini" data-cir="${c.id}" title="Ir a la capa">◎</button>
+        </div>` : c.tipo!=='wms'?`<div style="display:flex;flex-direction:column;gap:4px">
           <button class="mini" data-tb="${c.id}">Tabla</button>
           <button class="mini ${c.etiqueta?'verde':''}" data-et="${c.id}">🏷</button>
         </div>
@@ -3239,7 +3526,8 @@ function panelCapas(){
         </div>
         <button class="mini" data-cir="${c.id}" title="Ir a la capa" style="align-self:center">◎</button>`:''}
         <button class="mini rojo" data-bc="${c.id}">×</button>
-      </div>`).join('') : '<div class="vacio">Sin capas todavía. Agregá una abajo.<br>Tocá un elemento en el mapa para ver sus atributos.</div>'}
+      </div>`;
+    }).join('') : '<div class="vacio">Sin capas todavía. Agregá una abajo.<br>Tocá un elemento en el mapa para ver sus atributos.</div>'}
     <label>Agregar capa</label>
     <select id="capTipo">
       <option value="wms">WMS (servicio) — escanear capas</option>
@@ -3248,7 +3536,7 @@ function panelCapas(){
       <option value="file">Archivo del teléfono (GeoJSON · KML · KMZ · SHP · ZIP)</option>
     </select>
     <div id="capForm"></div>
-    <div class="nota">Pegá el enlace del <b>servicio</b> WMS/WFS (el mismo que usás en QGIS) y tocá <b>Escanear</b>: la app lista las capas disponibles para elegir. Las descargas van por HTTP nativo, así que sirve aunque el servidor no permita CORS. <b>Shapefile</b>: subí el <b>.zip</b> completo (con .shp, .dbf y .prj). <b>Proyección automática</b>: si la capa viene en CRTM05 o Lambert, la app lo detecta, la convierte a WGS84 y vuela a la zona sola; si se equivoca, corregila con 🌐.</div>
+    <div class="nota">Pegá el enlace del <b>servicio</b> WMS/WFS (el mismo que usás en QGIS) y tocá <b>Escanear</b>: la app lista las capas disponibles para elegir. Las descargas van por HTTP nativo, así que sirve aunque el servidor no permita CORS. <b>Shapefile</b>: subí el <b>.zip</b> completo (con .shp, .dbf y .prj). <b>Proyección automática</b>: si la capa viene en CRTM05 o Lambert, la app lo detecta, la convierte a WGS84 y vuela a la zona sola; si se equivoca, corregila con 🌐. <b>GeoJSON grande</b> (80 MB o más): se carga con un motor compacto que sólo dibuja/consulta lo visible; usá esta opción de <b>archivo</b> (no "abrir con" del sistema). En capas grandes no hay etiqueta ni tabla completa; sí color, consulta al tocar y estilo.</div>
   `);
   document.querySelectorAll('[data-tg]').forEach(b=> b.onclick = ()=> toggleCapa(b.dataset.tg));
   document.querySelectorAll('[data-tq]').forEach(b=> b.onclick = ()=> toggleConsultable(b.dataset.tq));
