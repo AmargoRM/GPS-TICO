@@ -88,6 +88,8 @@ label{display:block;font-size:9px;letter-spacing:.14em;text-transform:uppercase;
 .res .k{font-size:8px;letter-spacing:.14em;text-transform:uppercase;color:var(--musgo)}
 .res .v{font-family:var(--mono);font-size:14px;font-weight:600;margin-top:3px;word-break:break-all}
 .vacio{text-align:center;color:var(--musgo);font-size:12px;padding:34px 10px;line-height:1.6}
+.fechaHead{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:16px 0 2px;padding-top:8px;border-top:1px solid var(--cauce)}
+.fechaLbl{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--musgo)}
 .barra{height:4px;background:var(--cauce);border-radius:2px;overflow:hidden;margin-top:10px}
 .barra i{display:block;height:100%;background:var(--fix);width:0;transition:width .2s}
 
@@ -366,7 +368,7 @@ function distM(a1,o1,a2,o2){
 let DB = null;
 function abrirDB(){
   return new Promise((ok, mal)=>{
-    const r = indexedDB.open('garua-campo', 2);
+    const r = indexedDB.open('garua-campo', 3);
     r.onupgradeneeded = ()=>{
       const d = r.result;
       if(!d.objectStoreNames.contains('proyectos')) d.createObjectStore('proyectos',{keyPath:'id'});
@@ -375,6 +377,7 @@ function abrirDB(){
       if(!d.objectStoreNames.contains('tiles'))     d.createObjectStore('tiles');
       if(!d.objectStoreNames.contains('conf'))      d.createObjectStore('conf');
       if(!d.objectStoreNames.contains('capas'))     d.createObjectStore('capas',{keyPath:'id'}); // capas del usuario (F: capas)
+      if(!d.objectStoreNames.contains('zonas'))     d.createObjectStore('zonas',{keyPath:'id'}); // zonas de mapa sin conexión (parches)
     };
     r.onsuccess = ()=>{ DB = r.result; ok(DB); };
     r.onerror = ()=> mal(r.error);
@@ -672,6 +675,7 @@ function dibujar(){
   // tracks guardados
   ctx.lineJoin = ctx.lineCap = 'round';
   for(const t of S.tracks){
+    if(t.visible===false) continue;
     if(!t.pts || t.pts.length<2) continue;
     ctx.strokeStyle = 'rgba(224,164,88,.8)'; ctx.lineWidth = 2.5;
     trazar(t.pts, aPant);
@@ -683,6 +687,7 @@ function dibujar(){
   }
   // puntos
   for(const p of S.puntos){
+    if(p.visible===false) continue;
     const s = aPant(p.lat, p.lon);
     if(s.x<-30||s.x>W+30||s.y<-30||s.y>H+30) continue;
     if(p.promediado){
@@ -975,11 +980,14 @@ async function consumirArchivoAbierto(){
 }
 async function abrirArchivoImportado(f){
   if(!f || !f.text) return;
-  const nombre = (f.name||'archivo').replace(/\.(geojson|json|gpx)$/i,'');
-  const esGpx = f.kind==='gpx' || /^\s*<\?xml|<gpx/i.test(f.text);
+  const nombre = (f.name||'archivo').replace(/\.(geojson|json|gpx|kml)$/i,'');
+  const t = f.text;
+  const esGpx = f.kind==='gpx' || /<gpx[\s>]/i.test(t);
+  const esKml = f.kind==='kml' || /<kml[\s>]|<Placemark[\s>]/i.test(t);
   try{
-    if(esGpx){ await importarGPX(nombre, f.text); }
-    else{ const gj = JSON.parse(f.text); const capa = await guardarCapaVector(nombre, gj, true); if(capa) toast('GeoJSON cargado como capa: '+capa.nombre); }
+    if(esGpx){ await importarGPX(nombre, t); }
+    else if(esKml){ const capa = await guardarCapaVector(nombre, kmlAGeoJSON(t), true); if(capa) toast('KML cargado como capa: '+capa.nombre); }
+    else{ const gj = JSON.parse(t); const capa = await guardarCapaVector(nombre, gj, true); if(capa) toast('GeoJSON cargado como capa: '+capa.nombre); }
   }catch(e){ toast('No se pudo abrir el archivo (¿formato válido?).'); }
 }
 async function importarGPX(nombre, xml){
@@ -1484,10 +1492,10 @@ document.getElementById('btnMenu').onclick = ()=>{
     <div class="fila"><div class="cuerpo"><div class="t">Fuente de posición</div><div class="s">${S.fuente==='gps'?'GPS puro (nativo)':'Fusionada (GPS+WiFi+celda)'}</div></div><button class="mini" id="mFuente">Cambiar</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Diagnóstico GNSS</div><div class="s">Satélites, L5, exactitud</div></div><button class="mini" id="mDiag">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Filtros de calidad</div><div class="s">${S.filtros.activo?'Activo · '+S.filtros.preset:'Apagado'}</div></div><button class="mini" id="mFilt">Abrir</button></div>
-    <div class="fila"><div class="cuerpo"><div class="t">Capas del proyecto</div><div class="s">${S.capas.length} capa(s) · GeoJSON · WFS · WMS</div></div><button class="mini" id="mCapas">Abrir</button></div>
+    <div class="fila"><div class="cuerpo"><div class="t">Capas del proyecto</div><div class="s">${S.capas.length} capa(s) · GeoJSON · KML · SHP · WFS · WMS</div></div><button class="mini" id="mCapas">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Puntos y tracks</div><div class="s">${S.puntos.length} puntos · ${S.tracks.length} tracks</div></div><button class="mini" id="mDatos">Ver</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Convertir coordenadas</div><div class="s">Geo ↔ CRTM05 ↔ Lambert N/S</div></div><button class="mini" id="mConv">Abrir</button></div>
-    <div class="fila"><div class="cuerpo"><div class="t">Mapa sin conexión</div><div class="s">Descargar el área visible</div></div><button class="mini" id="mOff">Abrir</button></div>
+    <div class="fila"><div class="cuerpo"><div class="t">Mapa sin conexión</div><div class="s">Zonas y parches descargables</div></div><button class="mini" id="mOff">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Exportar proyecto</div><div class="s">GPX · CSV · GeoJSON</div></div><button class="mini" id="mExp">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Precisión y advertencias</div><div class="s">Leer antes de usar en expedientes</div></div><button class="mini" id="mInfo">Abrir</button></div>
   `);
@@ -1550,28 +1558,85 @@ async function cargarProyecto(id){
 }
 
 /* --- datos --- */
+// Marca de tiempo y clave de fecha (día local) de puntos y tracks, para
+// poder encender/apagar por jornada de campo.
+function tsPunto(p){ return p.t || 0; }
+function tsTrack(t){ return t.ini || (t.pts && t.pts[0] && t.pts[0].t) || 0; }
+function fechaClave(ts){ return ts ? new Date(ts).toLocaleDateString('es-CR') : 'Sin fecha'; }
+const esVisible = it => it.visible!==false;   // por defecto visible
+
+async function fijarVis(store, arr, id, vis){
+  const it = arr.find(x=>x.id===id); if(!it) return;
+  it.visible = vis; await dbPut(store, it);
+}
+async function toggleVisElemento(store, arr, id){
+  const it = arr.find(x=>x.id===id); if(!it) return;
+  await fijarVis(store, arr, id, it.visible===false);
+  dibujar(); panelDatos();
+}
+async function setVisFecha(fecha, vis){
+  for(const p of S.puntos) if(fechaClave(tsPunto(p))===fecha){ p.visible=vis; await dbPut('puntos',p); }
+  for(const t of S.tracks) if(fechaClave(tsTrack(t))===fecha){ t.visible=vis; await dbPut('tracks',t); }
+  dibujar(); panelDatos();
+}
+async function setVisTodos(vis){
+  for(const p of S.puntos){ p.visible=vis; await dbPut('puntos',p); }
+  for(const t of S.tracks){ t.visible=vis; await dbPut('tracks',t); }
+  dibujar(); panelDatos();
+}
+
 async function panelDatos(){
   if(!S.proy){ toast('Sin proyecto activo.'); return; }
-  abrirPanel('Puntos y tracks', `
-    ${S.puntos.length||S.tracks.length ? '' : '<div class="vacio">Nada guardado todavía.</div>'}
-    ${S.puntos.map(p=>{
-      const f = fmtCoord(p.lat, p.lon, S.modo);
-      const prom = p.promediado ? ` <span style="color:var(--fix)">◎ ${p.muestras} muestras · σ±${p.desvStd!=null?p.desvStd.toFixed(2):'?'}m</span>` : '';
+  const total = S.puntos.length + S.tracks.length;
+  const nVis = S.puntos.filter(esVisible).length + S.tracks.filter(esVisible).length;
+  const ojo = on => on ? '👁' : '⦸';
+
+  // Agrupar puntos y tracks por día.
+  const grupos = new Map();  // fecha -> {ts, puntos:[], tracks:[]}
+  const meter = (f, ts)=>{ if(!grupos.has(f)) grupos.set(f,{ts,puntos:[],tracks:[]}); const g=grupos.get(f); if(ts>g.ts)g.ts=ts; return g; };
+  for(const p of S.puntos){ const ts=tsPunto(p); meter(fechaClave(ts), ts).puntos.push(p); }
+  for(const t of S.tracks){ const ts=tsTrack(t); meter(fechaClave(ts), ts).tracks.push(t); }
+  const fechas = [...grupos.entries()].sort((a,b)=> b[1].ts - a[1].ts);
+
+  const bloques = fechas.map(([f,g])=>{
+    const filasP = g.puntos.map(p=>{
+      const c = fmtCoord(p.lat, p.lon, S.modo);
+      const prom = p.promediado ? ` <span style="color:var(--fix)">◎ ${p.muestras} m · σ±${p.desvStd!=null?p.desvStd.toFixed(2):'?'}m</span>` : '';
       return `<div class="fila">
-        <div class="cuerpo"><div class="t">${p.nom}${p.promediado?' ◎':''}</div><div class="s">${f.a} · ${f.b}<br>± ${p.exac.toFixed(1)} m${prom}${p.desc?' · '+p.desc:''}</div></div>
+        <button class="mini ${esVisible(p)?'verde':''}" data-vp="${p.id}" title="Ver/ocultar">${ojo(esVisible(p))}</button>
+        <div class="cuerpo" style="opacity:${esVisible(p)?1:.45}"><div class="t">${p.nom}${p.promediado?' ◎':''}</div><div class="s">${c.a} · ${c.b}${p.exac!=null?' · ± '+p.exac.toFixed(1)+' m':''}${prom}${p.desc?' · '+p.desc:''}</div></div>
         <button class="mini" data-ir="${p.lat},${p.lon}">Ir</button>
         <button class="mini rojo" data-dp="${p.id}">×</button>
       </div>`;
-    }).join('')}
-    ${S.tracks.map(t=>`<div class="fila">
-      <div class="cuerpo"><div class="t">${t.nom}</div><div class="s">${t.pts.length} pts · ${t.dist.toFixed(0)} m${t.rechazados?` · ${t.rechazados} filtrados`:''}</div></div>
-      <button class="mini rojo" data-dt="${t.id}">×</button>
-    </div>`).join('')}
+    }).join('');
+    const filasT = g.tracks.map(t=>`<div class="fila">
+        <button class="mini ${esVisible(t)?'verde':''}" data-vt="${t.id}" title="Ver/ocultar">${ojo(esVisible(t))}</button>
+        <div class="cuerpo" style="opacity:${esVisible(t)?1:.45}"><div class="t">〜 ${t.nom}</div><div class="s">${t.pts.length} pts · ${t.dist.toFixed(0)} m${t.rechazados?` · ${t.rechazados} filtrados`:''}</div></div>
+        <button class="mini" data-irt="${t.id}">Ir</button>
+        <button class="mini rojo" data-dt="${t.id}">×</button>
+      </div>`).join('');
+    const algunoVis = [...g.puntos,...g.tracks].some(esVisible);
+    return `<div class="fechaHead">
+        <div class="fechaLbl">${f} · ${g.puntos.length+g.tracks.length}</div>
+        <button class="mini" data-vf="${f}" data-von="${algunoVis?'0':'1'}">${algunoVis?'Ocultar día':'Mostrar día'}</button>
+      </div>${filasP}${filasT}`;
+  }).join('');
+
+  abrirPanel('Puntos y tracks', `
+    ${total ? `<div class="fila">
+        <div class="cuerpo"><div class="t">Visibles: ${nVis} / ${total}</div><div class="s">Apagá por día o uno por uno</div></div>
+        <button class="mini verde" id="verTodos">Ver todo</button>
+        <button class="mini" id="ocuTodos">Ocultar</button>
+      </div>${bloques}` : '<div class="vacio">Nada guardado todavía.</div>'}
   `);
-  document.querySelectorAll('[data-ir]').forEach(b=> b.onclick = ()=>{
-    const [a,o] = b.dataset.ir.split(',').map(Number);
-    S.centro.lat=a; S.centro.lon=o; S.zoom=18; S.seguir=false; cerrarPanel(); dibujar();
-  });
+  const irA = (a,o)=>{ S.centro.lat=a; S.centro.lon=o; S.zoom=18; S.seguir=false; cerrarPanel(); dibujar(); };
+  document.querySelectorAll('[data-ir]').forEach(b=> b.onclick = ()=>{ const [a,o]=b.dataset.ir.split(',').map(Number); irA(a,o); });
+  document.querySelectorAll('[data-irt]').forEach(b=> b.onclick = ()=>{ const t=S.tracks.find(x=>x.id===b.dataset.irt); if(t&&t.pts&&t.pts[0]) irA(t.pts[0].lat, t.pts[0].lon); });
+  document.querySelectorAll('[data-vp]').forEach(b=> b.onclick = ()=> toggleVisElemento('puntos', S.puntos, b.dataset.vp));
+  document.querySelectorAll('[data-vt]').forEach(b=> b.onclick = ()=> toggleVisElemento('tracks', S.tracks, b.dataset.vt));
+  document.querySelectorAll('[data-vf]').forEach(b=> b.onclick = ()=> setVisFecha(b.dataset.vf, b.dataset.von==='1'));
+  const vt=document.getElementById('verTodos'); if(vt) vt.onclick = ()=> setVisTodos(true);
+  const ot=document.getElementById('ocuTodos'); if(ot) ot.onclick = ()=> setVisTodos(false);
   document.querySelectorAll('[data-dp]').forEach(b=> b.onclick = async ()=>{
     await dbDel('puntos', b.dataset.dp); await cargarProyecto(S.proy.id); panelDatos();
   });
@@ -1632,24 +1697,57 @@ function panelConv(){
   };
 }
 
-/* --- offline --- */
-function tilesDelArea(zMin, zMax){
+/* --- offline (por zonas / parches) --- */
+// Recuadro geográfico de la vista actual.
+function boundsVista(){
+  return {
+    w: px2lon(lon2px(S.centro.lon,S.zoom) - W/2, S.zoom),
+    e: px2lon(lon2px(S.centro.lon,S.zoom) + W/2, S.zoom),
+    n: px2lat(lat2px(S.centro.lat,S.zoom) - H/2, S.zoom),
+    s: px2lat(lat2px(S.centro.lat,S.zoom) + H/2, S.zoom)
+  };
+}
+// Lista de tiles [z,x,y] que cubre un recuadro entre zMin y zMax.
+function tilesDeBounds(b, zMin, zMax){
   const lista = [];
-  const oesteN = px2lon(lon2px(S.centro.lon,S.zoom) - W/2, S.zoom);
-  const esteN  = px2lon(lon2px(S.centro.lon,S.zoom) + W/2, S.zoom);
-  const norteN = px2lat(lat2px(S.centro.lat,S.zoom) - H/2, S.zoom);
-  const surN   = px2lat(lat2px(S.centro.lat,S.zoom) + H/2, S.zoom);
   for(let z=zMin; z<=zMax; z++){
-    const x0 = Math.floor(lon2px(oesteN,z)/256), x1 = Math.floor(lon2px(esteN,z)/256);
-    const y0 = Math.floor(lat2px(norteN,z)/256), y1 = Math.floor(lat2px(surN,z)/256);
+    let x0 = Math.floor(lon2px(b.w,z)/256), x1 = Math.floor(lon2px(b.e,z)/256);
+    let y0 = Math.floor(lat2px(b.n,z)/256), y1 = Math.floor(lat2px(b.s,z)/256);
+    if(x0>x1) [x0,x1]=[x1,x0]; if(y0>y1) [y0,y1]=[y1,y0];
     for(let x=x0;x<=x1;x++) for(let y=y0;y<=y1;y++) lista.push([z,x,y]);
   }
   return lista;
 }
+function tilesDelArea(zMin, zMax){ return tilesDeBounds(boundsVista(), zMin, zMax); }  // vista actual
+// ¿Un tile cae dentro de una zona guardada? (para borrar sin dañar parches vecinos)
+function zonaCubreTile(zona, z, x, y){
+  if(z < zona.zMin || z > zona.zMax) return false;
+  const b = zona.bounds;
+  let x0 = Math.floor(lon2px(b.w,z)/256), x1 = Math.floor(lon2px(b.e,z)/256);
+  let y0 = Math.floor(lat2px(b.n,z)/256), y1 = Math.floor(lat2px(b.s,z)/256);
+  if(x0>x1) [x0,x1]=[x1,x0]; if(y0>y1) [y0,y1]=[y1,y0];
+  return x>=x0 && x<=x1 && y>=y0 && y<=y1;
+}
+// Borra los tiles de una zona salvo los que otra zona de la misma capa comparta.
+async function borrarZona(id){
+  const zonas = await dbAll('zonas');
+  const zona = zonas.find(z=>z.id===id); if(!zona) return;
+  const otras = zonas.filter(z=> z.id!==id && z.capa===zona.capa);
+  for(const [z,x,y] of tilesDeBounds(zona.bounds, zona.zMin, zona.zMax)){
+    if(otras.some(o=> zonaCubreTile(o,z,x,y))) continue;
+    await dbDel('tiles', `${zona.capa}/${z}/${x}/${y}`);
+  }
+  await dbDel('zonas', id);
+  memTiles.clear();
+}
 async function panelOffline(){
+  const zonas = (await dbAll('zonas')).sort((a,b)=> b.t - a.t);
   const conteo = await pedir(tx('tiles').count());
+  const capaNom = CAPAS[S.capa].nom;
   abrirPanel('Mapa sin conexión', `
-    <div class="nota" style="border-color:var(--fix)">Se descarga solo el área que estás viendo en el mapa. Encuadrá primero la zona, después abrí esto.</div>
+    <div class="nota" style="border-color:var(--fix)">Se descarga el <b>recuadro que estás viendo</b> como una <b>zona</b> con nombre. Podés guardar <b>varias zonas o parches</b>: se acumulan y cada una se borra por separado. Capa base actual: <b>${capaNom}</b> (cambiala con el botón del mapa antes de descargar si querés satélite y calles).</div>
+    <label>Nombre de la zona</label>
+    <input id="offNom" placeholder="Ej. Naciente río Naranjo">
     <label>Zoom máximo a descargar</label>
     <select id="offZ">
       <option value="16">16 — calles y ríos principales</option>
@@ -1657,10 +1755,19 @@ async function panelOffline(){
       <option value="18">18 — detalle alto, pesa 4×</option>
       <option value="19">19 — máximo, pesa 16×</option>
     </select>
-    <div class="res"><div class="k">Estimado</div><div class="v" id="offEst">—</div></div>
+    <div class="res"><div class="k">Estimado (área visible)</div><div class="v" id="offEst">—</div></div>
     <div class="barra"><i id="offBar"></i></div>
-    <button class="ancho" id="offOk">Descargar área visible</button>
-    <div class="res" style="margin-top:20px"><div class="k">Ya guardado</div><div class="v">${conteo} tiles en este teléfono</div></div>
+    <button class="ancho" id="offOk">Descargar esta zona</button>
+
+    <div style="margin-top:22px"><label>Zonas guardadas</label>
+      ${zonas.length ? zonas.map(z=>`<div class="fila">
+          <div class="cuerpo"><div class="t">${z.nom}</div><div class="s">${CAPAS[z.capa]?CAPAS[z.capa].nom:z.capa} · z${z.zMin}–${z.zMax} · ${z.tiles} tiles · ${new Date(z.t).toLocaleDateString('es-CR')}</div></div>
+          <button class="mini" data-zir="${z.id}">Ir</button>
+          <button class="mini rojo" data-zdel="${z.id}">×</button>
+        </div>`).join('') : '<div class="vacio">Sin zonas guardadas.<br>Encuadrá un área y descargala.</div>'}
+    </div>
+
+    <div class="res" style="margin-top:16px"><div class="k">Total en el teléfono</div><div class="v">${conteo} tiles</div></div>
     <button class="ancho borde" id="offBorrar">Borrar todo el mapa descargado</button>
     <div class="nota">Los tiles de Google Maps no se pueden descargar: sus Términos de Servicio lo prohíben expresamente y Play retira las apps que lo hacen. Por eso esta app usa Esri World Imagery y OpenStreetMap. Descargá áreas de trabajo, no provincias enteras: la descarga masiva viola las políticas de uso de ambos servicios.</div>
   `);
@@ -1670,33 +1777,51 @@ async function panelOffline(){
     return n;
   };
   document.getElementById('offZ').onchange = est; est();
+  document.querySelectorAll('[data-zir]').forEach(b=> b.onclick = async ()=>{
+    const z = (await dbAll('zonas')).find(x=>x.id===b.dataset.zir); if(!z) return;
+    S.centro.lon = (z.bounds.w+z.bounds.e)/2; S.centro.lat = (z.bounds.n+z.bounds.s)/2;
+    S.zoom = Math.max(2, Math.min(z.zMax, 15)); S.seguir = false;
+    cerrarPanel(); dibujar();
+  });
+  document.querySelectorAll('[data-zdel]').forEach(b=> b.onclick = async ()=>{
+    if(!confirm('Se borra esta zona y sus tiles (los que no compartan con otra zona). ¿Seguir?')) return;
+    await borrarZona(b.dataset.zdel); dibujar(); panelOffline();
+  });
   document.getElementById('offBorrar').onclick = async ()=>{
-    if(!confirm('Se borran TODOS los tiles descargados de todas las áreas. El mapa dejará de verse sin internet hasta que descargues de nuevo. ¿Seguir?')) return;
-    await pedir(tx('tiles','readwrite').clear()); memTiles.clear();
+    if(!confirm('Se borran TODOS los tiles y TODAS las zonas descargadas. El mapa dejará de verse sin internet hasta que descargues de nuevo. ¿Seguir?')) return;
+    await pedir(tx('tiles','readwrite').clear());
+    await pedir(tx('zonas','readwrite').clear());
+    memTiles.clear();
     cerrarPanel(); dibujar(); toast('Mapa descargado borrado.');
   };
   document.getElementById('offOk').onclick = async ()=>{
-    const lista = tilesDelArea(Math.max(2,Math.round(S.zoom)-2), +document.getElementById('offZ').value);
+    const capa = S.capa;                     // capturar por si cambia
+    const bounds = boundsVista();
+    const zMin = Math.max(2, Math.round(S.zoom)-2);
+    const zMax = +document.getElementById('offZ').value;
+    const nom = (document.getElementById('offNom').value.trim()) || `Zona ${new Date().toLocaleDateString('es-CR')}`;
+    const lista = tilesDeBounds(bounds, zMin, zMax);
     const btn = document.getElementById('offOk'), bar = document.getElementById('offBar');
     btn.disabled = true;
-    let hechos = 0, fallos = 0;
+    let hechos = 0, fallos = 0, guardados = 0;
     for(let i=0; i<lista.length; i+=6){
       await Promise.all(lista.slice(i,i+6).map(async ([z,x,y])=>{
-        const k = `${S.capa}/${z}/${x}/${y}`;
+        const k = `${capa}/${z}/${x}/${y}`;
         try{
-          if(await dbGet('tiles', k)) return;
-          const r = await fetch(CAPAS[S.capa].url(z,x,y));
+          if(await dbGet('tiles', k)){ guardados++; return; }
+          const r = await fetch(CAPAS[capa].url(z,x,y));
           if(!r.ok) throw 0;
-          await dbPut('tiles', await r.blob(), k);
+          await dbPut('tiles', await r.blob(), k); guardados++;
         }catch(e){ fallos++; }
         finally{ hechos++; }
       }));
       bar.style.width = (hechos/lista.length*100) + '%';
       btn.textContent = `Descargando ${hechos}/${lista.length}`;
     }
-    btn.textContent = 'Listo';
-    toast(fallos ? `Descargado con ${fallos} tiles fallidos.` : `Área guardada: ${hechos} tiles.`);
-    dibujar();
+    // Registrar la zona (parche) aunque falten algunos tiles.
+    await dbPut('zonas', { id:nid(), nom, capa, bounds, zMin, zMax, tiles:guardados, t:Date.now() });
+    toast(fallos ? `Zona "${nom}" guardada con ${fallos} tiles fallidos.` : `Zona "${nom}" guardada: ${guardados} tiles.`);
+    dibujar(); panelOffline();
   };
 }
 
@@ -1999,13 +2124,232 @@ function centrarEnCapa(capa){
   const anchoLon = Math.max(1e-4, b[2]-b[0]);
   S.zoom = Math.max(3, Math.min(18, Math.log2(360/anchoLon) + 0.5));
 }
-function agregarCapaArchivo(file){
+/* =======================================================================
+   IMPORTAR KML / KMZ / SHAPEFILE  (todo sin librerías externas)
+   ======================================================================= */
+
+// --- KML -> GeoJSON ---
+// Recorre <Placemark> (dentro de carpetas o no) y traduce Point, LineString,
+// Polygon (con huecos), MultiGeometry y gx:Track.
+// Busca descendientes por nombre local, ignorando el espacio de nombres
+// (así encuentra tanto <coordinates> como <gx:coord>). Con respaldo por si
+// el documento se parseó sin espacios de nombres.
+function _localName(el, local){
+  let r = [...el.getElementsByTagNameNS('*', local)];
+  if(!r.length) r = [...el.getElementsByTagName(local)];
+  return r;
+}
+function _txtHijo(el, local){ const n=_localName(el, local)[0]; return n ? n.textContent.trim() : ''; }
+function _kmlCoords(txt){
+  return (txt||'').trim().split(/\s+/).filter(Boolean).map(tp=>{
+    const a = tp.split(',').map(Number);
+    return [a[0], a[1]];   // lon, lat  (se ignora la altura)
+  }).filter(c=> isFinite(c[0]) && isFinite(c[1]));
+}
+function kmlAGeoJSON(xmlText){
+  const doc = new DOMParser().parseFromString(xmlText, 'application/xml');
+  if(doc.getElementsByTagName('parsererror').length) throw new Error('KML mal formado');
+  const feats = [];
+  for(const pm of _localName(doc.documentElement, 'Placemark')){
+    const geoms = [];
+    for(const g of _localName(pm,'Point')){ const c=_kmlCoords(_txtHijo(g,'coordinates'))[0]; if(c) geoms.push({type:'Point',coordinates:c}); }
+    for(const g of _localName(pm,'LineString')){ const l=_kmlCoords(_txtHijo(g,'coordinates')); if(l.length>1) geoms.push({type:'LineString',coordinates:l}); }
+    for(const g of _localName(pm,'Polygon')){
+      const rings=[];
+      const outer=_localName(g,'outerBoundaryIs')[0];
+      if(outer){ const r=_kmlCoords(_txtHijo(outer,'coordinates')); if(r.length>2) rings.push(r); }
+      for(const inner of _localName(g,'innerBoundaryIs')){ const r=_kmlCoords(_txtHijo(inner,'coordinates')); if(r.length>2) rings.push(r); }
+      if(rings.length) geoms.push({type:'Polygon',coordinates:rings});
+    }
+    for(const g of _localName(pm,'Track')){   // gx:Track: cada <gx:coord> = "lon lat alt"
+      const cs = _localName(g,'coord').map(c=>{ const a=c.textContent.trim().split(/\s+/).map(Number); return [a[0],a[1]]; }).filter(c=>isFinite(c[0]));
+      if(cs.length>1) geoms.push({type:'LineString',coordinates:cs});
+    }
+    if(!geoms.length) continue;
+    const props = { nombre: _txtHijo(pm,'name') || '', desc: _txtHijo(pm,'description') || '' };
+    // ExtendedData -> propiedades
+    for(const d of _localName(pm,'Data')){ const k=d.getAttribute('name'); if(k) props[k]=_txtHijo(d,'value'); }
+    for(const sd of _localName(pm,'SimpleData')){ const k=sd.getAttribute('name'); if(k) props[k]=sd.textContent.trim(); }
+    const geometry = geoms.length===1 ? geoms[0] : { type:'GeometryCollection', geometries:geoms };
+    feats.push({ type:'Feature', geometry, properties:props });
+  }
+  if(!feats.length) throw new Error('El KML no tenía elementos con geometría');
+  return { type:'FeatureCollection', features:feats };
+}
+
+// --- Lector ZIP (usa DecompressionStream del WebView, sin librerías) ---
+function _bufDe(u8){ return u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength); }
+async function _inflarRaw(bytes){
+  if(typeof DecompressionStream==='undefined') throw new Error('Este dispositivo no puede descomprimir ZIP/KMZ.');
+  const s = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('deflate-raw'));
+  return new Uint8Array(await new Response(s).arrayBuffer());
+}
+async function leerZip(buf){
+  const dv = new DataView(buf), u8 = new Uint8Array(buf);
+  let eocd = -1;
+  for(let i=buf.byteLength-22; i>=0 && i > buf.byteLength-22-65536; i--){ if(dv.getUint32(i,true)===0x06054b50){ eocd=i; break; } }
+  if(eocd<0) throw new Error('No es un ZIP válido');
+  const cdOff = dv.getUint32(eocd+16, true), cdCount = dv.getUint16(eocd+10, true);
+  const out = new Map();
+  let p = cdOff;
+  for(let n=0; n<cdCount; n++){
+    if(dv.getUint32(p,true)!==0x02014b50) break;
+    const method   = dv.getUint16(p+10, true);
+    const compSize = dv.getUint32(p+20, true);
+    const nameLen  = dv.getUint16(p+28, true);
+    const extraLen = dv.getUint16(p+30, true);
+    const commLen  = dv.getUint16(p+32, true);
+    const lho      = dv.getUint32(p+42, true);
+    const name = new TextDecoder().decode(u8.subarray(p+46, p+46+nameLen));
+    const lhNameLen  = dv.getUint16(lho+26, true);
+    const lhExtraLen = dv.getUint16(lho+28, true);
+    const dataStart  = lho + 30 + lhNameLen + lhExtraLen;
+    const comp = u8.subarray(dataStart, dataStart+compSize);
+    if(method===0)      out.set(name, comp.slice());
+    else if(method===8) out.set(name, await _inflarRaw(comp));
+    p += 46 + nameLen + extraLen + commLen;
+  }
+  return out;
+}
+
+// --- .prj (WKT) -> modo de proyección conocido de la app ---
+function modoDePrj(prj){
+  if(!prj) return null;
+  const s = prj.toUpperCase();
+  if(s.includes('PROJCS')){
+    if(s.includes('LAMBERT')){
+      const m = s.match(/LATITUDE_OF_ORIGIN[",\s]+(-?\d+(?:\.\d+)?)/);
+      const lat0 = m ? parseFloat(m[1]) : 0;
+      return lat0 > 10 ? 'ln' : 'ls';   // Lambert Norte (~10.47°) vs Sur (9°)
+    }
+    if(s.includes('CRTM') || s.includes('TRANSVERSE_MERCATOR')) return 'crtm05';
+    return 'crtm05';   // proyectado desconocido: CRTM05 es lo más común en CR
+  }
+  return 'geo';   // geográficas
+}
+
+// --- Shapefile (.shp + .dbf + .prj) -> GeoJSON, reproyectando a WGS84 ---
+function _areaAnillo(r){ let a=0; for(let i=0,j=r.length-1;i<r.length;j=i++){ a += r[j][0]*r[i][1] - r[i][0]*r[j][1]; } return a/2; }
+function shpAGeoJSON(shpBuf, dbfRows, prj){
+  const dv = new DataView(shpBuf), len = shpBuf.byteLength;
+  const xmin = dv.getFloat64(36, true), ymin = dv.getFloat64(44, true);
+  let modo = modoDePrj(prj);
+  if(!modo || modo==='geo'){
+    // Sin .prj: si los valores no parecen lon/lat, asumimos CRTM05.
+    if(Math.abs(xmin) > 180 || Math.abs(ymin) > 90) modo = 'crtm05';
+    else modo = 'geo';
+  }
+  const conv = (modo==='geo') ? (x,y)=>[x,y] : (x,y)=>{ const w=haciaWgs(x,y,modo); return [w.lon, w.lat]; };
+  const feats = [];
+  let off = 100, idx = 0;
+  const BASE = {11:1,21:1, 3:3,13:3,23:3, 5:5,15:5,25:5, 8:8,18:8,28:8};
+  while(off + 8 <= len){
+    const contentLen = dv.getInt32(off+4, false);       // en palabras de 16 bits
+    const rec = off + 8;
+    const type = dv.getInt32(rec, true);
+    const base = BASE[type] || type;
+    let geom = null;
+    if(base===1){
+      geom = { type:'Point', coordinates: conv(dv.getFloat64(rec+4,true), dv.getFloat64(rec+12,true)) };
+    } else if(base===8){
+      const nPts = dv.getInt32(rec+36, true); let pp = rec+40; const pts=[];
+      for(let i=0;i<nPts;i++){ pts.push(conv(dv.getFloat64(pp,true), dv.getFloat64(pp+8,true))); pp+=16; }
+      geom = { type:'MultiPoint', coordinates:pts };
+    } else if(base===3 || base===5){
+      const nParts = dv.getInt32(rec+36, true), nPts = dv.getInt32(rec+40, true);
+      let pp = rec+44; const parts=[];
+      for(let i=0;i<nParts;i++){ parts.push(dv.getInt32(pp,true)); pp+=4; }
+      const all=[]; for(let i=0;i<nPts;i++){ all.push(conv(dv.getFloat64(pp,true), dv.getFloat64(pp+8,true))); pp+=16; }
+      const rings=[]; for(let i=0;i<nParts;i++){ rings.push(all.slice(parts[i], i+1<nParts?parts[i+1]:nPts)); }
+      if(base===3){ geom = rings.length===1 ? {type:'LineString',coordinates:rings[0]} : {type:'MultiLineString',coordinates:rings}; }
+      else {
+        // Polígono: anillos horarios = exteriores; antihorarios = huecos.
+        const polys=[];
+        for(const r of rings){ if(_areaAnillo(r) < 0) polys.push([r]); else if(polys.length) polys[polys.length-1].push(r); else polys.push([r]); }
+        geom = polys.length===1 ? {type:'Polygon',coordinates:polys[0]} : {type:'MultiPolygon',coordinates:polys};
+      }
+    }
+    off = rec + contentLen*2;
+    if(geom && type!==0) feats.push({ type:'Feature', geometry:geom, properties:(dbfRows && dbfRows[idx]) ? dbfRows[idx] : {} });
+    idx++;
+  }
+  const fc = { type:'FeatureCollection', features:feats };
+  fc._modo = modo;
+  return fc;
+}
+
+// --- DBF (dBASE III/IV) -> filas de atributos ---
+function dbfLeer(buf){
+  const dv = new DataView(buf), u8 = new Uint8Array(buf);
+  const numRec = dv.getUint32(4, true), headerSize = dv.getUint16(8, true), recSize = dv.getUint16(10, true);
+  const fields=[]; let p=32;
+  while(p < headerSize && u8[p] !== 0x0D){
+    let name=''; for(let i=0;i<11 && u8[p+i]!==0;i++) name += String.fromCharCode(u8[p+i]);
+    fields.push({ name, type:String.fromCharCode(u8[p+11]), len:u8[p+16] });
+    p += 32;
+  }
+  const dec = new TextDecoder('latin1');
+  const rows=[]; let rp = headerSize;
+  for(let r=0; r<numRec; r++){
+    let cp = rp+1; const row={};
+    for(const f of fields){
+      const raw = dec.decode(u8.subarray(cp, cp+f.len)).replace(/\u0000/g,'').trim(); cp += f.len;
+      if(f.type==='N' || f.type==='F') row[f.name] = raw==='' ? null : Number(raw);
+      else if(f.type==='L') row[f.name] = /^[YyTt]$/.test(raw);
+      else row[f.name] = raw;
+    }
+    rp += recSize;
+    rows.push(row);   // se conservan todas para no desalinear con el .shp
+  }
+  return rows;
+}
+
+// --- Importar un ZIP que trae un shapefile (o un KMZ/GeoJSON camuflado) ---
+async function importarShapefileZip(nombre, buf){
+  const zip = await leerZip(buf);
+  const keys = [...zip.keys()];
+  const shpKey = keys.find(k=>/\.shp$/i.test(k));
+  if(!shpKey){
+    const kmlKey = keys.find(k=>/\.kml$/i.test(k));
+    if(kmlKey){ await guardarCapaVector(nombre, kmlAGeoJSON(new TextDecoder().decode(zip.get(kmlKey)))); return; }
+    const gjKey = keys.find(k=>/\.(geo)?json$/i.test(k));
+    if(gjKey){ await guardarCapaVector(nombre, JSON.parse(new TextDecoder().decode(zip.get(gjKey)))); return; }
+    throw new Error('El ZIP no trae .shp ni .kml');
+  }
+  const base = shpKey.replace(/\.[^.]+$/,'');
+  const buscar = ext => zip.get(base+'.'+ext) || zip.get(base+'.'+ext.toUpperCase());
+  const dbfU8 = buscar('dbf'), prjU8 = buscar('prj');
+  const dbfRows = dbfU8 ? dbfLeer(_bufDe(dbfU8)) : null;
+  const prj = prjU8 ? new TextDecoder().decode(prjU8) : null;
+  const gj = shpAGeoJSON(_bufDe(zip.get(shpKey)), dbfRows, prj);
+  const suf = (gj._modo && gj._modo!=='geo') ? ' ('+gj._modo.toUpperCase()+'→WGS84)' : '';
+  await guardarCapaVector(nombre + suf, gj);
+}
+
+// Importa una capa desde un archivo del teléfono: GeoJSON, KML, KMZ, SHP o ZIP.
+async function agregarCapaArchivo(file){
+  const nombre = file.name.replace(/\.(geojson|json|kml|kmz|shp|zip)$/i,'');
+  const ext = (file.name.split('.').pop()||'').toLowerCase();
   mostrarCargando('Leyendo archivo…');
-  const reader = new FileReader();
-  reader.onload = async ()=>{ try{ await guardarCapaVector(file.name.replace(/\.(geo)?json$/i,''), JSON.parse(reader.result)); }
-                        catch(e){ toast('Archivo GeoJSON inválido.'); } finally{ ocultarCargando(); } };
-  reader.onerror = ()=>{ ocultarCargando(); toast('No se pudo leer el archivo.'); };
-  reader.readAsText(file);
+  try{
+    if(ext==='geojson' || ext==='json'){
+      await guardarCapaVector(nombre, JSON.parse(await file.text()));
+    } else if(ext==='kml'){
+      await guardarCapaVector(nombre, kmlAGeoJSON(await file.text()));
+    } else if(ext==='kmz'){
+      const zip = await leerZip(await file.arrayBuffer());
+      const kmlKey = [...zip.keys()].find(k=>/\.kml$/i.test(k));
+      if(!kmlKey) throw new Error('El KMZ no contiene .kml');
+      await guardarCapaVector(nombre, kmlAGeoJSON(new TextDecoder().decode(zip.get(kmlKey))));
+    } else if(ext==='shp'){
+      await guardarCapaVector(nombre, shpAGeoJSON(await file.arrayBuffer(), null, null));
+    } else if(ext==='zip'){
+      await importarShapefileZip(nombre, await file.arrayBuffer());
+    } else {
+      toast('Formato no reconocido. Usá GeoJSON, KML, KMZ, SHP o ZIP.');
+    }
+  }catch(e){ toast('No se pudo importar: '+(e.message||e)); }
+  finally{ ocultarCargando(); }
 }
 async function agregarCapaURL(nombre, url){
   if(!url){ toast('Pegá la URL.'); return; }
@@ -2397,10 +2741,10 @@ function panelCapas(){
       <option value="wms">WMS (servicio) — escanear capas</option>
       <option value="wfs">WFS (servicio) — escanear capas</option>
       <option value="geojson_url">GeoJSON (enlace directo)</option>
-      <option value="file">GeoJSON (archivo del teléfono)</option>
+      <option value="file">Archivo del teléfono (GeoJSON · KML · KMZ · SHP · ZIP)</option>
     </select>
     <div id="capForm"></div>
-    <div class="nota">Pegá el enlace del <b>servicio</b> WMS/WFS (el mismo que usás en QGIS) y tocá <b>Escanear</b>: la app lista las capas disponibles para elegir. Las descargas van por HTTP nativo, así que sirve aunque el servidor no permita CORS. Vectores en WGS84. Shapefile: convertilo a GeoJSON (QGIS / mapshaper.org).</div>
+    <div class="nota">Pegá el enlace del <b>servicio</b> WMS/WFS (el mismo que usás en QGIS) y tocá <b>Escanear</b>: la app lista las capas disponibles para elegir. Las descargas van por HTTP nativo, así que sirve aunque el servidor no permita CORS. <b>Shapefile</b>: subí el <b>.zip</b> completo (con .shp, .dbf y .prj) para conservar atributos y reproyectar; si el .prj indica CRTM05 o Lambert, la app convierte a WGS84 sola.</div>
   `);
   document.querySelectorAll('[data-tg]').forEach(b=> b.onclick = ()=> toggleCapa(b.dataset.tg));
   document.querySelectorAll('[data-tq]').forEach(b=> b.onclick = ()=> toggleConsultable(b.dataset.tq));
@@ -2410,7 +2754,7 @@ function panelCapas(){
   const render = ()=>{
     const cf = document.getElementById('capForm');
     if(sel.value==='file'){
-      cf.innerHTML = `<input type="file" id="capFile" accept=".geojson,.json,application/geo+json,application/json" style="margin-top:8px">
+      cf.innerHTML = `<input type="file" id="capFile" accept=".geojson,.json,.kml,.kmz,.shp,.zip,application/geo+json,application/json,application/vnd.google-earth.kml+xml,application/vnd.google-earth.kmz,application/zip" style="margin-top:8px">
         <button class="ancho" id="capAdd">Agregar archivo</button>`;
       document.getElementById('capAdd').onclick = ()=>{ const f=document.getElementById('capFile').files[0]; if(!f){toast('Elegí un archivo.');return;} agregarCapaArchivo(f); };
     } else if(sel.value==='geojson_url'){
