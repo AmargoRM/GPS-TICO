@@ -2128,6 +2128,55 @@ async function agregarCapaWFS(nombre, base, typeName){
   }catch(e){ toast('No se pudo descargar el WFS: '+(e.message||e)); }
 }
 
+// Caja de Costa Rica (con margen) para reconocer una proyección tica.
+const CR_BBOX = { latMin:7.5, latMax:11.7, lonMin:-86.5, lonMax:-82.0 };
+const PROY_TICAS = ['crtm05','ln','ls'];
+// Primera coordenada de una FeatureCollection (para muestrear la proyección).
+function _primeraCoord(fc){
+  const feats = fc.type==='FeatureCollection' ? (fc.features||[]) : fc.type==='Feature' ? [fc] : [];
+  for(const f of feats){
+    const g = f && f.geometry; if(!g) continue;
+    let hit = null;
+    const rec = a=>{ if(hit) return; if(typeof a[0]==='number'){ hit = a; } else for(const x of a){ rec(x); if(hit) return; } };
+    if(g.type==='GeometryCollection'){ for(const gg of (g.geometries||[])){ if(gg&&gg.coordinates) rec(gg.coordinates); if(hit) break; } }
+    else if(g.coordinates) rec(g.coordinates);
+    if(hit) return hit;
+  }
+  return null;
+}
+// Detecta la proyección de origen: 'geo' si ya es lon/lat; si es proyectada,
+// prueba las proyecciones ticas y devuelve la que caiga dentro de Costa Rica.
+function detectarModoCapa(fc){
+  const c = _primeraCoord(fc);
+  if(!c) return { modo:'geo', dentroCR:false };
+  const x = c[0], y = c[1];
+  if(Math.abs(x)<=180 && Math.abs(y)<=90){
+    const dentroCR = y>=CR_BBOX.latMin && y<=CR_BBOX.latMax && x>=CR_BBOX.lonMin && x<=CR_BBOX.lonMax;
+    return { modo:'geo', dentroCR };
+  }
+  for(const m of PROY_TICAS){
+    try{ const w = haciaWgs(x, y, m);
+      if(w.lat>=CR_BBOX.latMin && w.lat<=CR_BBOX.latMax && w.lon>=CR_BBOX.lonMin && w.lon<=CR_BBOX.lonMax)
+        return { modo:m, dentroCR:true };
+    }catch(e){}
+  }
+  return { modo:'crtm05', dentroCR:false };   // proyectada desconocida: mejor esfuerzo
+}
+// Reproyecta EN SITIO las coordenadas de una FC desde una proyección tica a WGS84.
+function reproyectarFC(fc, modo){
+  if(modo==='geo') return;
+  const rec = coords=>{
+    if(typeof coords[0]==='number'){ const w = haciaWgs(coords[0], coords[1], modo); coords[0]=w.lon; coords[1]=w.lat; if(coords.length>2) coords.length=2; }
+    else for(const c of coords) rec(c);
+  };
+  const feats = fc.type==='FeatureCollection' ? (fc.features||[]) : fc.type==='Feature' ? [fc] : [];
+  for(const f of feats){ const g=f&&f.geometry; if(!g) continue;
+    if(g.type==='GeometryCollection'){ for(const gg of (g.geometries||[])) if(gg&&gg.coordinates) rec(gg.coordinates); }
+    else if(g.coordinates) rec(g.coordinates);
+    if(f) f._bbox = null;   // invalidar caché de caja
+  }
+}
+
 async function guardarCapaVector(nombre, gj, silencioso){
   // Normaliza a FeatureCollection (acepta Feature o geometría suelta).
   let fc = gj;
@@ -2135,13 +2184,67 @@ async function guardarCapaVector(nombre, gj, silencioso){
   if(gj.type !== 'FeatureCollection'){
     fc = { type:'FeatureCollection', features: gj.type==='Feature' ? [gj] : [{type:'Feature',geometry:gj,properties:{}}] };
   }
+  // Proyección de origen: la del shapefile (ya reproyectado) o autodetectada.
+  let proyFuente, aviso = '';
+  if(fc._proyFuente !== undefined){
+    proyFuente = fc._proyFuente;   // el .shp ya vino reproyectado a WGS84
+  } else {
+    const det = detectarModoCapa(fc);
+    proyFuente = det.modo;
+    if(proyFuente !== 'geo'){
+      reproyectarFC(fc, proyFuente);
+      aviso = det.dentroCR
+        ? `Detecté proyección ${proyFuente==='crtm05'?'CRTM05':proyFuente==='ln'?'Lambert Norte':'Lambert Sur'} y la ubiqué en Costa Rica.`
+        : 'Proyección desconocida; asumí CRTM05. Si no encaja, cambiala con 🌐.';
+    }
+  }
   const capa = { id:nid(), nombre:(nombre||'Capa').slice(0,40), tipo:'geojson', visible:true, consultable:true,
-                 color: colorCapa(S.capas.length), geojson: fc };
+                 color: colorCapa(S.capas.length), geojson: fc, proyFuente };
   await dbPut('capas', capa); S.capas.push(capa);
-  toast(`Capa "${capa.nombre}": ${(fc.features||[]).length} elementos.`);
-  if(silencioso){ centrarEnCapa(capa); dibujar(); }
-  else { dibujar(); panelCapas(); }
+  toast(aviso || `Capa "${capa.nombre}": ${(fc.features||[]).length} elementos.`);
+  // Siempre volar a donde está la capa.
+  centrarEnCapa(capa); dibujar();
+  if(!silencioso) panelCapas();
   return capa;
+}
+// Reinterpreta la proyección de origen de una capa y reproyecta a WGS84.
+// Usa ida y vuelta a través de la proyección actual, así no guarda copia cruda.
+async function reinterpretarCapa(capaId, nuevoModo){
+  const c = S.capas.find(x=>x.id===capaId); if(!c || !c.geojson) return;
+  const actual = c.proyFuente || 'geo';
+  if(actual === nuevoModo){ panelCapas(); return; }
+  const rec = coords=>{
+    if(typeof coords[0]==='number'){
+      // Recuperar la coordenada cruda (Este/Norte o lon/lat) desde WGS84 actual.
+      let raw;
+      if(actual==='geo') raw = [coords[0], coords[1]];
+      else { const p = desdeWgs(coords[1], coords[0], actual); raw = [p.e, p.n]; }
+      // Aplicar la nueva interpretación.
+      if(nuevoModo==='geo'){ coords[0]=raw[0]; coords[1]=raw[1]; }
+      else { const w = haciaWgs(raw[0], raw[1], nuevoModo); coords[0]=w.lon; coords[1]=w.lat; }
+    } else for(const cc of coords) rec(cc);
+  };
+  const feats = c.geojson.type==='FeatureCollection' ? (c.geojson.features||[]) : [c.geojson];
+  for(const f of feats){ const g=f&&f.geometry; if(!g) continue;
+    if(g.type==='GeometryCollection'){ for(const gg of (g.geometries||[])) if(gg&&gg.coordinates) rec(gg.coordinates); }
+    else if(g.coordinates) rec(g.coordinates);
+    if(f) f._bbox = null;
+  }
+  c.proyFuente = nuevoModo;
+  await dbPut('capas', c);
+  centrarEnCapa(c); dibujar(); panelCapas();
+  toast('Proyección: ' + (nuevoModo==='geo'?'WGS84 (geográficas)':nuevoModo==='crtm05'?'CRTM05':nuevoModo==='ln'?'Lambert Norte':'Lambert Sur'));
+}
+// Selector de proyección de origen de una capa.
+function panelProyeccion(capaId){
+  const c = S.capas.find(x=>x.id===capaId); if(!c) return;
+  const actual = c.proyFuente || 'geo';
+  const opciones = [['geo','WGS84 · geográficas (lon/lat)'],['crtm05','CRTM05 · EPSG:5367'],['ln','Lambert Norte · EPSG:5456'],['ls','Lambert Sur · EPSG:5457']];
+  abrirPanel('Proyección · '+c.nombre, `
+    <div class="nota" style="border-color:var(--fix)">Elegí en qué proyección venían las coordenadas originales. La app las convierte a WGS84 y reencuadra el mapa. Por defecto se autodetecta.</div>
+    ${opciones.map(([k,t])=>`<button class="ancho ${actual===k?'':'borde'}" data-pj="${k}" style="margin-top:8px;text-align:left">${t}${actual===k?'  ✓':''}</button>`).join('')}
+  `);
+  document.querySelectorAll('[data-pj]').forEach(b=> b.onclick = ()=> reinterpretarCapa(capaId, b.dataset.pj));
 }
 // Centra el mapa en la caja envolvente de una capa vectorial.
 function centrarEnCapa(capa){
@@ -2305,6 +2408,7 @@ function shpAGeoJSON(shpBuf, dbfRows, prj){
   }
   const fc = { type:'FeatureCollection', features:feats };
   fc._modo = modo;
+  fc._proyFuente = modo;   // ya reproyectado a WGS84; recordar el origen para el selector 🌐
   return fc;
 }
 
@@ -2791,7 +2895,7 @@ function panelCapas(){
   abrirPanel('Capas del proyecto', `
     ${S.capas.length ? S.capas.map(c=>`<div class="fila">
         <div class="cuerpo"><div class="t"><span style="color:${c.color||'#8899AA'}">■</span> ${c.nombre}</div>
-          <div class="s">${c.tipo==='wms'?'WMS':'Vector · '+((c.geojson.features||[]).length)+' elem.'} · ${c.consultable===false?'🔒 solo vista':'🔍 consultable'}${c.etiqueta?' · 🏷 '+escHtml(c.etiqueta):''}</div></div>
+          <div class="s">${c.tipo==='wms'?'WMS':'Vector · '+((c.geojson.features||[]).length)+' elem.'} · ${c.consultable===false?'🔒 solo vista':'🔍 consultable'}${c.proyFuente&&c.proyFuente!=='geo'?' · 🌐 '+(c.proyFuente==='crtm05'?'CRTM05':c.proyFuente==='ln'?'Lambert N':'Lambert S'):''}${c.etiqueta?' · 🏷 '+escHtml(c.etiqueta):''}</div></div>
         <div style="display:flex;flex-direction:column;gap:4px">
           <button class="mini ${c.visible?'verde':''}" data-tg="${c.id}">${c.visible?'Ver':'off'}</button>
           <button class="mini ${c.consultable===false?'':'verde'}" data-tq="${c.id}">${c.consultable===false?'🔒':'🔍'}</button>
@@ -2799,6 +2903,10 @@ function panelCapas(){
         ${c.tipo!=='wms'?`<div style="display:flex;flex-direction:column;gap:4px">
           <button class="mini" data-tb="${c.id}">Tabla</button>
           <button class="mini ${c.etiqueta?'verde':''}" data-et="${c.id}">🏷</button>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:4px">
+          <button class="mini" data-pj="${c.id}" title="Proyección">🌐</button>
+          <button class="mini" data-cir="${c.id}" title="Ir a la capa">◎</button>
         </div>`:''}
         <button class="mini rojo" data-bc="${c.id}">×</button>
       </div>`).join('') : '<div class="vacio">Sin capas todavía. Agregá una abajo.<br>Tocá un elemento en el mapa para ver sus atributos.</div>'}
@@ -2810,12 +2918,14 @@ function panelCapas(){
       <option value="file">Archivo del teléfono (GeoJSON · KML · KMZ · SHP · ZIP)</option>
     </select>
     <div id="capForm"></div>
-    <div class="nota">Pegá el enlace del <b>servicio</b> WMS/WFS (el mismo que usás en QGIS) y tocá <b>Escanear</b>: la app lista las capas disponibles para elegir. Las descargas van por HTTP nativo, así que sirve aunque el servidor no permita CORS. <b>Shapefile</b>: subí el <b>.zip</b> completo (con .shp, .dbf y .prj) para conservar atributos y reproyectar; si el .prj indica CRTM05 o Lambert, la app convierte a WGS84 sola.</div>
+    <div class="nota">Pegá el enlace del <b>servicio</b> WMS/WFS (el mismo que usás en QGIS) y tocá <b>Escanear</b>: la app lista las capas disponibles para elegir. Las descargas van por HTTP nativo, así que sirve aunque el servidor no permita CORS. <b>Shapefile</b>: subí el <b>.zip</b> completo (con .shp, .dbf y .prj). <b>Proyección automática</b>: si la capa viene en CRTM05 o Lambert, la app lo detecta, la convierte a WGS84 y vuela a la zona sola; si se equivoca, corregila con 🌐.</div>
   `);
   document.querySelectorAll('[data-tg]').forEach(b=> b.onclick = ()=> toggleCapa(b.dataset.tg));
   document.querySelectorAll('[data-tq]').forEach(b=> b.onclick = ()=> toggleConsultable(b.dataset.tq));
   document.querySelectorAll('[data-tb]').forEach(b=> b.onclick = ()=> tablaAtributos(b.dataset.tb));
   document.querySelectorAll('[data-et]').forEach(b=> b.onclick = ()=> panelEtiqueta(b.dataset.et));
+  document.querySelectorAll('[data-pj]').forEach(b=> b.onclick = ()=> panelProyeccion(b.dataset.pj));
+  document.querySelectorAll('[data-cir]').forEach(b=> b.onclick = ()=>{ const c=S.capas.find(x=>x.id===b.dataset.cir); if(c){ centrarEnCapa(c); cerrarPanel(); dibujar(); } });
   document.querySelectorAll('[data-bc]').forEach(b=> b.onclick = ()=> borrarCapa(b.dataset.bc));
   const sel = document.getElementById('capTipo');
   const render = ()=>{
