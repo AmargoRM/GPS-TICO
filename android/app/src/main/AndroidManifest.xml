@@ -23,7 +23,7 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
 
-            <!-- Abrir archivos GeoJSON / GPX con GPS TICO -->
+            <!-- Abrir archivos GeoJSON / GPX / KML con GPS TICO -->
             <intent-filter android:label="@string/app_name">
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
@@ -33,6 +33,7 @@
                 <data android:mimeType="application/geo+json" />
                 <data android:mimeType="application/json" />
                 <data android:mimeType="application/gpx+xml" />
+                <data android:mimeType="application/vnd.google-earth.kml+xml" />
                 <data android:mimeType="application/octet-stream" />
                 <data android:mimeType="text/plain" />
                 <data android:mimeType="text/xml" />
@@ -48,6 +49,7 @@
                 <data android:mimeType="*/*" />
                 <data android:pathPattern=".*\\.geojson" />
                 <data android:pathPattern=".*\\.gpx" />
+                <data android:pathPattern=".*\\.kml" />
             </intent-filter>
 
         </activity>

@@ -36,7 +36,8 @@ public class MainActivity extends BridgeActivity {
         if (uri == null) return;
         try {
             String nombre = nombreDe(uri);
-            String kind = (nombre != null && nombre.toLowerCase().endsWith(".gpx")) ? "gpx" : "geojson";
+            String lower = nombre != null ? nombre.toLowerCase() : "";
+            String kind = lower.endsWith(".gpx") ? "gpx" : lower.endsWith(".kml") ? "kml" : "geojson";
             java.io.InputStream in = getContentResolver().openInputStream(uri);
             if (in == null) return;
             java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
@@ -45,6 +46,7 @@ public class MainActivity extends BridgeActivity {
             in.close();
             String texto = new String(bos.toByteArray(), "UTF-8");
             if (kind.equals("geojson") && texto.contains("<gpx")) kind = "gpx";
+            if (kind.equals("geojson") && (texto.contains("<kml") || texto.contains("<Placemark"))) kind = "kml";
             String nom = nombre != null ? nombre : "archivo";
             if (frio) FileOpenBridge.setPending(nom, kind, texto);
             else FileOpenBridge.deliver(nom, kind, texto);
