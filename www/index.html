@@ -848,13 +848,15 @@ cv.addEventListener('pointermove', e=>{
   if(ev==='pointerup' && tapInicio && toques.size===1){
     const mov = Math.hypot(e.clientX-tapInicio.x, e.clientY-tapInicio.y);
     const dt = Date.now() - tapInicio.t;
-    if(mov < 16 && dt < 500){
+    // Ventana de toque alineada con el clic sostenido (600 ms) para que no
+    // quede una zona muerta entre "toque" y "chincheta".
+    if(mov < 20 && dt < 600){
       const r = cv.getBoundingClientRect();
       const px = e.clientX - r.left, py = e.clientY - r.top;
       const ll = pantallaALatLon(px, py);
       if(modoMapa==='medir' && ll){ medicion.pts.push(ll); actualizarHerramienta(); pedirDibujo(); }
       else if(modoMapa==='navegar' && ll){ navDestino = ll; navRuta = null; actualizarHerramienta(); pedirDibujo(); }
-      else consultarEnPantalla(px, py);
+      else { try{ consultarEnPantalla(px, py); }catch(err){ toast('Error al consultar: '+(err&&err.message?err.message:err)); } }
     }
   }
   tapInicio = null; cancelarLongPress();
@@ -2076,10 +2078,10 @@ function renderarMapaExport(opts){
     if(yr>=0 && yr<=H){ const Y=PY(yr); g.beginPath(); g.moveTo(padL+mW,Y); g.lineTo(padL+mW+TIC,Y); g.stroke();
       g.save(); g.translate(padL+mW+TIC+4, Y); g.rotate(-Math.PI/2); g.textAlign='center'; g.textBaseline='top'; g.fillText(fmtMetrosGrid(N),0,0); g.restore(); }
   }
-  // --- Cabecera: título + sistema ---
+  // --- Cabecera: título (opcional, en blanco si no se puso) + sistema ---
   g.textAlign='left'; g.textBaseline='alphabetic';
-  g.fillStyle='#111'; g.font='700 26px system-ui';
-  g.fillText(opts.titulo || (S.proy?S.proy.nom:'Mapa'), padL, 40);
+  const tit = (opts.titulo||'').trim();
+  if(tit){ g.fillStyle='#111'; g.font='700 26px system-ui'; g.fillText(tit, padL, 40); }
   g.fillStyle='#555'; g.font='600 16px ui-monospace, monospace';
   g.fillText('Cuadrícula CRTM05 · EPSG:5367 · m', padL, 62);
 
@@ -2179,8 +2181,8 @@ function panelExportMapa(){
   const items = itemsLeyendaEnVista();
   abrirPanel('Exportar mapa', `
     <div class="nota" style="border-color:var(--fix)">Exporta <b>exactamente la vista actual</b> del mapa, con cuadrícula CRTM05 en el borde, norte, escala, leyenda y fecha. Encuadrá la zona antes de generar.</div>
-    <label>Título</label>
-    <input id="emTit" value="${escHtml(S.proy?S.proy.nom:'Mapa')}">
+    <label>Título del mapa (opcional)</label>
+    <input id="emTit" value="" placeholder="Dejalo en blanco si no querés título">
     <label>Formato</label>
     <select id="emFmt">
       <option value="pdf">PDF georreferenciado (QGIS / Avenza)</option>
@@ -2976,6 +2978,12 @@ function distGeomPx(g, px, py, ll){
   }
   return Infinity;
 }
+function geomEsPoligono(g){
+  if(!g) return false;
+  if(g.type==='Polygon' || g.type==='MultiPolygon') return true;
+  if(g.type==='GeometryCollection') return (g.geometries||[]).some(geomEsPoligono);
+  return false;
+}
 function consultarEnPantalla(px,py){
   const ll = pantallaALatLon(px,py); if(!ll) return;
   // Margen en grados equivalente a la tolerancia en px, para descartar rápido
@@ -2986,22 +2994,33 @@ function consultarEnPantalla(px,py){
   const laMar = p1&&p2 ? Math.abs(p1.lat-p2.lat) : 0.01;
 
   // 1) Elemento vectorial consultable MÁS CERCANO (punto, línea o polígono).
+  //    A prueba de fallos: si el cálculo de distancia falla en una geometría,
+  //    se ignora ese elemento; y como respaldo se guarda el más chico cuya
+  //    caja envolvente contiene el toque (garantiza acierto en polígonos).
   let mejor=null, mejorDist=TOL, mejorCapa=null;
+  let respaldo=null, respaldoArea=Infinity, respaldoCapa=null;
   for(let i=S.capas.length-1;i>=0;i--){
     const c = S.capas[i];
     if(!c.visible || c.tipo==='wms' || c.consultable===false || !c.geojson) continue;
     const feats = c.geojson.type==='FeatureCollection' ? (c.geojson.features||[]) : c.geojson.type==='Feature' ? [c.geojson] : [];
     for(const f of feats){
       if(!f || !f.geometry) continue;
-      if(!f._bbox) f._bbox = bboxGeom(f.geometry);
+      if(!f._bbox){ try{ f._bbox = bboxGeom(f.geometry); }catch(e){ continue; } }
       const b = f._bbox;
-      if(b[2]<ll.lon-loMar || b[0]>ll.lon+loMar || b[3]<ll.lat-laMar || b[1]>ll.lat+laMar) continue;
-      const d = distGeomPx(f.geometry, px, py, ll);
+      if(!b || b[2]<ll.lon-loMar || b[0]>ll.lon+loMar || b[3]<ll.lat-laMar || b[1]>ll.lat+laMar) continue;
+      // Respaldo SOLO para polígonos: ¿el toque cae dentro de su caja?
+      if(geomEsPoligono(f.geometry) && ll.lon>=b[0] && ll.lon<=b[2] && ll.lat>=b[1] && ll.lat<=b[3]){
+        const area = Math.max(1e-12, (b[2]-b[0])*(b[3]-b[1]));
+        if(area < respaldoArea){ respaldoArea = area; respaldo = f; respaldoCapa = c; }
+      }
+      let d = Infinity;
+      try{ d = distGeomPx(f.geometry, px, py, ll); }catch(e){ d = Infinity; }
       if(d < mejorDist){ mejorDist = d; mejor = f; mejorCapa = c; if(d===0) break; }
     }
     if(mejor && mejorDist===0) break;
   }
   if(mejor){ mostrarAtributos(mejorCapa, [mejor]); return; }
+  if(respaldo){ mostrarAtributos(respaldoCapa, [respaldo]); return; }
   // 2) Punto del proyecto (marcado o promediado).
   let mejorP=null, mejorD=30;
   for(const p of S.puntos){ const s=latlonAPantalla(p.lat,p.lon); if(!s) continue; const d=Math.hypot(px-s.x,py-s.y); if(d<mejorD){ mejorD=d; mejorP=p; } }
