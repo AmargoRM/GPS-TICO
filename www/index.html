@@ -569,6 +569,8 @@ function dibujarCapasVector(aPant, vista){
     const feats = fc.type==='FeatureCollection' ? (fc.features||[])
                 : fc.type==='Feature' ? [fc] : [];
     const color = capa.color || '#E0A458';
+    const etiq = capa.etiqueta || null;   // campo a rotular, si el usuario lo activó
+    const rotulos = [];
     for(const f of feats){
       if(!f || !f.geometry) continue;
       if(!f._bbox) f._bbox = bboxGeom(f.geometry);
@@ -576,7 +578,13 @@ function dibujarCapasVector(aPant, vista){
       // Descartar si la caja del elemento no intersecta la vista.
       if(vista && (b[2]<vista.oLon || b[0]>vista.eLon || b[3]<vista.sLat || b[1]>vista.nLat)) continue;
       dibujarGeom(f.geometry, aPant, color);
+      // Preparar etiqueta (se dibuja después, encima de todas las geometrías).
+      if(etiq && f.properties){
+        const v = f.properties[etiq];
+        if(v!=null && v!==''){ const a = anclaGeom(f.geometry); if(a){ const s = aPant(a[1], a[0]); if(s.x>-40 && s.x<W+40 && s.y>-20 && s.y<H+20) rotulos.push([s.x, s.y, String(v)]); } }
+      }
     }
+    for(const [x,y,t] of rotulos) dibujarEtiqueta(x, y, t);
   }
 }
 function dibujarGeom(g, aPant, color){
@@ -597,6 +605,28 @@ function dibujarGeom(g, aPant, color){
     case 'MultiPolygon': g.coordinates.forEach(poly=> poly.forEach(r=> linea(r,true))); break;
     case 'GeometryCollection': (g.geometries||[]).forEach(gg=> dibujarGeom(gg, aPant, color)); break;
   }
+}
+// Punto representativo [lon,lat] de una geometría, para colgar su etiqueta.
+function centroideAnillo(r){ if(!r || !r.length) return null; let x=0,y=0; for(const c of r){ x+=c[0]; y+=c[1]; } return [x/r.length, y/r.length]; }
+function anclaGeom(g){
+  if(!g) return null;
+  switch(g.type){
+    case 'Point': return g.coordinates;
+    case 'MultiPoint': return g.coordinates[0];
+    case 'LineString': return g.coordinates[Math.floor(g.coordinates.length/2)];
+    case 'MultiLineString': { const l=g.coordinates[0]; return l && l[Math.floor(l.length/2)]; }
+    case 'Polygon': return centroideAnillo(g.coordinates[0]);
+    case 'MultiPolygon': return centroideAnillo(g.coordinates[0] && g.coordinates[0][0]);
+    case 'GeometryCollection': { for(const gg of (g.geometries||[])){ const a=anclaGeom(gg); if(a) return a; } return null; }
+  }
+  return null;
+}
+// Texto con halo oscuro para que se lea sobre cualquier fondo.
+function dibujarEtiqueta(x, y, txt){
+  if(txt.length>28) txt = txt.slice(0,27)+'…';
+  ctx.font = '600 11px system-ui'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.lineWidth = 3; ctx.strokeStyle = 'rgba(10,18,20,.92)'; ctx.strokeText(txt, x, y);
+  ctx.fillStyle = '#DCE6E4'; ctx.fillText(txt, x, y);
 }
 
 // Dibujado batcheado: coalesce múltiples pedidos en un solo frame.
@@ -2382,21 +2412,6 @@ function pantallaALatLon(px,py){ if(!ultimoT) return null; const t=ultimoT; cons
 function distSegPx(px,py,a,b){ const dx=b.x-a.x,dy=b.y-a.y,l2=dx*dx+dy*dy; let t=l2?((px-a.x)*dx+(py-a.y)*dy)/l2:0; t=Math.max(0,Math.min(1,t)); return Math.hypot(px-(a.x+t*dx), py-(a.y+t*dy)); }
 function puntoEnAnillo(lon,lat,ring){ let d=false; for(let i=0,j=ring.length-1;i<ring.length;j=i++){ const xi=ring[i][0],yi=ring[i][1],xj=ring[j][0],yj=ring[j][1]; if(((yi>lat)!=(yj>lat)) && (lon<(xj-xi)*(lat-yi)/(yj-yi)+xi)) d=!d; } return d; }
 function puntoEnPolig(lon,lat,rings){ let dentro=false; for(const r of rings){ if(puntoEnAnillo(lon,lat,r)) dentro=!dentro; } return dentro; }
-const TOL_PUNTO = 26, TOL_LINEA = 16;   // radios de acierto en px (dedo)
-function hitGeom(g, px, py, ll){
-  if(!g) return false;
-  const P = c=> latlonAPantalla(c[1],c[0]);
-  switch(g.type){
-    case 'Point': { const p=P(g.coordinates); return !!p && Math.hypot(px-p.x,py-p.y)<TOL_PUNTO; }
-    case 'MultiPoint': return g.coordinates.some(c=>{ const p=P(c); return !!p && Math.hypot(px-p.x,py-p.y)<TOL_PUNTO; });
-    case 'LineString': { const pts=g.coordinates.map(P); for(let i=1;i<pts.length;i++){ if(pts[i-1]&&pts[i]&&distSegPx(px,py,pts[i-1],pts[i])<TOL_LINEA) return true; } return false; }
-    case 'MultiLineString': return g.coordinates.some(l=> hitGeom({type:'LineString',coordinates:l},px,py,ll));
-    case 'Polygon': return puntoEnPolig(ll.lon,ll.lat,g.coordinates);
-    case 'MultiPolygon': return g.coordinates.some(poly=> puntoEnPolig(ll.lon,ll.lat,poly));
-    case 'GeometryCollection': return (g.geometries||[]).some(gg=> hitGeom(gg,px,py,ll));
-  }
-  return false;
-}
 /* --- herramientas de mapa: medición, navegación y chincheta --- */
 let modoMapa = 'consulta';   // 'consulta' | 'medir' | 'navegar'
 let medicion = { pts:[], unidad:'m' };
@@ -2582,50 +2597,69 @@ function abrirEnMaps(lat, lon){
   if(P && P.abrirExterno){ P.abrirExterno({url}).catch(()=> P.abrirExterno({url:`https://www.google.com/maps/dir/?api=1&destination=${lat},${lon}`}).catch(()=>toast('No se pudo abrir Maps.'))); }
   else window.open(url, '_system');
 }
+// Distancia mínima (px) del toque a una polilínea (segmentos, no solo vértices).
+function distSegAny(px, py, pts){
+  let m = Infinity;
+  for(let i=1;i<pts.length;i++){ if(pts[i-1] && pts[i]){ const d = distSegPx(px,py,pts[i-1],pts[i]); if(d<m) m=d; } }
+  if(pts.length===1 && pts[0]) m = Math.hypot(px-pts[0].x, py-pts[0].y);
+  return m;
+}
+// Distancia en px del toque a una geometría (0 si el toque cae dentro de un polígono).
+function distGeomPx(g, px, py, ll){
+  if(!g) return Infinity;
+  const P = c=> latlonAPantalla(c[1],c[0]);
+  switch(g.type){
+    case 'Point': { const p=P(g.coordinates); return p?Math.hypot(px-p.x,py-p.y):Infinity; }
+    case 'MultiPoint': return Math.min(...g.coordinates.map(c=>{ const p=P(c); return p?Math.hypot(px-p.x,py-p.y):Infinity; }));
+    case 'LineString': return distSegAny(px,py,g.coordinates.map(P));
+    case 'MultiLineString': return Math.min(...g.coordinates.map(l=> distSegAny(px,py,l.map(P))));
+    case 'Polygon': return puntoEnPolig(ll.lon,ll.lat,g.coordinates) ? 0 : Math.min(...g.coordinates.map(r=> distSegAny(px,py,r.map(P))));
+    case 'MultiPolygon': return g.coordinates.some(poly=> puntoEnPolig(ll.lon,ll.lat,poly)) ? 0
+                              : Math.min(...g.coordinates.map(poly=> Math.min(...poly.map(r=> distSegAny(px,py,r.map(P))))));
+    case 'GeometryCollection': return Math.min(...(g.geometries||[]).map(gg=> distGeomPx(gg,px,py,ll)));
+  }
+  return Infinity;
+}
 function consultarEnPantalla(px,py){
   const ll = pantallaALatLon(px,py); if(!ll) return;
-  // 1) Capas vectoriales (GeoJSON / WFS): acierto directo.
-  for(let i=S.capas.length-1;i>=0;i--){
-    const c = S.capas[i];
-    if(!c.visible || c.tipo==='wms' || c.consultable===false || !c.geojson) continue;
-    const feats = c.geojson.type==='FeatureCollection' ? (c.geojson.features||[]) : c.geojson.type==='Feature' ? [c.geojson] : [];
-    const encontrados = feats.filter(f=> hitGeom(f&&f.geometry, px, py, ll));
-    if(encontrados.length){ mostrarAtributos(c, encontrados); return; }
-  }
-  // 2) Punto del proyecto (marcado o promediado).
-  let mejorP=null, mejorD=30;
-  for(const p of S.puntos){ const s=latlonAPantalla(p.lat,p.lon); if(!s) continue; const d=Math.hypot(px-s.x,py-s.y); if(d<mejorD){ mejorD=d; mejorP=p; } }
-  if(mejorP){ mostrarPunto(mejorP); return; }
-  // 3) Elemento vectorial MÁS CERCANO (vértice) dentro de ~34px, por si el dedo cayó cerca.
-  let mejor=null, mejorDist=34, mejorCapa=null;
+  // Margen en grados equivalente a la tolerancia en px, para descartar rápido
+  // los elementos lejanos por su caja envolvente (capas grandes).
+  const TOL = 44;
+  const p1 = pantallaALatLon(px-TOL, py-TOL), p2 = pantallaALatLon(px+TOL, py+TOL);
+  const loMar = p1&&p2 ? Math.abs(p2.lon-p1.lon) : 0.01;
+  const laMar = p1&&p2 ? Math.abs(p1.lat-p2.lat) : 0.01;
+
+  // 1) Elemento vectorial consultable MÁS CERCANO (punto, línea o polígono).
+  let mejor=null, mejorDist=TOL, mejorCapa=null;
   for(let i=S.capas.length-1;i>=0;i--){
     const c = S.capas[i];
     if(!c.visible || c.tipo==='wms' || c.consultable===false || !c.geojson) continue;
     const feats = c.geojson.type==='FeatureCollection' ? (c.geojson.features||[]) : c.geojson.type==='Feature' ? [c.geojson] : [];
     for(const f of feats){
-      const d = distVerticesPx(f && f.geometry, px, py);
-      if(d < mejorDist){ mejorDist = d; mejor = f; mejorCapa = c; }
+      if(!f || !f.geometry) continue;
+      if(!f._bbox) f._bbox = bboxGeom(f.geometry);
+      const b = f._bbox;
+      if(b[2]<ll.lon-loMar || b[0]>ll.lon+loMar || b[3]<ll.lat-laMar || b[1]>ll.lat+laMar) continue;
+      const d = distGeomPx(f.geometry, px, py, ll);
+      if(d < mejorDist){ mejorDist = d; mejor = f; mejorCapa = c; if(d===0) break; }
     }
+    if(mejor && mejorDist===0) break;
   }
   if(mejor){ mostrarAtributos(mejorCapa, [mejor]); return; }
-  // 4) WMS: preguntar al servidor.
+  // 2) Punto del proyecto (marcado o promediado).
+  let mejorP=null, mejorD=30;
+  for(const p of S.puntos){ const s=latlonAPantalla(p.lat,p.lon); if(!s) continue; const d=Math.hypot(px-s.x,py-s.y); if(d<mejorD){ mejorD=d; mejorP=p; } }
+  if(mejorP){ mostrarPunto(mejorP); return; }
+  // 3) WMS: preguntar al servidor.
   for(let i=S.capas.length-1;i>=0;i--){
     const c = S.capas[i];
     if(!c.visible || c.tipo!=='wms' || c.consultable===false) continue;
     consultarWMS(c, px, py); return;
   }
-}
-// Distancia mínima (px) del toque a cualquier vértice de la geometría.
-function distVerticesPx(g, px, py){
-  if(!g) return Infinity;
-  let min = Infinity;
-  const rec = coords=>{
-    if(typeof coords[0]==='number'){ const s=latlonAPantalla(coords[1],coords[0]); if(s){ const d=Math.hypot(px-s.x,py-s.y); if(d<min) min=d; } }
-    else for(const c of coords) rec(c);
-  };
-  if(g.type==='GeometryCollection'){ for(const gg of (g.geometries||[])) min=Math.min(min, distVerticesPx(gg,px,py)); }
-  else if(g.coordinates) rec(g.coordinates);
-  return min;
+  // 4) Nada cerca: dar retroalimentación en vez de quedarse mudo.
+  const hayConsultables = S.capas.some(c=> c.visible && c.consultable!==false);
+  if(S.capas.length && !hayConsultables) toast('Activá la lupa 🔍 en la capa para poder consultarla.');
+  else if(hayConsultables) toast('No hay ningún elemento consultable en ese punto.');
 }
 function mostrarPunto(p){
   const f = fmtCoord(p.lat, p.lon, S.modo);
@@ -2716,6 +2750,35 @@ function tablaAtributos(capaId){
   `);
 }
 async function toggleConsultable(id){ const c=S.capas.find(x=>x.id===id); if(!c) return; c.consultable = c.consultable===false; await dbPut('capas',c); panelCapas(); }
+// Campos disponibles de una capa vectorial (unión de propiedades).
+function camposDeCapa(c){
+  const feats = c.geojson.type==='FeatureCollection' ? (c.geojson.features||[]) : c.geojson.type==='Feature' ? [c.geojson] : [];
+  const claves = [];
+  for(const f of feats){ const p=f&&f.properties||{}; for(const k of Object.keys(p)) if(!claves.includes(k)) claves.push(k); if(claves.length>=40) break; }
+  return claves;
+}
+async function setEtiqueta(id, campo){
+  const c = S.capas.find(x=>x.id===id); if(!c) return;
+  c.etiqueta = campo || null;
+  await dbPut('capas', c); dibujar(); panelCapas();
+  toast(campo ? 'Etiquetando por: '+campo : 'Etiquetas apagadas.');
+}
+// Elegir el campo con el que rotular los elementos de la capa sobre el mapa.
+function panelEtiqueta(id){
+  const c = S.capas.find(x=>x.id===id); if(!c || !c.geojson){ toast('Capa sin datos.'); return; }
+  const campos = camposDeCapa(c);
+  const feats = c.geojson.type==='FeatureCollection' ? (c.geojson.features||[]) : [c.geojson];
+  const muestra = (feats[0] && feats[0].properties) || {};
+  abrirPanel('Etiquetar · '+c.nombre, `
+    <div class="nota" style="border-color:var(--fix)">Elegí un campo de la capa y su valor se dibuja como texto sobre cada elemento en el mapa.</div>
+    <button class="ancho ${c.etiqueta?'borde':''}" data-set="">Sin etiqueta</button>
+    ${campos.length ? campos.map(k=>`
+      <button class="ancho ${c.etiqueta===k?'':'borde'}" data-set="${escHtml(k)}" style="margin-top:8px;text-align:left">
+        ${escHtml(k)} <span style="color:var(--musgo);font-weight:400">· ej: ${escHtml(fmtVal(muestra[k])).slice(0,26)||'—'}</span>
+      </button>`).join('') : '<div class="vacio">Esta capa no tiene atributos para etiquetar.</div>'}
+  `);
+  document.querySelectorAll('[data-set]').forEach(b=> b.onclick = ()=> setEtiqueta(id, b.dataset.set));
+}
 async function toggleCapa(id){ const c=S.capas.find(x=>x.id===id); if(!c) return; c.visible=!c.visible; await dbPut('capas',c); dibujar(); panelCapas(); }
 async function borrarCapa(id){
   // Borra también sus tiles WMS cacheados.
@@ -2728,12 +2791,15 @@ function panelCapas(){
   abrirPanel('Capas del proyecto', `
     ${S.capas.length ? S.capas.map(c=>`<div class="fila">
         <div class="cuerpo"><div class="t"><span style="color:${c.color||'#8899AA'}">■</span> ${c.nombre}</div>
-          <div class="s">${c.tipo==='wms'?'WMS':'Vector · '+((c.geojson.features||[]).length)+' elem.'} · ${c.consultable===false?'🔒 solo vista':'🔍 consultable'}</div></div>
+          <div class="s">${c.tipo==='wms'?'WMS':'Vector · '+((c.geojson.features||[]).length)+' elem.'} · ${c.consultable===false?'🔒 solo vista':'🔍 consultable'}${c.etiqueta?' · 🏷 '+escHtml(c.etiqueta):''}</div></div>
         <div style="display:flex;flex-direction:column;gap:4px">
           <button class="mini ${c.visible?'verde':''}" data-tg="${c.id}">${c.visible?'Ver':'off'}</button>
           <button class="mini ${c.consultable===false?'':'verde'}" data-tq="${c.id}">${c.consultable===false?'🔒':'🔍'}</button>
         </div>
-        ${c.tipo!=='wms'?`<button class="mini" data-tb="${c.id}">Tabla</button>`:''}
+        ${c.tipo!=='wms'?`<div style="display:flex;flex-direction:column;gap:4px">
+          <button class="mini" data-tb="${c.id}">Tabla</button>
+          <button class="mini ${c.etiqueta?'verde':''}" data-et="${c.id}">🏷</button>
+        </div>`:''}
         <button class="mini rojo" data-bc="${c.id}">×</button>
       </div>`).join('') : '<div class="vacio">Sin capas todavía. Agregá una abajo.<br>Tocá un elemento en el mapa para ver sus atributos.</div>'}
     <label>Agregar capa</label>
@@ -2749,6 +2815,7 @@ function panelCapas(){
   document.querySelectorAll('[data-tg]').forEach(b=> b.onclick = ()=> toggleCapa(b.dataset.tg));
   document.querySelectorAll('[data-tq]').forEach(b=> b.onclick = ()=> toggleConsultable(b.dataset.tq));
   document.querySelectorAll('[data-tb]').forEach(b=> b.onclick = ()=> tablaAtributos(b.dataset.tb));
+  document.querySelectorAll('[data-et]').forEach(b=> b.onclick = ()=> panelEtiqueta(b.dataset.et));
   document.querySelectorAll('[data-bc]').forEach(b=> b.onclick = ()=> borrarCapa(b.dataset.bc));
   const sel = document.getElementById('capTipo');
   const render = ()=>{
