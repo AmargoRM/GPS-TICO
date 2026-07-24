@@ -568,7 +568,7 @@ function dibujarCapasVector(aPant, vista){
     const fc = capa.geojson;
     const feats = fc.type==='FeatureCollection' ? (fc.features||[])
                 : fc.type==='Feature' ? [fc] : [];
-    const color = capa.color || '#E0A458';
+    const est = estiloCapa(capa);
     const etiq = capa.etiqueta || null;   // campo a rotular, si el usuario lo activó
     const rotulos = [];
     for(const f of feats){
@@ -577,7 +577,7 @@ function dibujarCapasVector(aPant, vista){
       const b = f._bbox;
       // Descartar si la caja del elemento no intersecta la vista.
       if(vista && (b[2]<vista.oLon || b[0]>vista.eLon || b[3]<vista.sLat || b[1]>vista.nLat)) continue;
-      dibujarGeom(f.geometry, aPant, color);
+      dibujarGeom(f.geometry, aPant, est);
       // Preparar etiqueta (se dibuja después, encima de todas las geometrías).
       if(etiq && f.properties){
         const v = f.properties[etiq];
@@ -587,15 +587,36 @@ function dibujarCapasVector(aPant, vista){
     for(const [x,y,t] of rotulos) dibujarEtiqueta(x, y, t);
   }
 }
-function dibujarGeom(g, aPant, color){
+// Estilo efectivo de una capa (con valores por defecto).
+function estiloCapa(capa){
+  return { color: capa.color||'#E0A458', punto: capa.punto||'circulo',
+           fillAlpha: capa.opacidad!=null?capa.opacidad:0.2, grosor: capa.grosor||2, tam: capa.tam||5 };
+}
+function hexRGBA(hex, a){
+  let h=(hex||'#E0A458').replace('#',''); if(h.length===3) h=h.split('').map(c=>c+c).join('');
+  const n=parseInt(h,16); return `rgba(${(n>>16)&255},${(n>>8)&255},${n&255},${a})`;
+}
+// Dibuja un símbolo de punto según el estilo de la capa.
+function dibujarSimbolo(p, sim, color, r, gr){
+  ctx.beginPath();
+  if(sim==='cuadro'){ ctx.rect(p.x-r,p.y-r,2*r,2*r); }
+  else if(sim==='triangulo'){ ctx.moveTo(p.x,p.y-r); ctx.lineTo(p.x+r,p.y+r); ctx.lineTo(p.x-r,p.y+r); ctx.closePath(); }
+  else if(sim==='rombo'){ ctx.moveTo(p.x,p.y-r); ctx.lineTo(p.x+r,p.y); ctx.lineTo(p.x,p.y+r); ctx.lineTo(p.x-r,p.y); ctx.closePath(); }
+  else if(sim==='cruz'){ ctx.moveTo(p.x-r,p.y); ctx.lineTo(p.x+r,p.y); ctx.moveTo(p.x,p.y-r); ctx.lineTo(p.x,p.y+r); ctx.strokeStyle=color; ctx.lineWidth=gr+1; ctx.stroke(); return; }
+  else if(sim==='aspa'){ ctx.moveTo(p.x-r,p.y-r); ctx.lineTo(p.x+r,p.y+r); ctx.moveTo(p.x+r,p.y-r); ctx.lineTo(p.x-r,p.y+r); ctx.strokeStyle=color; ctx.lineWidth=gr+1; ctx.stroke(); return; }
+  else { ctx.arc(p.x,p.y,r,0,7); }
+  ctx.fillStyle=color; ctx.fill(); ctx.lineWidth=1.5; ctx.strokeStyle='#0A1214'; ctx.stroke();
+}
+function dibujarGeom(g, aPant, est){
   if(!g) return;
+  const color = est.color, gr = est.grosor||2, sim = est.punto||'circulo', r = est.tam||5, fa = est.fillAlpha!=null?est.fillAlpha:0.2;
   const linea = (coords, cerrar)=>{
     ctx.beginPath();
     for(let i=0;i<coords.length;i++){ const p = aPant(coords[i][1], coords[i][0]); if(i===0) ctx.moveTo(p.x,p.y); else ctx.lineTo(p.x,p.y); }
-    if(cerrar){ ctx.closePath(); ctx.fillStyle = color+'33'; ctx.fill(); }
-    ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.stroke();
+    if(cerrar){ ctx.closePath(); if(fa>0){ ctx.fillStyle = hexRGBA(color, fa); ctx.fill(); } }
+    ctx.strokeStyle = color; ctx.lineWidth = gr; ctx.stroke();
   };
-  const punto = (c)=>{ const p = aPant(c[1],c[0]); ctx.beginPath(); ctx.arc(p.x,p.y,4,0,7); ctx.fillStyle = color; ctx.fill(); ctx.lineWidth=1.5; ctx.strokeStyle='#0A1214'; ctx.stroke(); };
+  const punto = (c)=>{ dibujarSimbolo(aPant(c[1],c[0]), sim, color, r, gr); };
   switch(g.type){
     case 'Point': punto(g.coordinates); break;
     case 'MultiPoint': g.coordinates.forEach(punto); break;
@@ -603,7 +624,7 @@ function dibujarGeom(g, aPant, color){
     case 'MultiLineString': g.coordinates.forEach(l=> linea(l,false)); break;
     case 'Polygon': g.coordinates.forEach(r=> linea(r,true)); break;
     case 'MultiPolygon': g.coordinates.forEach(poly=> poly.forEach(r=> linea(r,true))); break;
-    case 'GeometryCollection': (g.geometries||[]).forEach(gg=> dibujarGeom(gg, aPant, color)); break;
+    case 'GeometryCollection': (g.geometries||[]).forEach(gg=> dibujarGeom(gg, aPant, est)); break;
   }
 }
 // Punto representativo [lon,lat] de una geometría, para colgar su etiqueta.
@@ -1527,6 +1548,7 @@ document.getElementById('btnMenu').onclick = ()=>{
     <div class="fila"><div class="cuerpo"><div class="t">Convertir coordenadas</div><div class="s">Geo ↔ CRTM05 ↔ Lambert N/S</div></div><button class="mini" id="mConv">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Mapa sin conexión</div><div class="s">Zonas y parches descargables</div></div><button class="mini" id="mOff">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Exportar proyecto</div><div class="s">GPX · CSV · GeoJSON</div></div><button class="mini" id="mExp">Abrir</button></div>
+    <div class="fila"><div class="cuerpo"><div class="t">Exportar mapa</div><div class="s">PDF georreferenciado · PNG · grilla CRTM05</div></div><button class="mini" id="mExpMapa">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Precisión y advertencias</div><div class="s">Leer antes de usar en expedientes</div></div><button class="mini" id="mInfo">Abrir</button></div>
   `);
   document.getElementById('mFuente').onclick = panelFuente;
@@ -1537,6 +1559,7 @@ document.getElementById('btnMenu').onclick = ()=>{
   document.getElementById('mConv').onclick  = panelConv;
   document.getElementById('mOff').onclick   = panelOffline;
   document.getElementById('mExp').onclick   = panelExport;
+  document.getElementById('mExpMapa').onclick = panelExportMapa;
   document.getElementById('mInfo').onclick  = panelInfo;
 };
 
@@ -1964,6 +1987,235 @@ async function bajar(nom, txt, tipo){
   a.click();
   setTimeout(()=> URL.revokeObjectURL(a.href), 4000);
   toast('Archivo descargado.');
+}
+
+/* =======================================================================
+   EXPORTAR MAPA  (PNG o PDF georreferenciado, con grilla CRTM05)
+   ======================================================================= */
+function blobABase64(blob){ return new Promise((ok,mal)=>{ const r=new FileReader(); r.onload=()=>ok(String(r.result).split(',')[1]); r.onerror=mal; r.readAsDataURL(blob); }); }
+async function bajarBlob(nom, blob){
+  const safe = nom.replace(/[^\w\-. áéíóúñÁÉÍÓÚÑ]/g,'_');
+  const P = window.Capacitor && window.Capacitor.Plugins;
+  if(P && P.Filesystem){
+    try{
+      const b64 = await blobABase64(blob);
+      const res = await P.Filesystem.writeFile({ path:safe, data:b64, directory:'CACHE' });   // sin encoding = binario
+      if(P.Share) await P.Share.share({ title:safe, url:res.uri, dialogTitle:'Guardar o compartir '+safe });
+      else toast('Guardado en caché: '+safe);
+      return;
+    }catch(e){ toast('No se pudo guardar: '+(e && e.message?e.message:e)); return; }
+  }
+  const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=safe; a.click();
+  setTimeout(()=>URL.revokeObjectURL(a.href),4000); toast('Archivo descargado.');
+}
+// Paso de grilla "redondo" adaptado al rango, para no saturar (5–8 líneas).
+function pasoGrilla(rango){
+  const objetivo = Math.max(1e-6, rango/6);
+  const p10 = Math.pow(10, Math.floor(Math.log10(objetivo)));
+  for(const m of [1,2,2.5,5,10]) if(p10*m >= objetivo) return p10*m;
+  return p10*10;
+}
+function fmtMetrosGrid(v){ v=Math.round(v); const s=Math.abs(v).toString().replace(/\B(?=(\d{3})+(?!\d))/g,' '); return (v<0?'-':'')+s; }
+
+// Renderiza la vista actual a un canvas con marco, grilla CRTM05 exterior,
+// norte, barra de escala, leyenda y fecha. Devuelve {canvas, geo}.
+function renderarMapaExport(opts){
+  dibujar();                              // asegurar que el mapa vivo esté al día
+  if(!ultimoT){ toast('Abrí el mapa primero.'); return null; }
+  const k = 2;                            // supersampling para nitidez
+  const mW = Math.round(W*k), mH = Math.round(H*k);
+  // Esquinas geográficas EXACTAS de lo dibujado.
+  const tl = pantallaALatLon(0,0), br = pantallaALatLon(W,H);
+  const lonW=tl.lon, latN=tl.lat, lonE=br.lon, latS=br.lat;
+
+  // Márgenes (px de página).
+  const padL=84, padT=72, padR=34;
+  const leg = opts.leyenda||[];
+  const legCols = 2, legRows = Math.ceil(leg.length/legCols);
+  const stripH = 118 + legRows*34;
+  const pageW = padL + mW + padR;
+  const pageH = padT + mH + stripH;
+
+  const cvE = document.createElement('canvas');
+  cvE.width = pageW; cvE.height = pageH;
+  const g = cvE.getContext('2d');
+  g.fillStyle = '#FFFFFF'; g.fillRect(0,0,pageW,pageH);
+  // Mapa (instantánea del canvas vivo).
+  g.imageSmoothingEnabled = true;
+  g.drawImage(cv, 0,0,cv.width,cv.height, padL, padT, mW, mH);
+  // Marco.
+  g.strokeStyle='#111'; g.lineWidth=2; g.strokeRect(padL, padT, mW, mH);
+
+  // --- Grilla exterior CRTM05 (solo marcas y números en el marco) ---
+  const c = [tmFwd(latN,lonW,CRTM05),tmFwd(latN,lonE,CRTM05),tmFwd(latS,lonW,CRTM05),tmFwd(latS,lonE,CRTM05)];
+  let Emin=Infinity,Emax=-Infinity,Nmin=Infinity,Nmax=-Infinity;
+  for(const q of c){ Emin=Math.min(Emin,q.e);Emax=Math.max(Emax,q.e);Nmin=Math.min(Nmin,q.n);Nmax=Math.max(Nmax,q.n); }
+  const paso = pasoGrilla(Math.max(Emax-Emin, Nmax-Nmin));
+  const lonParaE=(lat,E)=>{ let a=lonW,b=lonE; for(let i=0;i<38;i++){ const m=(a+b)/2; (tmFwd(lat,m,CRTM05).e<E)?a=m:b=m; } return (a+b)/2; };
+  const latParaN=(lon,N)=>{ let a=latS,b=latN; for(let i=0;i<38;i++){ const m=(a+b)/2; (tmFwd(m,lon,CRTM05).n<N)?a=m:b=m; } return (a+b)/2; };
+  const PX = cx => padL + cx*k, PY = cy => padT + cy*k;   // css -> página
+  g.fillStyle='#111'; g.strokeStyle='#111'; g.lineWidth=1.5;
+  g.font='600 18px ui-monospace, monospace';
+  const TIC=11;
+  // Eastings (marcas arriba y abajo).
+  g.textAlign='center';
+  for(let E=Math.ceil(Emin/paso)*paso; E<=Emax; E+=paso){
+    const xt = latlonAPantalla(latN, lonParaE(latN,E)).x;
+    const xb = latlonAPantalla(latS, lonParaE(latS,E)).x;
+    if(xt>=0 && xt<=W){ const X=PX(xt); g.beginPath(); g.moveTo(X,padT); g.lineTo(X,padT-TIC); g.stroke();
+      g.textBaseline='bottom'; g.fillText(fmtMetrosGrid(E), X, padT-TIC-3); }
+    if(xb>=0 && xb<=W){ const X=PX(xb); g.beginPath(); g.moveTo(X,padT+mH); g.lineTo(X,padT+mH+TIC); g.stroke();
+      g.textBaseline='top'; g.fillText(fmtMetrosGrid(E), X, padT+mH+TIC+3); }
+  }
+  // Northings (marcas izquierda y derecha, texto rotado).
+  for(let N=Math.ceil(Nmin/paso)*paso; N<=Nmax; N+=paso){
+    const yl = latlonAPantalla(latParaN(lonW,N), lonW).y;
+    const yr = latlonAPantalla(latParaN(lonE,N), lonE).y;
+    if(yl>=0 && yl<=H){ const Y=PY(yl); g.beginPath(); g.moveTo(padL,Y); g.lineTo(padL-TIC,Y); g.stroke();
+      g.save(); g.translate(padL-TIC-4, Y); g.rotate(-Math.PI/2); g.textAlign='center'; g.textBaseline='bottom'; g.fillText(fmtMetrosGrid(N),0,0); g.restore(); }
+    if(yr>=0 && yr<=H){ const Y=PY(yr); g.beginPath(); g.moveTo(padL+mW,Y); g.lineTo(padL+mW+TIC,Y); g.stroke();
+      g.save(); g.translate(padL+mW+TIC+4, Y); g.rotate(-Math.PI/2); g.textAlign='center'; g.textBaseline='top'; g.fillText(fmtMetrosGrid(N),0,0); g.restore(); }
+  }
+  // --- Cabecera: título + sistema ---
+  g.textAlign='left'; g.textBaseline='alphabetic';
+  g.fillStyle='#111'; g.font='700 26px system-ui';
+  g.fillText(opts.titulo || (S.proy?S.proy.nom:'Mapa'), padL, 40);
+  g.fillStyle='#555'; g.font='600 16px ui-monospace, monospace';
+  g.fillText('Cuadrícula CRTM05 · EPSG:5367 · m', padL, 62);
+
+  // --- Franja inferior: norte, escala, leyenda, fecha ---
+  const sy = padT + mH;
+  g.strokeStyle='#ccc'; g.lineWidth=1; g.beginPath(); g.moveTo(padL, sy+40); g.lineTo(pageW-padR, sy+40); g.stroke();
+  // Norte
+  const nx=padL+16, ny=sy+90;
+  g.strokeStyle='#111'; g.fillStyle='#111'; g.lineWidth=2.5;
+  g.beginPath(); g.moveTo(nx,ny+22); g.lineTo(nx,ny-22); g.stroke();
+  g.beginPath(); g.moveTo(nx,ny-28); g.lineTo(nx-7,ny-14); g.lineTo(nx+7,ny-14); g.closePath(); g.fill();
+  g.textAlign='center'; g.font='700 18px system-ui'; g.fillText('N', nx, ny+40);
+  // Barra de escala (m/px de página).
+  const mPx = 156543.03392*Math.cos(S.centro.lat*D2R)/Math.pow(2,S.zoom);   // m por px css
+  const mPorPagPx = mPx / k;
+  let obj = 150*mPorPagPx; const e10=Math.pow(10,Math.floor(Math.log10(obj)));
+  const mult=[1,2,5,10].find(x=>e10*x>=obj)||10; const metros=e10*mult; const barPx=metros/mPorPagPx;
+  const bx=nx+70, by=sy+96;
+  g.strokeStyle='#111'; g.lineWidth=2.5; g.beginPath(); g.moveTo(bx,by-8); g.lineTo(bx,by); g.lineTo(bx+barPx,by); g.lineTo(bx+barPx,by-8); g.stroke();
+  g.fillStyle='#111'; g.textAlign='left'; g.font='600 15px ui-monospace, monospace';
+  g.fillText(metros>=1000?(metros/1000)+' km':metros+' m', bx, by-12);
+  // Leyenda
+  g.font='600 16px system-ui';
+  const lx0 = bx + barPx + 60;
+  const colW = (pageW - padR - lx0)/legCols;
+  for(let i=0;i<leg.length;i++){
+    const col=i%legCols, row=Math.floor(i/legCols);
+    const ex = lx0 + col*colW, ey = sy+70 + row*34;
+    g.fillStyle = leg[i].color || '#666'; g.strokeStyle='#111'; g.lineWidth=1;
+    g.fillRect(ex, ey-14, 20, 16); g.strokeRect(ex, ey-14, 20, 16);
+    g.fillStyle='#111'; g.textAlign='left'; g.textBaseline='alphabetic';
+    let nom = leg[i].nombre||''; if(nom.length>28) nom=nom.slice(0,27)+'…';
+    g.fillText(nom, ex+28, ey);
+  }
+  if(!leg.length){ g.fillStyle='#888'; g.fillText('(sin capas activas en la vista)', lx0, sy+72); }
+  // Fecha de generación
+  g.fillStyle='#555'; g.textAlign='right'; g.font='600 15px ui-monospace, monospace';
+  g.fillText('Generado: '+new Date().toLocaleString('es-CR'), pageW-padR, pageH-14);
+
+  return { canvas:cvE, geo:{ padL, padT, mW, mH, latN, latS, lonW, lonE } };
+}
+
+// PDF de una sola página con la imagen (JPEG) y un viewport georreferenciado
+// OGC (WGS84) legible por QGIS/GDAL y Avenza.
+async function construirPDF(canvas, geo){
+  const dataURL = canvas.toDataURL('image/jpeg', 0.92);
+  const bin = atob(dataURL.split(',')[1]);
+  const jpg = new Uint8Array(bin.length); for(let i=0;i<bin.length;i++) jpg[i]=bin.charCodeAt(i);
+  const iw=canvas.width, ih=canvas.height;
+  const PT=72/150;                         // 150 dpi
+  const PW=+(iw*PT).toFixed(2), PH=+(ih*PT).toFixed(2);
+  const bx0=(geo.padL*PT).toFixed(2), bx1=((geo.padL+geo.mW)*PT).toFixed(2);
+  const by1=(PH-geo.padT*PT).toFixed(2), by0=(PH-(geo.padT+geo.mH)*PT).toFixed(2);
+  const gpts=[geo.latS,geo.lonW, geo.latN,geo.lonW, geo.latN,geo.lonE, geo.latS,geo.lonE].map(v=>v.toFixed(8)).join(' ');
+  const wkt='GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563]],PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433],AUTHORITY["EPSG","4326"]]';
+  const vp=`/VP [ << /Type /Viewport /BBox [${bx0} ${by0} ${bx1} ${by1}] /Name (Mapa) /Measure << /Type /Measure /Subtype /GEO /Bounds [0 0 0 1 1 1 1 0] /GPTS [${gpts}] /LPTS [0 0 0 1 1 1 1 0] /GCS << /Type /GEOGCS /WKT (${wkt}) >> >> >> ]`;
+  const content=`q ${PW} 0 0 ${PH} 0 0 cm /Im0 Do Q`;
+  const enc=new TextEncoder(); const parts=[]; let len=0; const off=[];
+  const push=s=>{ const b=(typeof s==='string')?enc.encode(s):s; parts.push(b); len+=b.length; };
+  const obj=s=>{ off.push(len); push(s); };
+  push('%PDF-1.7\n');
+  obj('1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n');
+  obj('2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n');
+  obj(`3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${PW} ${PH}] /Resources << /XObject << /Im0 5 0 R >> >> /Contents 4 0 R ${vp} >>\nendobj\n`);
+  obj(`4 0 obj\n<< /Length ${content.length} >>\nstream\n${content}\nendstream\nendobj\n`);
+  off.push(len);
+  push(`5 0 obj\n<< /Type /XObject /Subtype /Image /Width ${iw} /Height ${ih} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ${jpg.length} >>\nstream\n`);
+  push(jpg); push('\nendstream\nendobj\n');
+  const xrefStart=len;
+  let xref='xref\n0 6\n0000000000 65535 f \n';
+  for(let i=0;i<5;i++) xref += String(off[i]).padStart(10,'0')+' 00000 n \n';
+  push(xref);
+  push(`trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n${xrefStart}\n%%EOF`);
+  return new Blob(parts, {type:'application/pdf'});
+}
+
+// Capas/puntos/tracks visibles dentro de la vista actual (para la leyenda).
+function itemsLeyendaEnVista(){
+  const b = boundsVista();   // {w,e,n,s}
+  const inter = bb => !(bb[2]<b.w || bb[0]>b.e || bb[3]<b.s || bb[1]>b.n);
+  const items = [];
+  for(const c of S.capas){
+    if(!c.visible) continue;
+    if(c.tipo==='wms'){ items.push({ color:'#8899AA', nombre:c.nombre, tipo:'wms' }); continue; }
+    const feats = c.geojson&&c.geojson.features || [];
+    let dentro=false;
+    for(const f of feats){ if(!f||!f.geometry) continue; if(!f._bbox) f._bbox=bboxGeom(f.geometry); if(inter(f._bbox)){ dentro=true; break; } }
+    if(dentro) items.push({ color:c.color||'#E0A458', nombre:c.nombre, tipo:'vector' });
+  }
+  const ptsVis = S.puntos.some(p=> p.visible!==false && p.lon>=b.w && p.lon<=b.e && p.lat>=b.s && p.lat<=b.n);
+  if(ptsVis) items.push({ color:'#DCE6E4', nombre:'Puntos del proyecto', tipo:'puntos' });
+  const trkVis = S.tracks.some(t=> t.visible!==false && (t.pts||[]).some(p=> p.lon>=b.w && p.lon<=b.e && p.lat>=b.s && p.lat<=b.n));
+  if(trkVis) items.push({ color:'#E0A458', nombre:'Tracks del proyecto', tipo:'tracks' });
+  return items;
+}
+function panelExportMapa(){
+  const items = itemsLeyendaEnVista();
+  abrirPanel('Exportar mapa', `
+    <div class="nota" style="border-color:var(--fix)">Exporta <b>exactamente la vista actual</b> del mapa, con cuadrícula CRTM05 en el borde, norte, escala, leyenda y fecha. Encuadrá la zona antes de generar.</div>
+    <label>Título</label>
+    <input id="emTit" value="${escHtml(S.proy?S.proy.nom:'Mapa')}">
+    <label>Formato</label>
+    <select id="emFmt">
+      <option value="pdf">PDF georreferenciado (QGIS / Avenza)</option>
+      <option value="png">PNG (imagen)</option>
+    </select>
+    <label>Leyenda (capas visibles en la vista) — editá los nombres</label>
+    <div id="emLeg">
+      ${items.length ? items.map((it,i)=>`<div class="fila">
+        <span style="flex:none;width:20px;height:20px;border-radius:4px;border:1px solid #000;background:${it.color}"></span>
+        <input data-leg="${i}" value="${escHtml(it.nombre)}" style="margin-top:0">
+      </div>`).join('') : '<div class="vacio">No hay capas activas dentro de la vista.</div>'}
+    </div>
+    <button class="ancho" id="emOk">Generar y compartir</button>
+    <div class="nota">El PDF lleva un viewport geográfico (WGS84) para abrirse ubicado en QGIS/Avenza; la <b>cuadrícula visible es CRTM05</b>, que es la referencia legal en Costa Rica. La georreferencia es exacta a escala de campo; en áreas muy grandes puede haber una leve diferencia por la proyección del mapa base.</div>
+  `);
+  document.getElementById('emOk').onclick = async ()=>{
+    const titulo = document.getElementById('emTit').value.trim();
+    const fmt = document.getElementById('emFmt').value;
+    // Aplicar nombres editados a la leyenda.
+    document.querySelectorAll('[data-leg]').forEach(inp=>{ items[+inp.dataset.leg].nombre = inp.value; });
+    mostrarCargando('Generando mapa…');
+    try{
+      const res = renderarMapaExport({ titulo, leyenda: items });
+      if(!res){ ocultarCargando(); return; }
+      const base = (titulo||'mapa').replace(/\s+/g,'_');
+      if(fmt==='png'){
+        const blob = await new Promise(r=> res.canvas.toBlob(r, 'image/png'));
+        await bajarBlob(base+'.png', blob);
+      } else {
+        const blob = await construirPDF(res.canvas, res.geo);
+        await bajarBlob(base+'.pdf', blob);
+      }
+    }catch(e){ toast('No se pudo generar: '+(e.message||e)); }
+    finally{ ocultarCargando(); dibujar(); }
+  };
 }
 
 /* --- info --- */
@@ -2883,6 +3135,37 @@ function panelEtiqueta(id){
   `);
   document.querySelectorAll('[data-set]').forEach(b=> b.onclick = ()=> setEtiqueta(id, b.dataset.set));
 }
+// Estilo de una capa: color, símbolo de punto, grosor y transparencia de relleno.
+function panelEstilo(id){
+  const c = S.capas.find(x=>x.id===id); if(!c) return;
+  const sims = [['circulo','●'],['cuadro','■'],['triangulo','▲'],['rombo','◆'],['cruz','＋'],['aspa','✕']];
+  const swatches = ['#E0A458','#4FD1C5','#C75146','#6FCF6F','#B07CC6','#E06AA0','#F2C94C','#2D9CDB','#EB5757','#27AE60','#DCE6E4','#8899AA'];
+  const op = c.opacidad!=null ? c.opacidad : 0.2;
+  const colActual = /^#[0-9a-fA-F]{6}$/.test(c.color||'') ? c.color : '#E0A458';
+  abrirPanel('Estilo · '+c.nombre, `
+    <label>Color</label>
+    <div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:6px">
+      ${swatches.map(h=>`<button data-col="${h}" style="width:32px;height:32px;border-radius:8px;border:3px solid ${(c.color||'').toLowerCase()===h.toLowerCase()?'#fff':'transparent'};background:${h};padding:0"></button>`).join('')}
+    </div>
+    <label>Color personalizado</label>
+    <input type="color" id="stCol" value="${colActual}" style="height:46px;padding:4px">
+    <label>Símbolo de punto</label>
+    <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:6px">
+      ${sims.map(([k,g])=>`<button class="mini ${((c.punto||'circulo')===k)?'verde':''}" data-sim="${k}" style="font-size:17px;min-width:44px">${g}</button>`).join('')}
+    </div>
+    <label>Grosor de línea/borde: <span id="stGrV">${c.grosor||2}</span> px</label>
+    <input type="range" id="stGr" min="1" max="6" step="1" value="${c.grosor||2}">
+    <label>Relleno de polígonos (opacidad): <span id="stOpV">${Math.round(op*100)}</span>%</label>
+    <input type="range" id="stOp" min="0" max="100" step="5" value="${Math.round(op*100)}">
+    <div class="nota">0% = relleno transparente (solo el contorno); 100% = relleno sólido. El color aplica a puntos, líneas y bordes.</div>
+  `);
+  const guardar = async (reabrir)=>{ await dbPut('capas', c); dibujar(); if(reabrir) panelEstilo(id); };
+  document.querySelectorAll('[data-col]').forEach(b=> b.onclick = ()=>{ c.color=b.dataset.col; guardar(true); });
+  document.getElementById('stCol').onchange = e=>{ c.color=e.target.value; guardar(true); };
+  document.querySelectorAll('[data-sim]').forEach(b=> b.onclick = ()=>{ c.punto=b.dataset.sim; guardar(true); });
+  const gr=document.getElementById('stGr'); gr.oninput=()=> document.getElementById('stGrV').textContent=gr.value; gr.onchange=()=>{ c.grosor=+gr.value; guardar(false); };
+  const op2=document.getElementById('stOp'); op2.oninput=()=> document.getElementById('stOpV').textContent=op2.value; op2.onchange=()=>{ c.opacidad=(+op2.value)/100; guardar(false); };
+}
 async function toggleCapa(id){ const c=S.capas.find(x=>x.id===id); if(!c) return; c.visible=!c.visible; await dbPut('capas',c); dibujar(); panelCapas(); }
 async function borrarCapa(id){
   // Borra también sus tiles WMS cacheados.
@@ -2905,9 +3188,10 @@ function panelCapas(){
           <button class="mini ${c.etiqueta?'verde':''}" data-et="${c.id}">🏷</button>
         </div>
         <div style="display:flex;flex-direction:column;gap:4px">
+          <button class="mini" data-se="${c.id}" title="Estilo">🎨</button>
           <button class="mini" data-pj="${c.id}" title="Proyección">🌐</button>
-          <button class="mini" data-cir="${c.id}" title="Ir a la capa">◎</button>
-        </div>`:''}
+        </div>
+        <button class="mini" data-cir="${c.id}" title="Ir a la capa" style="align-self:center">◎</button>`:''}
         <button class="mini rojo" data-bc="${c.id}">×</button>
       </div>`).join('') : '<div class="vacio">Sin capas todavía. Agregá una abajo.<br>Tocá un elemento en el mapa para ver sus atributos.</div>'}
     <label>Agregar capa</label>
@@ -2924,6 +3208,7 @@ function panelCapas(){
   document.querySelectorAll('[data-tq]').forEach(b=> b.onclick = ()=> toggleConsultable(b.dataset.tq));
   document.querySelectorAll('[data-tb]').forEach(b=> b.onclick = ()=> tablaAtributos(b.dataset.tb));
   document.querySelectorAll('[data-et]').forEach(b=> b.onclick = ()=> panelEtiqueta(b.dataset.et));
+  document.querySelectorAll('[data-se]').forEach(b=> b.onclick = ()=> panelEstilo(b.dataset.se));
   document.querySelectorAll('[data-pj]').forEach(b=> b.onclick = ()=> panelProyeccion(b.dataset.pj));
   document.querySelectorAll('[data-cir]').forEach(b=> b.onclick = ()=>{ const c=S.capas.find(x=>x.id===b.dataset.cir); if(c){ centrarEnCapa(c); cerrarPanel(); dibujar(); } });
   document.querySelectorAll('[data-bc]').forEach(b=> b.onclick = ()=> borrarCapa(b.dataset.bc));
