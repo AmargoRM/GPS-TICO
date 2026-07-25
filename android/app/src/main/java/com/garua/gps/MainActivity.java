@@ -28,7 +28,10 @@ public class MainActivity extends BridgeActivity {
         manejarArchivo(intent, false);       // caliente: entregar al plugin
     }
 
-    // Abrió un archivo con GPS TICO (GeoJSON / GPX): leerlo y pasarlo a JS.
+    // Abrió un archivo con GPS TICO (GeoJSON / GPX / KML): pasarlo a JS.
+    // Los GeoJSON se copian a caché en streaming y se pasa la RUTA, para que
+    // JS los transmita con el motor compacto sin cargar 80 MB+ en memoria
+    // (leerlos completos a un String desbordaba el proceso y cerraba la app).
     private void manejarArchivo(Intent intent, boolean frio) {
         if (intent == null) return;
         if (!Intent.ACTION_VIEW.equals(intent.getAction())) return;
@@ -37,17 +40,40 @@ public class MainActivity extends BridgeActivity {
         try {
             String nombre = nombreDe(uri);
             String lower = nombre != null ? nombre.toLowerCase() : "";
-            String kind = lower.endsWith(".gpx") ? "gpx" : lower.endsWith(".kml") ? "kml" : "geojson";
+            String nom = nombre != null ? nombre : "archivo";
+            boolean esGeojson = lower.endsWith(".geojson") || lower.endsWith(".json");
+            if (esGeojson) {
+                java.io.File out = new java.io.File(getCacheDir(), "import_" + System.currentTimeMillis() + ".geojson");
+                java.io.InputStream in = getContentResolver().openInputStream(uri);
+                if (in == null) return;
+                java.io.FileOutputStream fos = new java.io.FileOutputStream(out);
+                byte[] buf = new byte[65536]; int n;
+                while ((n = in.read(buf)) > 0) fos.write(buf, 0, n);
+                fos.flush(); fos.close(); in.close();
+                if (frio) FileOpenBridge.setPending(nom, "geojsonpath", out.getAbsolutePath());
+                else FileOpenBridge.deliver(nom, "geojsonpath", out.getAbsolutePath());
+                return;
+            }
+            // GPX / KML / otros: leer texto con tope de tamaño para no desbordar.
+            final int LIMITE = 45 * 1024 * 1024;
             java.io.InputStream in = getContentResolver().openInputStream(uri);
             if (in == null) return;
             java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
-            byte[] buf = new byte[8192]; int n;
-            while ((n = in.read(buf)) > 0) bos.write(buf, 0, n);
+            byte[] buf = new byte[8192]; int n; boolean grande = false;
+            while ((n = in.read(buf)) > 0) {
+                bos.write(buf, 0, n);
+                if (bos.size() > LIMITE) { grande = true; break; }
+            }
             in.close();
+            if (grande) {
+                if (frio) FileOpenBridge.setPending(nom, "toobig", nom);
+                else FileOpenBridge.deliver(nom, "toobig", nom);
+                return;
+            }
             String texto = new String(bos.toByteArray(), "UTF-8");
+            String kind = lower.endsWith(".gpx") ? "gpx" : lower.endsWith(".kml") ? "kml" : "geojson";
             if (kind.equals("geojson") && texto.contains("<gpx")) kind = "gpx";
             if (kind.equals("geojson") && (texto.contains("<kml") || texto.contains("<Placemark"))) kind = "kml";
-            String nom = nombre != null ? nombre : "archivo";
             if (frio) FileOpenBridge.setPending(nom, kind, texto);
             else FileOpenBridge.deliver(nom, kind, texto);
         } catch (Exception ignored) {}

@@ -1045,7 +1045,12 @@ async function consumirArchivoAbierto(){
   try{ const f = await P.consumePendingFile(); if(f && f.text) abrirArchivoImportado(f); }catch(e){}
 }
 async function abrirArchivoImportado(f){
-  if(!f || !f.text) return;
+  if(!f) return;
+  // GeoJSON grande abierto desde el sistema: nativo copió a caché y pasó la
+  // RUTA; se transmite por el motor compacto (sin cargar todo en memoria).
+  if(f.kind==='geojsonpath'){ await importarGeoJSONDesdePath((f.name||'capa').replace(/\.(geojson|json)$/i,''), f.text); return; }
+  if(f.kind==='toobig'){ toast('Ese archivo es muy grande para abrirlo así. Agregalo desde Capas → Archivo del teléfono.'); return; }
+  if(!f.text) return;
   if(!chequearTamano(f.text.length)) return;   // evita OOM con archivos enormes
   const nombre = (f.name||'archivo').replace(/\.(geojson|json|gpx|kml)$/i,'');
   const t = f.text;
@@ -2759,8 +2764,9 @@ function _scanObjeto(buf, start){
   return -1;
 }
 // Genera los features de un FeatureCollection sin cargar todo en memoria.
-async function* streamFeatures(file){
-  const reader = file.stream().pipeThrough(new TextDecoderStream()).getReader();
+// Acepta cualquier ReadableStream<Uint8Array> (File.stream() o fetch().body).
+async function* streamFeatures(byteStream){
+  const reader = byteStream.pipeThrough(new TextDecoderStream()).getReader();
   let buf='', done=false;
   const fill = async ()=>{ if(done) return false; const r=await reader.read(); if(r.done){ done=true; return false; } buf += r.value; return true; };
   while(true){                       // ubicar el arreglo "features" [
@@ -2863,15 +2869,24 @@ function _finalizarBig(B, id, nombre, proyFuente, nFeats){
            color: colorCapa(S.capas.length), proyFuente, nFeats,
            ox:B.ox, oy:B.oy, coords, partStart, featPartStart:fps, featType, featBBox, bb, grid };
 }
-// Importa un GeoJSON grande con el motor compacto.
-async function importarGeoJSONGrande(nombre, file){
+// Abre por streaming un GeoJSON grande que el nativo copió a caché (ruta).
+async function importarGeoJSONDesdePath(nombre, path){
+  try{
+    const url = (window.Capacitor && window.Capacitor.convertFileSrc) ? window.Capacitor.convertFileSrc(path) : path;
+    const resp = await fetch(url);
+    if(!resp || !resp.body) throw new Error('no se pudo transmitir el archivo');
+    await importarGeoJSONGrande(nombre, resp.body);
+  }catch(e){ toast('No se pudo abrir la capa grande: '+(e && e.message?e.message:e)+'. Probá desde Capas → Archivo.'); ocultarCargando(); }
+}
+// Importa un GeoJSON grande con el motor compacto desde un stream de bytes.
+async function importarGeoJSONGrande(nombre, byteStream){
   mostrarCargando('Leyendo capa grande…');
   try{
     const id = nid();
     let B=null, proyFuente='geo', dentroCR=false, detHecha=false, nFeats=0;
     let props=[], chunkIdx=0;
     const flush = async ()=>{ if(props.length){ await dbPut('bigprops', props, id+':'+chunkIdx); chunkIdx++; props=[]; } };
-    for await (const feat of streamFeatures(file)){
+    for await (const feat of streamFeatures(byteStream)){
       const g = feat && feat.geometry; if(!g) continue;
       const first = _primeraCoordGeom(g); if(!first) continue;
       if(!detHecha){
@@ -3014,7 +3029,7 @@ async function agregarCapaArchivo(file){
   // GeoJSON grande → motor compacto en streaming (soporta 80 MB y más).
   if(ext==='geojson' || ext==='json'){
     if(file.size!=null && file.size > BIG_MAX){ toast('Archivo enorme (> ~400 MB). Dividilo por zona.'); return; }
-    if(file.size!=null && file.size > BIG_UMBRAL){ await importarGeoJSONGrande(nombre, file); return; }
+    if(file.size!=null && file.size > BIG_UMBRAL){ await importarGeoJSONGrande(nombre, file.stream()); return; }
     mostrarCargando('Leyendo archivo…');
     try{ await guardarCapaVector(nombre, JSON.parse(await file.text())); }
     catch(e){ toast('No se pudo importar: '+(e.message||e)); }
