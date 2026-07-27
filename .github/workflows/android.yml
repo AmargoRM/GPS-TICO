@@ -9,6 +9,9 @@ on:
       - claude/gps-tico-capacitor-apk-djrkna
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -67,3 +70,22 @@ jobs:
           name: gps-tico-build-${{ github.run_number }}
           path: android/app/build/outputs/apk/release/app-release.apk
           if-no-files-found: error
+
+      - name: Preparar el APK con nombre estable
+        run: cp android/app/build/outputs/apk/release/app-release.apk gps-tico.apk
+
+      - name: Limpiar Releases viejos con otra firma (evita instalar por error)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete apk-debug --yes --cleanup-tag || true
+
+      - name: Publicar el APK firmado como Release descargable
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete apk-release --yes --cleanup-tag || true
+          gh release create apk-release gps-tico.apk \
+            --title "GPS TICO - APK (release firmado)" \
+            --target "$GITHUB_SHA" \
+            --notes "APK de release firmado con la llave de produccion, compilado desde la rama de la app completa. Se instala/actualiza encima de una version anterior firmada con la misma llave. Descarga gps-tico.apk y abrilo en el telefono."
