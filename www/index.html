@@ -349,6 +349,31 @@ function gms(v, esLat){
   const g = Math.floor(v), m = Math.floor((v-g)*60), s = ((v-g)*60-m)*60;
   return `${g}° ${String(m).padStart(2,'0')}' ${s.toFixed(2).padStart(5,'0')}" ${h}`;
 }
+// Interpreta una componente geográfica escrita a mano: acepta grados
+// decimales ("9.4318", "-84.162") o grados-minutos-segundos con hemisferio
+// ("9° 25' 54.5\" N", "84 09 43 W", "84°09'43\"O"). Devuelve NaN si no entiende.
+function parseGeoComp(txt){
+  if(txt==null) return NaN;
+  let s = String(txt).trim();
+  if(!s) return NaN;
+  let signo = 0; // 0 = sin hemisferio explícito
+  const H = s.match(/([NSEWOnsewo])\s*$/) || s.match(/^\s*([NSEWOnsewo])/);
+  if(H){
+    const h = H[1].toUpperCase();
+    signo = (h==='S' || h==='W' || h==='O') ? -1 : 1;
+    s = s.replace(H[0], ' ');
+  }
+  const nums = s.match(/-?\d+(?:[.,]\d+)?/g);
+  if(!nums) return NaN;
+  const g = parseFloat(nums[0].replace(',', '.'));
+  if(isNaN(g)) return NaN;
+  const m = nums[1] != null ? Math.abs(parseFloat(nums[1].replace(',', '.'))) : 0;
+  const sec = nums[2] != null ? Math.abs(parseFloat(nums[2].replace(',', '.'))) : 0;
+  let val = Math.abs(g) + m/60 + sec/3600;
+  if(signo !== 0) val *= signo;        // el hemisferio manda si está presente
+  else if(g < 0) val = -val;           // si no, respeta el signo del número
+  return val;
+}
 function fmtCoord(lat, lon, modo){
   if(modo==='geo'){
     return { a:gms(lat,true), b:gms(lon,false), c:`${lat.toFixed(6)}, ${lon.toFixed(6)}` };
@@ -1495,6 +1520,7 @@ document.getElementById('btnMenu').onclick = ()=>{
     <div class="fila"><div class="cuerpo"><div class="t">Capas del proyecto</div><div class="s">${S.capas.length} capa(s) · GeoJSON · KML · SHP · WFS · WMS</div></div><button class="mini" id="mCapas">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Puntos y tracks</div><div class="s">${S.puntos.length} puntos · ${S.tracks.length} tracks</div></div><button class="mini" id="mDatos">Ver</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Convertir coordenadas</div><div class="s">Geo ↔ CRTM05 ↔ Lambert N/S</div></div><button class="mini" id="mConv">Abrir</button></div>
+    <div class="fila"><div class="cuerpo"><div class="t">Ir a un punto</div><div class="s">Escribí coordenadas y marcá la chincheta</div></div><button class="mini" id="mIr">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Mapa sin conexión</div><div class="s">Zonas y parches descargables</div></div><button class="mini" id="mOff">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Exportar proyecto</div><div class="s">GPX · CSV · GeoJSON</div></div><button class="mini" id="mExp">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Precisión y advertencias</div><div class="s">Leer antes de usar en expedientes</div></div><button class="mini" id="mInfo">Abrir</button></div>
@@ -1505,6 +1531,7 @@ document.getElementById('btnMenu').onclick = ()=>{
   document.getElementById('mCapas').onclick = panelCapas;
   document.getElementById('mDatos').onclick = panelDatos;
   document.getElementById('mConv').onclick  = panelConv;
+  document.getElementById('mIr').onclick    = panelIrPunto;
   document.getElementById('mOff').onclick   = panelOffline;
   document.getElementById('mExp').onclick   = panelExport;
   document.getElementById('mInfo').onclick  = panelInfo;
@@ -1694,6 +1721,82 @@ function panelConv(){
     document.getElementById('cvA').value = S.fix.coords.latitude.toFixed(7);
     document.getElementById('cvB').value = S.fix.coords.longitude.toFixed(7);
     correr();
+  };
+}
+
+/* --- ir a un punto manual (chincheta por coordenadas escritas) --- */
+function irAChincheta(lat, lon){
+  chincheta = { lat, lon };
+  S.centro.lat = lat; S.centro.lon = lon;
+  S.zoom = Math.max(S.zoom, 17); S.seguir = false;
+  if(navigator.vibrate){ try{ navigator.vibrate(35); }catch(e){} }
+  pedirDibujo(); panelChincheta();
+}
+function panelIrPunto(){
+  abrirPanel('Ir a un punto (manual)', `
+    <label>Sistema de coordenadas</label>
+    <select id="ipIn">
+      <option value="geo">Geográficas · WGS84 (decimal o GMS)</option>
+      <option value="crtm05">CRTM05 · EPSG:5367</option>
+      <option value="ln">Lambert Norte · EPSG:5456</option>
+      <option value="ls">Lambert Sur · EPSG:5457</option>
+    </select>
+    <div class="grid2">
+      <div><label id="ipLA">Latitud</label><input id="ipA" placeholder="9.431800"></div>
+      <div><label id="ipLB">Longitud</label><input id="ipB" placeholder="-84.162000"></div>
+    </div>
+    <button class="ancho" id="ipOk">Ir y marcar chincheta</button>
+    <button class="ancho borde" id="ipPeg">Pegar del portapapeles</button>
+    <div id="ipRes"></div>
+    <div class="nota">Escribí las coordenadas en cualquiera de los formatos de la app. En geográficas se aceptan grados decimales (<b>9.4318, -84.162</b>) o grados-minutos-segundos con hemisferio (<b>9° 25' 54.5" N</b> · <b>84° 09' 43" O</b>). La chincheta queda lista para navegar hasta ahí o guardarla como punto.</div>
+  `);
+  const sel = document.getElementById('ipIn');
+  const setLbls = ()=>{
+    const g = sel.value==='geo';
+    document.getElementById('ipLA').textContent = g ? 'Latitud' : 'Este (E)';
+    document.getElementById('ipLB').textContent = g ? 'Longitud' : 'Norte (N)';
+    document.getElementById('ipA').placeholder = g ? '9.431800  ó  9°25\'54.5"N' : '486123.45';
+    document.getElementById('ipB').placeholder = g ? '-84.162000  ó  84°09\'43"O' : '1042876.10';
+  };
+  sel.onchange = setLbls; setLbls();
+
+  // Interpreta lo escrito y devuelve {lat,lon} en WGS84, o null si no cuadra.
+  const leer = ()=>{
+    const m = sel.value;
+    let w;
+    if(m==='geo'){
+      const lat = parseGeoComp(document.getElementById('ipA').value);
+      const lon = parseGeoComp(document.getElementById('ipB').value);
+      if(isNaN(lat)||isNaN(lon)){ toast('No entendí las coordenadas. Revisá el formato.'); return null; }
+      w = { lat, lon };
+    }else{
+      const a = parseFloat(String(document.getElementById('ipA').value).replace(',', '.'));
+      const b = parseFloat(String(document.getElementById('ipB').value).replace(',', '.'));
+      if(isNaN(a)||isNaN(b)){ toast('Faltan números válidos.'); return null; }
+      w = haciaWgs(a, b, m);
+    }
+    if(Math.abs(w.lat)>90 || w.lon<-180 || w.lon>180){ toast('Esas coordenadas no caen en la Tierra. Revisá el orden E/N.'); return null; }
+    return w;
+  };
+  document.getElementById('ipOk').onclick = ()=>{
+    const w = leer(); if(!w) return;
+    const fuera = w.lat<5 || w.lat>12 || w.lon<-88 || w.lon>-81;
+    if(fuera) toast('Ojo: ese punto queda fuera de Costa Rica.');
+    irAChincheta(w.lat, w.lon);
+  };
+  // Pega texto tipo "9.4318, -84.162" (o con GMS) en los dos campos.
+  document.getElementById('ipPeg').onclick = async ()=>{
+    let txt = '';
+    try{ txt = await navigator.clipboard.readText(); }
+    catch(e){ toast('No se pudo leer el portapapeles.'); return; }
+    const partes = String(txt).split(/[;\n]|,(?=\s*-?\d)/).map(s=>s.trim()).filter(Boolean);
+    if(partes.length>=2){
+      document.getElementById('ipA').value = partes[0];
+      document.getElementById('ipB').value = partes[1];
+      toast('Pegado. Revisá y tocá "Ir y marcar chincheta".');
+    }else{
+      toast('No encontré dos coordenadas en el portapapeles.');
+    }
   };
 }
 
