@@ -71,7 +71,7 @@ public class MainActivity extends BridgeActivity {
                 return;
             }
             String texto = new String(bos.toByteArray(), "UTF-8");
-            String kind = lower.endsWith(".gpx") ? "gpx" : lower.endsWith(".kml") ? "kml" : "geojson";
+            String kind = lower.endsWith(".gpx") ? "gpx" : lower.endsWith(".kml") ? "kml" : lower.endsWith(".dxf") ? "dxf" : "geojson";
             if (kind.equals("geojson") && texto.contains("<gpx")) kind = "gpx";
             if (kind.equals("geojson") && (texto.contains("<kml") || texto.contains("<Placemark"))) kind = "kml";
             if (frio) FileOpenBridge.setPending(nom, kind, texto);

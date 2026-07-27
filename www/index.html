@@ -1052,13 +1052,15 @@ async function abrirArchivoImportado(f){
   if(f.kind==='toobig'){ toast('Ese archivo es muy grande para abrirlo así. Agregalo desde Capas → Archivo del teléfono.'); return; }
   if(!f.text) return;
   if(!chequearTamano(f.text.length)) return;   // evita OOM con archivos enormes
-  const nombre = (f.name||'archivo').replace(/\.(geojson|json|gpx|kml)$/i,'');
+  const nombre = (f.name||'archivo').replace(/\.(geojson|json|gpx|kml|dxf)$/i,'');
   const t = f.text;
   const esGpx = f.kind==='gpx' || /<gpx[\s>]/i.test(t);
   const esKml = f.kind==='kml' || /<kml[\s>]|<Placemark[\s>]/i.test(t);
+  const esDxf = f.kind==='dxf' || /\bENTITIES\b|AutoCAD|LWPOLYLINE/.test(t.slice(0,4000));
   try{
     if(esGpx){ await importarGPX(nombre, t); }
     else if(esKml){ const capa = await guardarCapaVector(nombre, kmlAGeoJSON(t), true); if(capa) toast('KML cargado como capa: '+capa.nombre); }
+    else if(esDxf){ const capa = await guardarCapaVector(nombre, dxfAGeoJSON(t), true); if(capa) toast('DXF cargado como capa: '+capa.nombre); }
     else{ const gj = JSON.parse(t); const capa = await guardarCapaVector(nombre, gj, true); if(capa) toast('GeoJSON cargado como capa: '+capa.nombre); }
   }catch(e){ toast('No se pudo abrir el archivo (¿formato válido?).'); }
 }
@@ -1910,7 +1912,10 @@ function panelExport(){
     <button class="ancho" id="exCsv">Descargar CSV</button>
     <button class="ancho borde" id="exGpx">Descargar GPX (puntos + tracks)</button>
     <button class="ancho borde" id="exGeo">Descargar GeoJSON (para QGIS)</button>
-    <div class="nota">El GeoJSON sale en WGS84, que es lo que QGIS espera por defecto. Reproyectá dentro de QGIS a CRTM05 si lo necesitás en metros: así usás la ruta de transformación oficial y no la mía.</div>
+    <label>Sistema para el DXF (CAD)</label>
+    <select id="exDxfSys"><option value="crtm05">CRTM05 (EPSG:5367)</option><option value="ln">Lambert Norte (EPSG:5456)</option><option value="ls">Lambert Sur (EPSG:5457)</option></select>
+    <button class="ancho borde" id="exDxf">Descargar DXF (CAD · AutoCAD/QGIS)</button>
+    <div class="nota">El GeoJSON sale en WGS84 (lo que QGIS espera). El <b>DXF</b> sale en metros del sistema elegido, listo para CAD; <b>DWG</b> no se genera (binario): abrí el DXF en AutoCAD/Civil y guardá como DWG si lo necesitás. Reproyectá en QGIS si querés la transformación oficial.</div>
   `);
   document.getElementById('exCsv').onclick = ()=>{
     const m = document.getElementById('exSys').value;
@@ -1971,6 +1976,10 @@ function panelExport(){
         filtro: t.filtroConfig ? `HDOP<=${t.filtroConfig.hdopMax} sat>=${t.filtroConfig.satMin} exac<=${t.filtroConfig.exacMax}m CN0>=${t.filtroConfig.cn0Min}` : null },
       geometry:{ type:'LineString', coordinates:t.pts.map(q=>[q.lon,q.lat,q.alt||0]) } });
     bajar(S.proy.nom+'.geojson', JSON.stringify(fc,null,1), 'application/geo+json');
+  };
+  document.getElementById('exDxf').onclick = ()=>{
+    if(!S.puntos.length && !S.tracks.length){ toast('No hay puntos ni tracks para exportar.'); return; }
+    exportarDXF(document.getElementById('exDxfSys').value);
   };
 }
 async function bajar(nom, txt, tipo){
@@ -2742,6 +2751,73 @@ async function importarShapefileZip(nombre, buf){
 }
 
 /* =======================================================================
+   CAD DXF  (importar y exportar; DWG no: es binario propietario)
+   ======================================================================= */
+// DXF (ASCII) -> GeoJSON. Entidades: LINE, LWPOLYLINE, POLYLINE/VERTEX,
+// POINT, CIRCLE, ARC, TEXT/MTEXT. Coordenadas en metros (se reproyectan
+// después con la autodetección tica de guardarCapaVector).
+function dxfAGeoJSON(text){
+  const raw = text.split(/\r\n|\r|\n/);
+  const P=[]; for(let i=0;i+1<raw.length;i+=2){ const c=parseInt((raw[i]||'').trim(),10); if(!isNaN(c)) P.push([c, raw[i+1]]); }
+  let i=0; for(; i<P.length; i++){ if(P[i][0]===2 && (P[i][1]||'').trim()==='ENTITIES'){ i++; break; } }
+  if(i>=P.length){ i=0; }   // algunos DXF mínimos no marcan sección; intentar igual
+  const feats=[];
+  const add=(geom,layer,extra)=>{ if(geom) feats.push({type:'Feature', geometry:geom, properties:Object.assign({capa_cad:(layer||'0')}, extra||{})}); };
+  const circ=(cx,cy,r)=>{ const a=[]; for(let k=0;k<=48;k++){ const t=k/48*2*Math.PI; a.push([cx+r*Math.cos(t), cy+r*Math.sin(t)]); } return a; };
+  const arco=(cx,cy,r,a0,a1)=>{ let s=a0*Math.PI/180, e=a1*Math.PI/180; if(e<=s) e+=2*Math.PI; const steps=Math.max(2,Math.ceil((e-s)/(Math.PI/24))); const a=[]; for(let k=0;k<=steps;k++){ const t=s+(e-s)*k/steps; a.push([cx+r*Math.cos(t), cy+r*Math.sin(t)]); } return a; };
+  while(i<P.length){
+    if(P[i][0]!==0){ i++; continue; }
+    const et=(P[i][1]||'').trim(); i++;
+    if(et==='ENDSEC'||et==='EOF') break;
+    const E={ layer:'0', verts:[] }; let flag=0;
+    while(i<P.length && P[i][0]!==0){
+      const c=P[i][0], v=P[i][1], nv=parseFloat((v||'').trim());
+      if(c===8) E.layer=(v||'').trim();
+      else if(c===10){ if(et==='LWPOLYLINE') E.verts.push([nv,0]); else E.x=nv; }
+      else if(c===20){ if(et==='LWPOLYLINE'){ const a=E.verts[E.verts.length-1]; if(a)a[1]=nv; } else E.y=nv; }
+      else if(c===11) E.x1=nv; else if(c===21) E.y1=nv;
+      else if(c===40) E.r=nv; else if(c===50) E.a0=nv; else if(c===51) E.a1=nv;
+      else if(c===70) flag=nv|0; else if(c===1) E.text=v;
+      i++;
+    }
+    if(et==='LINE'){ if(E.x!=null&&E.x1!=null) add({type:'LineString',coordinates:[[E.x,E.y],[E.x1,E.y1]]}, E.layer); }
+    else if(et==='POINT'){ if(E.x!=null) add({type:'Point',coordinates:[E.x,E.y]}, E.layer); }
+    else if(et==='TEXT'||et==='MTEXT'){ if(E.x!=null) add({type:'Point',coordinates:[E.x,E.y]}, E.layer, {texto:(E.text||'').trim()}); }
+    else if(et==='CIRCLE'){ if(E.x!=null&&E.r!=null) add({type:'Polygon',coordinates:[circ(E.x,E.y,E.r)]}, E.layer); }
+    else if(et==='ARC'){ if(E.x!=null&&E.r!=null) add({type:'LineString',coordinates:arco(E.x,E.y,E.r,E.a0||0,E.a1||0)}, E.layer); }
+    else if(et==='LWPOLYLINE'){ const vs=E.verts.filter(a=>isFinite(a[0])&&isFinite(a[1])); if(vs.length>=2){ if((flag&1)&&vs.length>=3){ const r=vs.slice(); r.push(r[0]); add({type:'Polygon',coordinates:[r]}, E.layer); } else add({type:'LineString',coordinates:vs}, E.layer); } }
+    else if(et==='POLYLINE'){
+      const closed=(flag&1)===1, layer=E.layer, vs=[];
+      while(i<P.length){
+        if(P[i][0]===0){ const t=(P[i][1]||'').trim();
+          if(t==='VERTEX'){ i++; let vx=null,vy=null; while(i<P.length && P[i][0]!==0){ const c=P[i][0]; const nv=parseFloat((P[i][1]||'').trim()); if(c===10)vx=nv; else if(c===20)vy=nv; i++; } if(vx!=null&&vy!=null) vs.push([vx,vy]); }
+          else if(t==='SEQEND'){ i++; while(i<P.length && P[i][0]!==0) i++; break; }
+          else break;
+        } else i++;
+      }
+      if(vs.length>=2){ if(closed&&vs.length>=3){ const r=vs.slice(); r.push(r[0]); add({type:'Polygon',coordinates:[r]}, layer); } else add({type:'LineString',coordinates:vs}, layer); }
+    }
+  }
+  if(!feats.length) throw new Error('El DXF no trae entidades reconocibles (LINE/POLYLINE/POINT/CIRCLE/ARC/TEXT).');
+  return { type:'FeatureCollection', features:feats };
+}
+// Exporta puntos y tracks del proyecto a DXF (ASCII R12) en metros proyectados.
+function exportarDXF(modo){
+  const pr = (lat,lon)=> desdeWgs(lat,lon,modo);   // {e,n}
+  let s = '0\nSECTION\n2\nENTITIES\n';
+  const P = (x,y,capa)=> `0\nPOINT\n8\n${capa}\n10\n${x.toFixed(3)}\n20\n${y.toFixed(3)}\n30\n0\n`;
+  const T = (x,y,capa,h,str)=> `0\nTEXT\n8\n${capa}\n10\n${x.toFixed(3)}\n20\n${y.toFixed(3)}\n30\n0\n40\n${h}\n1\n${String(str||'').replace(/[\r\n]/g,' ')}\n`;
+  for(const p of S.puntos){ const q=pr(p.lat,p.lon); s+=P(q.e,q.n,'PUNTOS'); s+=T(q.e+1,q.n+1,'PUNTOS',3,p.nom); }
+  for(const t of S.tracks){ if(!t.pts||t.pts.length<2) continue;
+    s += `0\nPOLYLINE\n8\nTRACKS\n66\n1\n70\n0\n`;
+    for(const w of t.pts){ const q=pr(w.lat,w.lon); s+=`0\nVERTEX\n8\nTRACKS\n10\n${q.e.toFixed(3)}\n20\n${q.n.toFixed(3)}\n30\n0\n`; }
+    s += `0\nSEQEND\n`;
+  }
+  s += '0\nENDSEC\n0\nEOF\n';
+  bajar(S.proy.nom+'_'+modo+'.dxf', s, 'application/dxf');
+}
+
+/* =======================================================================
    CAPAS GRANDES (GeoJSON de 80 MB o más)
    - Lectura en streaming: no se carga todo el archivo ni se crea un objeto
      JS gigante (evita el pico de memoria que crasheaba la app).
@@ -3051,8 +3127,12 @@ async function agregarCapaArchivo(file){
       await guardarCapaVector(nombre, shpAGeoJSON(await file.arrayBuffer(), null, null));
     } else if(ext==='zip'){
       await importarShapefileZip(nombre, await file.arrayBuffer());
+    } else if(ext==='dxf'){
+      await guardarCapaVector(nombre, dxfAGeoJSON(await file.text()));
+    } else if(ext==='dwg'){
+      toast('DWG es binario y no se puede leer sin conversión. Convertilo a DXF (ODA File Converter, AutoCAD o QGIS) y cargá el .dxf.');
     } else {
-      toast('Formato no reconocido. Usá GeoJSON, KML, KMZ, SHP o ZIP.');
+      toast('Formato no reconocido. Usá GeoJSON, KML, KMZ, SHP, ZIP o DXF.');
     }
   }catch(e){ toast('No se pudo importar: '+(e.message||e)); }
   finally{ ocultarCargando(); }
@@ -3101,6 +3181,18 @@ function fmtDist(m, unidad){
   if(unidad==='km' || (unidad==null && m>=1000)) return (m/1000).toFixed(m>=10000?1:2)+' km';
   return m.toFixed(m<100?1:0)+' m';
 }
+// Área de un polígono (m²) por shoelace en CRTM05 (metros), robusto para CR.
+function areaPoligonoM2(pts){
+  if(!pts || pts.length<3) return 0;
+  const p = pts.map(q=> tmFwd(q.lat, q.lon, CRTM05));
+  let a=0; for(let i=0,j=p.length-1;i<p.length;j=i++){ a += p[j].e*p[i].n - p[i].e*p[j].n; }
+  return Math.abs(a/2);
+}
+function fmtArea(m2){
+  const ha = m2/10000;
+  if(m2>=10000) return `${Math.round(m2).toLocaleString('es-CR')} m²  ·  ${ha.toFixed(4)} ha`;
+  return `${m2.toFixed(1)} m²`;
+}
 function setModoMapa(m){
   modoMapa = (modoMapa===m) ? 'consulta' : m;
   document.getElementById('btnMedir').dataset.on = modoMapa==='medir' ? '1' : '0';
@@ -3116,7 +3208,14 @@ function actualizarHerramienta(){
   if(modoMapa==='medir'){
     barra.classList.add('on');
     let d = 0; for(let i=1;i<medicion.pts.length;i++) d += distM(medicion.pts[i-1].lat, medicion.pts[i-1].lon, medicion.pts[i].lat, medicion.pts[i].lon);
-    txt.innerHTML = `<b>Medición</b> · ${medicion.pts.length} punto(s)<br>Distancia: <b>${fmtDist(d, medicion.unidad)}</b>`;
+    let extra = '';
+    if(medicion.pts.length>=3){
+      const a = medicion.pts[0], z = medicion.pts[medicion.pts.length-1];
+      const per = d + distM(z.lat, z.lon, a.lat, a.lon);   // cerrado
+      const area = areaPoligonoM2(medicion.pts);
+      extra = `<br>Perímetro: <b>${fmtDist(per, medicion.unidad)}</b><br>Área: <b>${fmtArea(area)}</b> <span style="color:var(--musgo)">(CRTM05)</span>`;
+    }
+    txt.innerHTML = `<b>Medición</b> · ${medicion.pts.length} punto(s)<br>Distancia: <b>${fmtDist(d, medicion.unidad)}</b>${extra}`;
     btns.innerHTML = `<button id="hUnidad">${medicion.unidad==='km'?'m':'km'}</button><button id="hDeshacer">Deshacer</button><button id="hLimpiar">Limpiar</button><button id="hSalir">Salir</button>`;
     document.getElementById('hUnidad').onclick = ()=>{ medicion.unidad = medicion.unidad==='km'?'m':'km'; actualizarHerramienta(); };
     document.getElementById('hDeshacer').onclick = ()=>{ medicion.pts.pop(); actualizarHerramienta(); pedirDibujo(); };
@@ -3162,6 +3261,15 @@ async function calcularRutaCalles(){
 function dibujarHerramientas(aPant){
   // Medición: polilínea + vértices.
   if(medicion.pts.length){
+    // Con 3+ puntos: relleno y cierre punteado (modo área).
+    if(medicion.pts.length>=3){
+      ctx.beginPath();
+      medicion.pts.forEach((p,i)=>{ const s=aPant(p.lat,p.lon); if(i===0)ctx.moveTo(s.x,s.y); else ctx.lineTo(s.x,s.y); });
+      ctx.closePath(); ctx.fillStyle='rgba(79,209,197,.14)'; ctx.fill();
+      const a=aPant(medicion.pts[0].lat,medicion.pts[0].lon), z=aPant(medicion.pts[medicion.pts.length-1].lat,medicion.pts[medicion.pts.length-1].lon);
+      ctx.setLineDash([6,5]); ctx.strokeStyle='rgba(79,209,197,.6)'; ctx.lineWidth=2;
+      ctx.beginPath(); ctx.moveTo(z.x,z.y); ctx.lineTo(a.x,a.y); ctx.stroke(); ctx.setLineDash([]);
+    }
     ctx.strokeStyle = '#4FD1C5'; ctx.lineWidth = 3; ctx.setLineDash([]);
     ctx.beginPath();
     medicion.pts.forEach((p,i)=>{ const s=aPant(p.lat,p.lon); if(i===0)ctx.moveTo(s.x,s.y); else ctx.lineTo(s.x,s.y); });
@@ -3548,7 +3656,7 @@ function panelCapas(){
       <option value="wms">WMS (servicio) — escanear capas</option>
       <option value="wfs">WFS (servicio) — escanear capas</option>
       <option value="geojson_url">GeoJSON (enlace directo)</option>
-      <option value="file">Archivo del teléfono (GeoJSON · KML · KMZ · SHP · ZIP)</option>
+      <option value="file">Archivo del teléfono (GeoJSON · KML · KMZ · SHP · ZIP · DXF)</option>
     </select>
     <div id="capForm"></div>
     <div class="nota">Pegá el enlace del <b>servicio</b> WMS/WFS (el mismo que usás en QGIS) y tocá <b>Escanear</b>: la app lista las capas disponibles para elegir. Las descargas van por HTTP nativo, así que sirve aunque el servidor no permita CORS. <b>Shapefile</b>: subí el <b>.zip</b> completo (con .shp, .dbf y .prj). <b>Proyección automática</b>: si la capa viene en CRTM05 o Lambert, la app lo detecta, la convierte a WGS84 y vuela a la zona sola; si se equivoca, corregila con 🌐. <b>GeoJSON grande</b> (80 MB o más): se carga con un motor compacto que sólo dibuja/consulta lo visible; usá esta opción de <b>archivo</b> (no "abrir con" del sistema). En capas grandes no hay etiqueta ni tabla completa; sí color, consulta al tocar y estilo.</div>
@@ -3565,7 +3673,7 @@ function panelCapas(){
   const render = ()=>{
     const cf = document.getElementById('capForm');
     if(sel.value==='file'){
-      cf.innerHTML = `<input type="file" id="capFile" accept=".geojson,.json,.kml,.kmz,.shp,.zip,application/geo+json,application/json,application/vnd.google-earth.kml+xml,application/vnd.google-earth.kmz,application/zip" style="margin-top:8px">
+      cf.innerHTML = `<input type="file" id="capFile" accept=".geojson,.json,.kml,.kmz,.shp,.zip,.dxf,application/geo+json,application/json,application/vnd.google-earth.kml+xml,application/vnd.google-earth.kmz,application/zip,application/dxf,image/vnd.dxf" style="margin-top:8px">
         <button class="ancho" id="capAdd">Agregar archivo</button>`;
       document.getElementById('capAdd').onclick = ()=>{ const f=document.getElementById('capFile').files[0]; if(!f){toast('Elegí un archivo.');return;} agregarCapaArchivo(f); };
     } else if(sel.value==='geojson_url'){

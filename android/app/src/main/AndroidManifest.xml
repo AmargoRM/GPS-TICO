@@ -50,6 +50,7 @@
                 <data android:pathPattern=".*\\.geojson" />
                 <data android:pathPattern=".*\\.gpx" />
                 <data android:pathPattern=".*\\.kml" />
+                <data android:pathPattern=".*\\.dxf" />
             </intent-filter>
 
         </activity>
