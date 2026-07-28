@@ -787,6 +787,7 @@ let toques = new Map(), ultDist = 0, arrastrando = false;
 let tapInicio = null;   // para distinguir un toque (consulta) de un arrastre
 let uso_movio_mapa = false;  // el usuario interactuó con el mapa antes del primer fix
 let lpTimer = null;     // temporizador de clic sostenido (chincheta)
+let pinColocado = false; // el clic sostenido ya puso una chincheta en este gesto
 function cancelarLongPress(){ if(lpTimer){ clearTimeout(lpTimer); lpTimer = null; } }
 cv.addEventListener('pointerdown', e=>{
   cv.setPointerCapture(e.pointerId);
@@ -797,9 +798,11 @@ cv.addEventListener('pointerdown', e=>{
   // Clic sostenido (600 ms) con un solo dedo = poner chincheta.
   cancelarLongPress();
   if(toques.size===1){
+    pinColocado = false;
     const dx0 = e.clientX, dy0 = e.clientY;
     lpTimer = setTimeout(()=>{
       lpTimer = null;
+      pinColocado = true;
       const r = cv.getBoundingClientRect();
       ponerChincheta(dx0 - r.left, dy0 - r.top);
     }, 600);
@@ -829,8 +832,11 @@ cv.addEventListener('pointermove', e=>{
   // 'arrastrando' porque el jitter táctil lo activaba y bloqueaba el toque.
   if(ev==='pointerup' && tapInicio && toques.size===1){
     const mov = Math.hypot(e.clientX-tapInicio.x, e.clientY-tapInicio.y);
-    const dt = Date.now() - tapInicio.t;
-    if(mov < 16 && dt < 500){
+    // Un toque = poco movimiento y que NO se haya disparado ya la chincheta
+    // (clic sostenido). Antes exigíamos < 500 ms, y un toque de 0,5-0,6 s
+    // caía en un hueco: ni consultaba ni ponía chincheta. Ahora el límite
+    // real es la chincheta a los 600 ms; por debajo de eso, es consulta.
+    if(mov < 18 && !pinColocado){
       const r = cv.getBoundingClientRect();
       const px = e.clientX - r.left, py = e.clientY - r.top;
       const ll = pantallaALatLon(px, py);
@@ -2791,6 +2797,10 @@ function consultarEnPantalla(px,py){
     if(!c.visible || c.tipo!=='wms' || c.consultable===false) continue;
     consultarWMS(c, px, py); return;
   }
+  // 5) No cayó sobre nada. Si hay capas vectoriales consultables, avisar para
+  //    que el usuario sepa que el toque SÍ funciona y toque justo encima.
+  const hayVector = S.capas.some(c=> c.visible && c.tipo!=='wms' && c.consultable!==false && c.geojson);
+  if(hayVector) toast('Tocá justo encima de un elemento para ver sus atributos.');
 }
 // Distancia mínima (px) del toque a cualquier vértice de la geometría.
 function distVerticesPx(g, px, py){
