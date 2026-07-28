@@ -587,20 +587,28 @@ function bboxGeom(g){
 }
 // Dibuja las capas vectoriales del usuario (GeoJSON/WFS) sobre el mapa,
 // recortando por el área visible para rendir con capas grandes.
+function colorDeFeature(capa, f){
+  const sim = capa.simbologia;
+  if(sim && sim.campo){
+    const v = f.properties ? f.properties[sim.campo] : undefined;
+    const c = sim.categorias && sim.categorias[String(v)];
+    return c || sim.defecto || capa.color || '#E0A458';
+  }
+  return capa.color || '#E0A458';
+}
 function dibujarCapasVector(aPant, vista){
   for(const capa of S.capas){
     if(!capa.visible || capa.tipo==='wms' || !capa.geojson) continue;
     const fc = capa.geojson;
     const feats = fc.type==='FeatureCollection' ? (fc.features||[])
                 : fc.type==='Feature' ? [fc] : [];
-    const color = capa.color || '#E0A458';
     for(const f of feats){
       if(!f || !f.geometry) continue;
       if(!f._bbox) f._bbox = bboxGeom(f.geometry);
       const b = f._bbox;
       // Descartar si la caja del elemento no intersecta la vista.
       if(vista && (b[2]<vista.oLon || b[0]>vista.eLon || b[3]<vista.sLat || b[1]>vista.nLat)) continue;
-      dibujarGeom(f.geometry, aPant, color);
+      dibujarGeom(f.geometry, aPant, colorDeFeature(capa, f));
     }
   }
 }
@@ -2819,6 +2827,75 @@ function tablaAtributos(capaId){
   `);
 }
 async function toggleConsultable(id){ const c=S.capas.find(x=>x.id===id); if(!c) return; c.consultable = c.consultable===false; await dbPut('capas',c); panelCapas(); }
+
+/* --- simbología por atributo --- */
+function camposDeCapa(c){
+  const feats = c.geojson.type==='FeatureCollection' ? (c.geojson.features||[]) : [c.geojson];
+  const claves = [];
+  for(const f of feats){ const p=f.properties||{}; for(const k of Object.keys(p)) if(!claves.includes(k)) claves.push(k); if(claves.length>=40) break; }
+  return claves;
+}
+function valoresDistintos(c, campo){
+  const feats = c.geojson.type==='FeatureCollection' ? (c.geojson.features||[]) : [c.geojson];
+  const vals = [];
+  for(const f of feats){ const v = String((f.properties||{})[campo]); if(!vals.includes(v)) vals.push(v); if(vals.length>=60) break; }
+  return vals;
+}
+function panelSimbologia(id){
+  const c = S.capas.find(x=>x.id===id); if(!c || !c.geojson) return;
+  const campos = camposDeCapa(c);
+  const sim = c.simbologia || {};
+  abrirPanel('Simbología · '+c.nombre, `
+    <label>Modo</label>
+    <div class="grid2">
+      <button class="mini ${!sim.campo?'verde':''}" id="smUnico">Color único</button>
+      <button class="mini ${sim.campo?'verde':''}" id="smCat">Por atributo</button>
+    </div>
+    <div id="smBody"></div>
+  `);
+  const render = ()=>{
+    const body = document.getElementById('smBody');
+    if(!c.simbologia || !c.simbologia.campo){
+      body.innerHTML = `<label>Color de la capa</label>
+        <input type="color" id="smColor" value="${(c.color||'#E0A458')}" style="height:44px;padding:4px">
+        <button class="ancho" id="smGuardar">Guardar</button>`;
+      document.getElementById('smColor').oninput = e=>{ c.color = e.target.value; };
+      document.getElementById('smGuardar').onclick = async ()=>{ delete c.simbologia; await dbPut('capas', c); dibujar(); toast('Simbología: color único.'); cerrarPanel(); };
+    } else {
+      const sm = c.simbologia;
+      body.innerHTML = `<label>Atributo</label>
+        <select id="smCampo">${campos.map(k=>`<option value="${escHtml(k)}" ${k===sm.campo?'selected':''}>${escHtml(k)}</option>`).join('')}</select>
+        <div id="smCats" style="margin-top:8px"></div>
+        <button class="ancho" id="smGuardar">Guardar</button>
+        <div class="nota">Cada valor distinto del atributo recibe un color. Tocá un color para cambiarlo.</div>`;
+      const pintarCats = ()=>{
+        const cats = document.getElementById('smCats');
+        const vals = Object.keys(sm.categorias||{});
+        cats.innerHTML = vals.map(v=>`<div class="fila" style="padding:6px 0"><input type="color" value="${sm.categorias[v]}" data-cat="${escHtml(v)}" style="width:44px;height:32px;padding:2px;margin:0"><div class="cuerpo"><div class="s">${escHtml(v)}</div></div></div>`).join('');
+        cats.querySelectorAll('[data-cat]').forEach(inp=> inp.oninput = e=>{ sm.categorias[inp.dataset.cat] = e.target.value; dibujar(); });
+      };
+      document.getElementById('smCampo').onchange = e=>{
+        sm.campo = e.target.value;
+        const vals = valoresDistintos(c, sm.campo);
+        sm.categorias = {}; vals.forEach((v,i)=> sm.categorias[v] = colorCapa(i));
+        sm.defecto = c.color || '#8899AA';
+        pintarCats(); dibujar();
+      };
+      pintarCats();
+      document.getElementById('smGuardar').onclick = async ()=>{ await dbPut('capas', c); dibujar(); toast('Simbología por "'+sm.campo+'" guardada.'); cerrarPanel(); };
+    }
+  };
+  document.getElementById('smUnico').onclick = ()=>{ delete c.simbologia; render(); };
+  document.getElementById('smCat').onclick = ()=>{
+    if(!campos.length){ toast('Esta capa no tiene atributos para clasificar.'); return; }
+    const campo = (c.simbologia&&c.simbologia.campo) || campos[0];
+    const vals = valoresDistintos(c, campo);
+    const categorias = {}; vals.forEach((v,i)=> categorias[v]=colorCapa(i));
+    c.simbologia = { campo, categorias, defecto: c.color||'#8899AA' };
+    render();
+  };
+  render();
+}
 async function toggleCapa(id){ const c=S.capas.find(x=>x.id===id); if(!c) return; c.visible=!c.visible; await dbPut('capas',c); dibujar(); panelCapas(); }
 async function borrarCapa(id){
   // Borra también sus tiles WMS cacheados.
@@ -2836,7 +2913,7 @@ function panelCapas(){
           <button class="mini ${c.visible?'verde':''}" data-tg="${c.id}">${c.visible?'Ver':'off'}</button>
           <button class="mini ${c.consultable===false?'':'verde'}" data-tq="${c.id}">${c.consultable===false?'🔒':'🔍'}</button>
         </div>
-        ${c.tipo!=='wms'?`<button class="mini" data-tb="${c.id}">Tabla</button>`:''}
+        ${c.tipo!=='wms'?`<div style="display:flex;flex-direction:column;gap:4px"><button class="mini" data-tb="${c.id}">Tabla</button><button class="mini" data-sm="${c.id}">🎨</button></div>`:''}
         <button class="mini rojo" data-bc="${c.id}">×</button>
       </div>`).join('') : '<div class="vacio">Sin capas todavía. Agregá una abajo.<br>Tocá un elemento en el mapa para ver sus atributos.</div>'}
     <label>Agregar capa</label>
@@ -2852,6 +2929,7 @@ function panelCapas(){
   document.querySelectorAll('[data-tg]').forEach(b=> b.onclick = ()=> toggleCapa(b.dataset.tg));
   document.querySelectorAll('[data-tq]').forEach(b=> b.onclick = ()=> toggleConsultable(b.dataset.tq));
   document.querySelectorAll('[data-tb]').forEach(b=> b.onclick = ()=> tablaAtributos(b.dataset.tb));
+  document.querySelectorAll('[data-sm]').forEach(b=> b.onclick = ()=> panelSimbologia(b.dataset.sm));
   document.querySelectorAll('[data-bc]').forEach(b=> b.onclick = ()=> borrarCapa(b.dataset.bc));
   const sel = document.getElementById('capTipo');
   const render = ()=>{
