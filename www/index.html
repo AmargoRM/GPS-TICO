@@ -1017,6 +1017,10 @@ async function abrirArchivoImportado(f){
   const t = f.text;
   const esGpx = f.kind==='gpx' || /<gpx[\s>]/i.test(t);
   const esKml = f.kind==='kml' || /<kml[\s>]|<Placemark[\s>]/i.test(t);
+  // ¿Es una copia de seguridad de GPS TICO? Restaurar en vez de cargar capa.
+  if(!esGpx && !esKml && /"_tipo"\s*:\s*"gpstico-backup"/.test(t)){
+    try{ const bk = JSON.parse(t); if(bk._tipo==='gpstico-backup'){ await restaurarBackup(bk); return; } }catch(e){}
+  }
   try{
     if(esGpx){ await importarGPX(nombre, t); }
     else if(esKml){ const capa = await guardarCapaVector(nombre, kmlAGeoJSON(t), true); if(capa) toast('KML cargado como capa: '+capa.nombre); }
@@ -1531,6 +1535,7 @@ document.getElementById('btnMenu').onclick = ()=>{
     <div class="fila"><div class="cuerpo"><div class="t">Ir a un punto</div><div class="s">Escribí coordenadas y marcá la chincheta</div></div><button class="mini" id="mIr">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Mapa sin conexión</div><div class="s">Zonas y parches descargables</div></div><button class="mini" id="mOff">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Exportar proyecto</div><div class="s">GPX · CSV · GeoJSON</div></div><button class="mini" id="mExp">Abrir</button></div>
+    <div class="fila"><div class="cuerpo"><div class="t">Copia de seguridad</div><div class="s">Respaldar / restaurar TODO en un archivo</div></div><button class="mini verde" id="mBackup">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Precisión y advertencias</div><div class="s">Leer antes de usar en expedientes</div></div><button class="mini" id="mInfo">Abrir</button></div>
   `);
   document.getElementById('mFuente').onclick = panelFuente;
@@ -1542,8 +1547,69 @@ document.getElementById('btnMenu').onclick = ()=>{
   document.getElementById('mIr').onclick    = panelIrPunto;
   document.getElementById('mOff').onclick   = panelOffline;
   document.getElementById('mExp').onclick   = panelExport;
+  document.getElementById('mBackup').onclick = panelBackup;
   document.getElementById('mInfo').onclick  = panelInfo;
 };
+
+/* --- copia de seguridad completa (todos los proyectos/puntos/tracks/capas) --- */
+function volcarConf(){
+  return new Promise(ok=>{
+    const out = {}; const req = tx('conf').openCursor();
+    req.onsuccess = e=>{ const c = e.target.result; if(c){ out[c.key] = c.value; c.continue(); } else ok(out); };
+    req.onerror = ()=> ok(out);
+  });
+}
+async function exportarBackup(){
+  mostrarCargando('Preparando copia…');
+  try{
+    const data = {
+      _tipo:'gpstico-backup', _v:1, fecha:new Date().toISOString(),
+      proyectos: await dbAll('proyectos'),
+      puntos: await dbAll('puntos'),
+      tracks: await dbAll('tracks'),
+      capas: await dbAll('capas'),
+      conf: await volcarConf()
+    };
+    const n = 'gpstico-backup-'+new Date().toISOString().slice(0,19).replace(/[:T]/g,'-')+'.json';
+    await bajar(n, JSON.stringify(data), 'application/json');
+    toast(`Copia lista: ${data.proyectos.length} proyectos · ${data.puntos.length} puntos · ${data.tracks.length} tracks.`);
+  }catch(e){ toast('No se pudo crear la copia.'); }
+  finally{ ocultarCargando(); }
+}
+async function restaurarBackup(d){
+  if(!d || d._tipo!=='gpstico-backup'){ toast('No es una copia de GPS TICO.'); return false; }
+  mostrarCargando('Restaurando…');
+  try{
+    for(const p of (d.proyectos||[])) await dbPut('proyectos', p);
+    for(const p of (d.puntos||[]))   await dbPut('puntos', p);
+    for(const t of (d.tracks||[]))   await dbPut('tracks', t);
+    for(const c of (d.capas||[]))    await dbPut('capas', c);
+    if(d.conf) for(const k of Object.keys(d.conf)) await dbPut('conf', d.conf[k], k);
+    ocultarCargando();
+    toast('Copia restaurada. Reiniciando…');
+    setTimeout(()=> location.reload(), 900);
+    return true;
+  }catch(e){ ocultarCargando(); toast('No se pudo restaurar.'); return false; }
+}
+function importarBackupArchivo(file){
+  const reader = new FileReader();
+  reader.onload = ()=>{ try{ restaurarBackup(JSON.parse(reader.result)); }catch(e){ toast('Archivo de copia inválido.'); } };
+  reader.onerror = ()=> toast('No se pudo leer el archivo.');
+  reader.readAsText(file);
+}
+function panelBackup(){
+  abrirPanel('Copia de seguridad', `
+    <div class="nota" style="border-color:var(--alerta)">Guardá una copia de <b>TODO</b> (proyectos, puntos, tracks, capas y ajustes) en un archivo. Si cambiás de teléfono o una actualización borra datos, restaurás desde acá. Hacelo seguido y guardá el archivo en Drive o tu PC.</div>
+    <div class="res"><div class="k">Contenido actual</div><div class="v">${S.puntos.length} puntos · ${S.tracks.length} tracks · ${S.capas.length} capas</div></div>
+    <button class="ancho" id="bkExp">Exportar copia (todo)</button>
+    <label>Restaurar desde un archivo de copia</label>
+    <input type="file" id="bkFile" accept="application/json,.json">
+    <button class="ancho borde" id="bkImp">Restaurar copia</button>
+    <div class="nota">Restaurar <b>agrega/actualiza</b> sin borrar lo que ya tengas. La app se reinicia al terminar.</div>
+  `);
+  document.getElementById('bkExp').onclick = exportarBackup;
+  document.getElementById('bkImp').onclick = ()=>{ const f=document.getElementById('bkFile').files[0]; if(!f){ toast('Elegí el archivo de copia.'); return; } importarBackupArchivo(f); };
+}
 
 /* --- proyectos --- */
 document.getElementById('proyBtn').onclick = panelProyectos;
