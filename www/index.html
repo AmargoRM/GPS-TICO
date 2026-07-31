@@ -571,6 +571,15 @@ function colorDeFeature(capa, f){
   }
   return capa.color || '#E0A458';
 }
+// Determina si un feature está oculto por simbología (categoría desactivada).
+// Devuelve true si la capa tiene simbología y la categoría de este feature
+// está marcada como oculta en sim.ocultas.
+function featureOculto(capa, f){
+  const sim = capa.simbologia;
+  if(!sim || !sim.campo || !sim.ocultas) return false;
+  const v = f.properties ? String(f.properties[sim.campo]) : 'undefined';
+  return !!sim.ocultas[v];
+}
 // Dibuja las capas vectoriales del usuario (GeoJSON/WFS) sobre el mapa,
 // recortando por el área visible para rendir con capas grandes.
 function dibujarCapasVector(aPant, vista){
@@ -586,6 +595,7 @@ function dibujarCapasVector(aPant, vista){
     const rotulos = [];
     for(const f of feats){
       if(!f || !f.geometry) continue;
+      if(featureOculto(capa, f)) continue;
       if(!f._bbox) f._bbox = bboxGeom(f.geometry);
       const b = f._bbox;
       // Descartar si la caja del elemento no intersecta la vista.
@@ -3426,8 +3436,13 @@ function consultarEnPantalla(px,py){
   const ll = pantallaALatLon(px,py); if(!ll) return;
   // Margen en grados equivalente a la tolerancia en px, para descartar rápido
   // los elementos lejanos por su caja envolvente (capas grandes).
-  const TOL = 44;
-  const p1 = pantallaALatLon(px-TOL, py-TOL), p2 = pantallaALatLon(px+TOL, py+TOL);
+  // Se usa un margen más ancho (72 px) para el filtro previo por bbox: así
+  // los puntos que caen justo en el borde no se descartan por el filtro
+  // grueso y llegan al cálculo fino de distancia (que usa TOL_PT).
+  const TOL = 44;         // radio efectivo para líneas y polígonos
+  const TOL_PT = 60;      // radio más generoso para PUNTOS (dedo grueso)
+  const TOL_FILT = Math.max(TOL, TOL_PT) + 8;
+  const p1 = pantallaALatLon(px-TOL_FILT, py-TOL_FILT), p2 = pantallaALatLon(px+TOL_FILT, py+TOL_FILT);
   const loMar = p1&&p2 ? Math.abs(p2.lon-p1.lon) : 0.01;
   const laMar = p1&&p2 ? Math.abs(p1.lat-p2.lat) : 0.01;
 
@@ -3435,7 +3450,7 @@ function consultarEnPantalla(px,py){
   //    A prueba de fallos: si el cálculo de distancia falla en una geometría,
   //    se ignora ese elemento; y como respaldo se guarda el más chico cuya
   //    caja envolvente contiene el toque (garantiza acierto en polígonos).
-  let mejor=null, mejorDist=TOL, mejorCapa=null;
+  let mejor=null, mejorDist=Infinity, mejorCapa=null;
   let respaldo=null, respaldoArea=Infinity, respaldoCapa=null;
   for(let i=S.capas.length-1;i>=0;i--){
     const c = S.capas[i];
@@ -3443,6 +3458,7 @@ function consultarEnPantalla(px,py){
     const feats = c.geojson.type==='FeatureCollection' ? (c.geojson.features||[]) : c.geojson.type==='Feature' ? [c.geojson] : [];
     for(const f of feats){
       if(!f || !f.geometry) continue;
+      if(featureOculto(c, f)) continue;
       if(!f._bbox){ try{ f._bbox = bboxGeom(f.geometry); }catch(e){ continue; } }
       const b = f._bbox;
       if(!b || b[2]<ll.lon-loMar || b[0]>ll.lon+loMar || b[3]<ll.lat-laMar || b[1]>ll.lat+laMar) continue;
@@ -3453,7 +3469,11 @@ function consultarEnPantalla(px,py){
       }
       let d = Infinity;
       try{ d = distGeomPx(f.geometry, px, py, ll); }catch(e){ d = Infinity; }
-      if(d < mejorDist){ mejorDist = d; mejor = f; mejorCapa = c; if(d===0) break; }
+      // Tolerancia por tipo: puntos y multipuntos aceptan hasta TOL_PT (60 px),
+      // líneas y polígonos solo hasta TOL (44 px).
+      const gt = f.geometry.type;
+      const tolFeat = (gt==='Point' || gt==='MultiPoint') ? TOL_PT : TOL;
+      if(d <= tolFeat && d < mejorDist){ mejorDist = d; mejor = f; mejorCapa = c; if(d===0) break; }
     }
     if(mejor && mejorDist===0) break;
   }
@@ -3665,17 +3685,36 @@ function panelSimbologia(id){
       document.getElementById('smGuardar').onclick = async ()=>{ delete c.simbologia; await dbPut('capas', c); dibujar(); toast('Simbología: color único.'); cerrarPanel(); };
     } else {
       const sm = c.simbologia;
+      if(!sm.ocultas) sm.ocultas = {};
       body.innerHTML = `<label>Atributo</label>
         <select id="smCampo">${campos.map(k=>`<option value="${escHtml(k)}" ${k===sm.campo?'selected':''}>${escHtml(k)}</option>`).join('')}</select>
+        <div style="display:flex;gap:6px;margin-top:6px">
+          <button class="mini" id="smVerTodo">Mostrar todo</button>
+          <button class="mini" id="smOcultarTodo">Ocultar todo</button>
+        </div>
         <div id="smCats" style="margin-top:8px"></div>
         <button class="ancho" id="smGuardar">Guardar</button>
-        <div class="nota">Cada valor distinto del atributo recibe un color. Tocá un color para cambiarlo.</div>`;
+        <div class="nota">Tocá el 👁 para mostrar/ocultar los elementos de esa categoría en el mapa. Los elementos ocultos tampoco responden al toque.</div>`;
       const pintarCats = ()=>{
         const cats = document.getElementById('smCats');
         const vals = Object.keys(sm.categorias||{});
-        cats.innerHTML = vals.map(v=>`<div class="fila" style="padding:6px 0"><input type="color" value="${sm.categorias[v]}" data-cat="${escHtml(v)}" style="width:44px;height:32px;padding:2px;margin:0"><div class="cuerpo"><div class="s">${escHtml(v)}</div></div></div>`).join('');
+        cats.innerHTML = vals.map(v=>{
+          const oculto = !!sm.ocultas[v];
+          return `<div class="fila" style="padding:6px 0;opacity:${oculto?0.45:1}">
+            <input type="color" value="${sm.categorias[v]}" data-cat="${escHtml(v)}" style="width:44px;height:32px;padding:2px;margin:0">
+            <div class="cuerpo"><div class="s">${escHtml(v)}</div></div>
+            <button class="mini ${oculto?'':'verde'}" data-vis="${escHtml(v)}" title="${oculto?'Mostrar':'Ocultar'}">${oculto?'🚫':'👁'}</button>
+          </div>`;
+        }).join('');
         cats.querySelectorAll('[data-cat]').forEach(inp=> inp.oninput = e=>{ sm.categorias[inp.dataset.cat] = e.target.value; dibujar(); });
+        cats.querySelectorAll('[data-vis]').forEach(b=> b.onclick = ()=>{
+          const v = b.dataset.vis;
+          if(sm.ocultas[v]) delete sm.ocultas[v]; else sm.ocultas[v] = true;
+          pintarCats(); dibujar();
+        });
       };
+      document.getElementById('smVerTodo').onclick = ()=>{ sm.ocultas = {}; pintarCats(); dibujar(); };
+      document.getElementById('smOcultarTodo').onclick = ()=>{ sm.ocultas = {}; Object.keys(sm.categorias||{}).forEach(v=> sm.ocultas[v]=true); pintarCats(); dibujar(); };
       document.getElementById('smCampo').onchange = e=>{
         sm.campo = e.target.value;
         const vals = valoresDistintos(c, sm.campo);
