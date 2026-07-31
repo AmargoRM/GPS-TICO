@@ -603,12 +603,53 @@ function dibujarCapasVector(aPant, vista){
       const est = {...estBase, color: colorDeFeature(capa, f)};
       dibujarGeom(f.geometry, aPant, est);
       // Preparar etiqueta (se dibuja después, encima de todas las geometrías).
+      // Se guarda [x_ancla, y_ancla, texto, esPunto] — la colocación real
+      // (al lado del punto, sin tapar el símbolo) se resuelve en el bucle final.
       if(etiq && f.properties){
         const v = f.properties[etiq];
-        if(v!=null && v!==''){ const a = anclaGeom(f.geometry); if(a){ const s = aPant(a[1], a[0]); if(s.x>-40 && s.x<W+40 && s.y>-20 && s.y<H+20) rotulos.push([s.x, s.y, String(v)]); } }
+        if(v!=null && v!==''){
+          const a = anclaGeom(f.geometry);
+          if(a){
+            const s = aPant(a[1], a[0]);
+            if(s.x>-40 && s.x<W+40 && s.y>-20 && s.y<H+20){
+              const gt = f.geometry && f.geometry.type;
+              const esPunto = (gt==='Point' || gt==='MultiPoint');
+              rotulos.push([s.x, s.y, String(v), esPunto, estBase.tam||5]);
+            }
+          }
+        }
       }
     }
-    for(const [x,y,t] of rotulos) dibujarEtiqueta(x, y, t);
+    // Coloca etiquetas de puntos al lado derecho del símbolo, evitando
+    // solapamientos: si el hueco elegido ya está ocupado por otra etiqueta,
+    // se prueba abajo-derecha, arriba-derecha, izquierda, etc.
+    const colocados = [];   // {x1,y1,x2,y2} de las cajas ya dibujadas
+    const chocaCon = (bx1,by1,bx2,by2)=> colocados.some(o=> !(bx2<o.x1||bx1>o.x2||by2<o.y1||by1>o.y2));
+    for(const [ax,ay,t,esPunto,tam] of rotulos){
+      const txt = t.length>28 ? t.slice(0,27)+'…' : t;
+      ctx.font = '600 11px system-ui';
+      const tw = ctx.measureText(txt).width, th = 14;
+      // Candidatos de posición del centro de la etiqueta, en orden de preferencia:
+      // derecha, izquierda, abajo, arriba, y cuatro diagonales.
+      const off = (esPunto ? (tam+6) : 4) + 6;   // separación del ancla
+      const cand = [
+        [ax + tw/2 + off, ay],                   // derecha
+        [ax - tw/2 - off, ay],                   // izquierda
+        [ax, ay + th/2 + off],                   // abajo
+        [ax, ay - th/2 - off],                   // arriba
+        [ax + tw/2 + off, ay + th/2 + off],      // abajo-derecha
+        [ax + tw/2 + off, ay - th/2 - off],      // arriba-derecha
+        [ax - tw/2 - off, ay + th/2 + off],      // abajo-izquierda
+        [ax - tw/2 - off, ay - th/2 - off]       // arriba-izquierda
+      ];
+      let ex=cand[0][0], ey=cand[0][1];
+      for(const [cx,cy] of cand){
+        const x1=cx-tw/2-2, y1=cy-th/2-2, x2=cx+tw/2+2, y2=cy+th/2+2;
+        if(!chocaCon(x1,y1,x2,y2)){ ex=cx; ey=cy; break; }
+      }
+      colocados.push({x1:ex-tw/2-2, y1:ey-th/2-2, x2:ex+tw/2+2, y2:ey+th/2+2});
+      dibujarEtiqueta(ex, ey, txt);
+    }
   }
 }
 // Estilo efectivo de una capa (con valores por defecto).
@@ -678,6 +719,10 @@ function anclaGeom(g){
 function dibujarEtiqueta(x, y, txt){
   if(txt.length>28) txt = txt.slice(0,27)+'…';
   ctx.font = '600 11px system-ui'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  // Fondo semitransparente para mejorar la lectura sobre cualquier mapa base.
+  const tw = ctx.measureText(txt).width, pad = 3, h = 14;
+  ctx.fillStyle = 'rgba(10,18,20,.72)';
+  ctx.fillRect(x - tw/2 - pad, y - h/2, tw + 2*pad, h);
   ctx.lineWidth = 3; ctx.strokeStyle = 'rgba(10,18,20,.92)'; ctx.strokeText(txt, x, y);
   ctx.fillStyle = '#DCE6E4'; ctx.fillText(txt, x, y);
 }
@@ -3434,27 +3479,29 @@ function geomEsPoligono(g){
 }
 function consultarEnPantalla(px,py){
   const ll = pantallaALatLon(px,py); if(!ll) return;
-  // Margen en grados equivalente a la tolerancia en px, para descartar rápido
-  // los elementos lejanos por su caja envolvente (capas grandes).
-  // Se usa un margen más ancho (72 px) para el filtro previo por bbox: así
-  // los puntos que caen justo en el borde no se descartan por el filtro
-  // grueso y llegan al cálculo fino de distancia (que usa TOL_PT).
+  // Radios de acierto (píxeles). Puntos son objetos pequeños y el dedo cubre
+  // ~80 px; se aceptan más lejos que líneas/polígonos.
   const TOL = 44;         // radio efectivo para líneas y polígonos
-  const TOL_PT = 60;      // radio más generoso para PUNTOS (dedo grueso)
-  const TOL_FILT = Math.max(TOL, TOL_PT) + 8;
+  const TOL_PT = 80;      // radio para PUNTOS
+  // Margen del filtro previo por bbox: 3x la tolerancia del dedo, para que
+  // ningún punto cercano se descarte prematuramente por conversiones px→lat/lon.
+  const TOL_FILT = Math.max(TOL, TOL_PT) * 3;
   const p1 = pantallaALatLon(px-TOL_FILT, py-TOL_FILT), p2 = pantallaALatLon(px+TOL_FILT, py+TOL_FILT);
   const loMar = p1&&p2 ? Math.abs(p2.lon-p1.lon) : 0.01;
   const laMar = p1&&p2 ? Math.abs(p1.lat-p2.lat) : 0.01;
 
   // 1) Elemento vectorial consultable MÁS CERCANO (punto, línea o polígono).
-  //    A prueba de fallos: si el cálculo de distancia falla en una geometría,
-  //    se ignora ese elemento; y como respaldo se guarda el más chico cuya
-  //    caja envolvente contiene el toque (garantiza acierto en polígonos).
   let mejor=null, mejorDist=Infinity, mejorCapa=null;
   let respaldo=null, respaldoArea=Infinity, respaldoCapa=null;
+  // Diagnóstico: si nada matchea, sabemos por qué (cuántas capas, features cerca, distancia mínima real).
+  let capasConsult=0, capasVisibleNoConsult=0, capasOcultas=0, featsCerca=0, minDistReal=Infinity;
   for(let i=S.capas.length-1;i>=0;i--){
     const c = S.capas[i];
-    if(!c.visible || c.tipo==='wms' || c.consultable===false || !c.geojson) continue;
+    if(!c.visible){ capasOcultas++; continue; }
+    if(c.tipo==='wms') continue;
+    if(c.consultable===false){ capasVisibleNoConsult++; continue; }
+    if(!c.geojson) continue;
+    capasConsult++;
     const feats = c.geojson.type==='FeatureCollection' ? (c.geojson.features||[]) : c.geojson.type==='Feature' ? [c.geojson] : [];
     for(const f of feats){
       if(!f || !f.geometry) continue;
@@ -3462,6 +3509,7 @@ function consultarEnPantalla(px,py){
       if(!f._bbox){ try{ f._bbox = bboxGeom(f.geometry); }catch(e){ continue; } }
       const b = f._bbox;
       if(!b || b[2]<ll.lon-loMar || b[0]>ll.lon+loMar || b[3]<ll.lat-laMar || b[1]>ll.lat+laMar) continue;
+      featsCerca++;
       // Respaldo SOLO para polígonos: ¿el toque cae dentro de su caja?
       if(geomEsPoligono(f.geometry) && ll.lon>=b[0] && ll.lon<=b[2] && ll.lat>=b[1] && ll.lat<=b[3]){
         const area = Math.max(1e-12, (b[2]-b[0])*(b[3]-b[1]));
@@ -3469,8 +3517,8 @@ function consultarEnPantalla(px,py){
       }
       let d = Infinity;
       try{ d = distGeomPx(f.geometry, px, py, ll); }catch(e){ d = Infinity; }
-      // Tolerancia por tipo: puntos y multipuntos aceptan hasta TOL_PT (60 px),
-      // líneas y polígonos solo hasta TOL (44 px).
+      if(d < minDistReal) minDistReal = d;
+      // Tolerancia por tipo: puntos aceptan hasta TOL_PT (80), líneas/polígonos hasta TOL (44).
       const gt = f.geometry.type;
       const tolFeat = (gt==='Point' || gt==='MultiPoint') ? TOL_PT : TOL;
       if(d <= tolFeat && d < mejorDist){ mejorDist = d; mejor = f; mejorCapa = c; if(d===0) break; }
@@ -3478,6 +3526,28 @@ function consultarEnPantalla(px,py){
     if(mejor && mejorDist===0) break;
   }
   if(mejor){ mostrarAtributos(mejorCapa, [mejor]); return; }
+  // Fallback: si hay un feature dentro del bbox filtrado (featsCerca>0) pero
+  // ninguno cumplió la tolerancia estricta, tomar el MÁS CERCANO hasta 140 px.
+  // Así el usuario no queda mudo cuando toca cerca pero no exactamente encima.
+  if(featsCerca>0 && minDistReal < 140){
+    // segunda pasada: solo comparar distancias sin exigir tolerancia estricta
+    let mm=null, mmC=null, mmD=Infinity;
+    for(let i=S.capas.length-1;i>=0;i--){
+      const c = S.capas[i];
+      if(!c.visible || c.tipo==='wms' || c.consultable===false || !c.geojson) continue;
+      const feats = c.geojson.type==='FeatureCollection' ? (c.geojson.features||[]) : c.geojson.type==='Feature' ? [c.geojson] : [];
+      for(const f of feats){
+        if(!f || !f.geometry) continue;
+        if(featureOculto(c, f)) continue;
+        const b = f._bbox; if(!b) continue;
+        if(b[2]<ll.lon-loMar || b[0]>ll.lon+loMar || b[3]<ll.lat-laMar || b[1]>ll.lat+laMar) continue;
+        let d = Infinity;
+        try{ d = distGeomPx(f.geometry, px, py, ll); }catch(e){}
+        if(d < mmD){ mmD = d; mm = f; mmC = c; }
+      }
+    }
+    if(mm){ mostrarAtributos(mmC, [mm]); return; }
+  }
   // 1b) Capas grandes (motor compacto).
   const bh = bigHitTest(px, py, ll, TOL);
   if(bh){ mostrarAtributosBig(bh.capa, bh.fi); return; }
