@@ -1502,6 +1502,8 @@ let fuentePrevTrack = null;   // fuente a restaurar al terminar el track
 async function alternarTrack(){
   const b = document.getElementById('btnTrack');
   if(S.grabando){
+    // Al detener el track, se marca como pendiente de subir a la nube.
+    S.grabando.sincronizado = false;
     await dbPut('tracks', JSON.parse(JSON.stringify(S.grabando)));
     await dbDel('conf','trackEnCurso');
     const rech = S.grabando.rechazados||0;
@@ -1748,7 +1750,9 @@ document.getElementById('btnTrack').onclick = alternarTrack;
 
 /* --- menú --- */
 document.getElementById('btnMenu').onclick = ()=>{
-  const pend = S.puntos.filter(p=> p.sincronizado!==true).length;
+  const pendP = S.puntos.filter(p=> p.sincronizado!==true).length;
+  const pendT = (S.tracks||[]).filter(t=> t.sincronizado!==true).length;
+  const pend = pendP + pendT;
   abrirPanel('Menú', `
     <div class="fila"><div class="cuerpo"><div class="t">Capas del proyecto</div><div class="s">${S.capas.length} capa(s) · GeoJSON · KML · SHP · WFS · WMS</div></div><button class="mini" id="mCapas">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Puntos y tracks</div><div class="s">${S.puntos.length} puntos · ${S.tracks.length} tracks</div></div><button class="mini" id="mDatos">Ver</button></div>
@@ -1757,7 +1761,7 @@ document.getElementById('btnMenu').onclick = ()=>{
     <div class="fila"><div class="cuerpo"><div class="t">Mapa sin conexión</div><div class="s">Zonas y parches descargables</div></div><button class="mini" id="mOff">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Exportar proyecto</div><div class="s">GPX · CSV · GeoJSON</div></div><button class="mini" id="mExp">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Exportar mapa</div><div class="s">PDF georreferenciado · PNG · grilla CRTM05</div></div><button class="mini" id="mExpMapa">Abrir</button></div>
-    <div class="fila"><div class="cuerpo"><div class="t">☁ Sincronizar a la nube</div><div class="s">${pend?pend+' punto(s) sin subir':'todo sincronizado'} · Neon</div></div><button class="mini" id="mSync">Abrir</button></div>
+    <div class="fila"><div class="cuerpo"><div class="t">☁ Sincronizar a la nube</div><div class="s">${pend?(pendP+' punto(s) · '+pendT+' track(s) pendientes'):'todo sincronizado'} · Neon</div></div><button class="mini" id="mSync">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Actualizar app</div><div class="s">Build actual: ${APP_BUILD||'dev'} · buscar versión nueva</div></div><button class="mini" id="mUpd">Buscar</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">⚙ Configuración y términos de uso</div><div class="s">Fuente, diagnóstico, filtros, alertas, precisión</div></div><button class="mini" id="mConfig">Abrir</button></div>
   `);
@@ -3901,15 +3905,29 @@ async function buscarActualizacion(manual){
 let syncCfg = { url:'', token:'', auto:true };
 async function cargarSyncCfg(){ try{ const c = await dbGet('conf','syncCfg'); if(c) syncCfg = Object.assign(syncCfg, c); }catch(e){} }
 async function guardarSyncCfg(){ await dbPut('conf', syncCfg, 'syncCfg'); }
-// Punto listo para subir (sin las fotos, que son pesadas; se cuentan aparte).
+// Formato del punto para enviar al proxy. Coincide con la tabla `puntos`
+// que arma el Worker: id, proy, nombre, detalle, fecha, lat, lon, alt_orto, exac.
 function puntoParaNube(p){
-  return { id:p.id, proy:p.proy, nom:p.nom, desc:p.desc||'', lat:p.lat, lon:p.lon,
-           alt_orto:p.altOrto!=null?p.altOrto:null, alt_elip:p.altElip!=null?p.altElip:null,
-           exac:p.exac!=null?p.exac:null, fuente:p.fuente||'fused', tipo:p.tipo||null,
-           datos:p.datos||null, promediado:!!p.promediado, muestras:p.muestras||null,
-           desv_std:p.desvStd!=null?p.desvStd:null, n_fotos:(p.fotos?p.fotos.length:0),
-           t: new Date(p.t||Date.now()).toISOString() };
+  return { id:p.id, proy:p.proy||null,
+           nombre: p.nom || '',
+           detalle: p.desc || '',
+           fecha: new Date(p.t || Date.now()).toISOString(),
+           lat: p.lat, lon: p.lon,
+           alt_orto: p.altOrto!=null ? p.altOrto : null,
+           exac: p.exac!=null ? p.exac : null };
 }
+// Formato del track para enviar al proxy: la geometría LineString viaja en `geojson`.
+function trackParaNube(t){
+  return { id:t.id, proy:t.proy||null,
+           nombre: t.nom || '',
+           detalle: t.desc || '',
+           fecha: new Date(t.ini || t.t || Date.now()).toISOString(),
+           distancia_m: t.dist!=null ? t.dist : null,
+           n_puntos: (t.pts && t.pts.length) || 0,
+           geojson: t.geojson || (t.pts ? { type:'Feature', geometry:{ type:'LineString', coordinates: t.pts.map(pt=>[pt.lon, pt.lat]) }, properties:{ nom:t.nom, dist:t.dist } } : null) };
+}
+// POST al proxy con validación estricta: si el servidor responde ok:false
+// (aunque el HTTP sea 200), lanzamos error para NO marcar como sincronizado.
 async function postNube(ruta, body){
   if(!syncCfg.url) throw new Error('Falta la URL del proxy');
   const base = syncCfg.url.replace(/\/+$/,'');
@@ -3918,52 +3936,56 @@ async function postNube(ruta, body){
     headers:{ 'Content-Type':'application/json', 'Authorization':'Bearer '+(syncCfg.token||'') },
     body: JSON.stringify(body)
   });
-  if(!r.ok) throw new Error('HTTP '+r.status+' '+(await r.text()).slice(0,120));
-  return r.json().catch(()=>({}));
+  const txt = await r.text();
+  let data = {}; try{ data = JSON.parse(txt); }catch(e){}
+  if(!r.ok) throw new Error('HTTP '+r.status+': '+(data.error||txt.slice(0,140)));
+  // El proxy siempre incluye ok:true/false. Si viene false, es error lógico.
+  if(data.ok === false) throw new Error(data.error || 'El proxy rechazó la petición');
+  return data;
 }
 async function sincronizarNube(manual){
   if(!syncCfg.url){ if(manual) toast('Configurá la URL del proxy primero.'); return; }
   if(!navigator.onLine){ if(manual) toast('Sin conexión; se subirá cuando haya internet.'); return; }
-  const pend = S.puntos.filter(p=> p.sincronizado!==true);
-  if(!pend.length){ if(manual) toast('No hay puntos pendientes de subir.'); return; }
-  if(manual) mostrarCargando('Subiendo '+pend.length+' punto(s)…');
+  const puntosPend = S.puntos.filter(p=> p.sincronizado!==true);
+  const tracksPend = (S.tracks||[]).filter(t=> t.sincronizado!==true);
+  if(!puntosPend.length && !tracksPend.length){ if(manual) toast('No hay nada pendiente de subir.'); return; }
+  if(manual) mostrarCargando('Subiendo…');
+  let nP = 0, nT = 0, err = null;
   try{
-    await postNube('/puntos', { puntos: pend.map(puntoParaNube) });
-    for(const p of pend){ p.sincronizado = true; await dbPut('puntos', p); }
-    if(manual) toast('Subidos '+pend.length+' punto(s) a Neon.');
-  }catch(e){ if(manual) toast('No se pudo subir: '+(e.message||e)); }
+    if(puntosPend.length){
+      const rr = await postNube('/puntos', { puntos: puntosPend.map(puntoParaNube) });
+      for(const p of puntosPend){ p.sincronizado = true; await dbPut('puntos', p); }
+      nP = rr.recibidos || puntosPend.length;
+    }
+    if(tracksPend.length){
+      const rr = await postNube('/tracks', { tracks: tracksPend.map(trackParaNube) });
+      for(const t of tracksPend){ t.sincronizado = true; await dbPut('tracks', t); }
+      nT = rr.recibidos || tracksPend.length;
+    }
+  }catch(e){ err = e; }
   finally{ if(manual) ocultarCargando(); }
-}
-async function subirCapasNube(){
-  const capas = S.capas.filter(c=> c.tipo==='geojson' && c.geojson && c.sincronizado!==true);
-  if(!capas.length){ toast('No hay capas vectoriales nuevas para subir.'); return; }
-  mostrarCargando('Subiendo '+capas.length+' capa(s)…');
-  try{
-    await postNube('/capas', { capas: capas.map(c=>({ id:c.id, nombre:c.nombre, geojson:c.geojson, t:new Date().toISOString() })) });
-    for(const c of capas){ c.sincronizado = true; await dbPut('capas', c); }
-    toast('Subidas '+capas.length+' capa(s) a Neon.');
-  }catch(e){ toast('No se pudo subir: '+(e.message||e)); }
-  finally{ ocultarCargando(); }
+  if(err){ if(manual) toast('No se pudo subir: '+(err.message||err)); return; }
+  if(manual) toast('Subidos '+nP+' punto(s) y '+nT+' track(s) a Neon.');
 }
 function panelSync(){
-  const pend = S.puntos.filter(p=> p.sincronizado!==true).length;
-  const capasPend = S.capas.filter(c=> c.tipo==='geojson' && c.sincronizado!==true).length;
+  const puntosPend = S.puntos.filter(p=> p.sincronizado!==true).length;
+  const tracksPend = (S.tracks||[]).filter(t=> t.sincronizado!==true).length;
   abrirPanel('Sincronizar a la nube (Neon)', `
-    <div class="nota" style="border-color:var(--fix)">Tus puntos y capas se suben a <b>tu</b> base Neon a través de un proxy propio (un Cloudflare Worker que guarda la clave secreta). La app solo necesita la <b>dirección del proxy</b> y un <b>token</b>. Funciona offline: lo pendiente se sube cuando hay internet.</div>
+    <div class="nota" style="border-color:var(--fix)">Sube tus <b>puntos</b> y <b>tracks</b> a dos tablas separadas en tu base Neon a través de un proxy propio (Cloudflare Worker). Funciona offline: lo pendiente se sube cuando hay internet. Las tablas se crean solas la primera vez.</div>
     <label>Dirección del proxy (URL)</label>
-    <input id="syUrl" value="${escHtml(syncCfg.url)}" placeholder="https://gps-tico-proxy.tucuenta.workers.dev">
+    <input id="syUrl" value="${escHtml(syncCfg.url)}" placeholder="https://nube.tucuenta.workers.dev">
     <label>Token de acceso</label>
-    <input id="syTok" value="${escHtml(syncCfg.token)}" placeholder="el que pusiste en el Worker">
+    <input id="syTok" value="${escHtml(syncCfg.token)}" placeholder="el mismo API_TOKEN que pusiste en el Worker">
     <label style="display:flex;align-items:center;gap:8px;text-transform:none;letter-spacing:0;font-size:13px;margin-top:12px">
       <input type="checkbox" id="syAuto" ${syncCfg.auto?'checked':''} style="width:auto;margin:0"> Subir automáticamente cuando haya internet</label>
     <div class="grid2" style="margin-top:12px">
       <button class="mini" id="syProbar">Probar conexión</button>
       <button class="mini" id="syGuardar">Guardar ajustes</button>
     </div>
-    <div class="res" style="margin-top:12px"><div class="k">Pendientes de subir</div><div class="v">${pend} punto(s) · ${capasPend} capa(s)</div></div>
-    <button class="ancho" id="sySubir">Subir puntos ahora</button>
-    <button class="ancho borde" id="syCapas">Subir capas vectoriales (KML/GeoJSON)</button>
-    <div class="nota">Las fotos no se suben todavía (son pesadas); se sube el conteo. El almacenamiento de fotos en la nube es un paso aparte.</div>
+    <div class="res" style="margin-top:12px"><div class="k">Pendientes de subir</div><div class="v">${puntosPend} punto(s) · ${tracksPend} track(s)</div></div>
+    <button class="ancho" id="sySubir">Subir ahora</button>
+    <button class="ancho borde" id="syReset">Volver a marcar todo como pendiente</button>
+    <div class="nota">Si algo se marcó como "subido" sin haber llegado (ej. con un proxy mal configurado), tocá el segundo botón para reenviar. Las fotos no se suben todavía (van aparte).</div>
   `);
   document.getElementById('syGuardar').onclick = async ()=>{
     syncCfg.url = document.getElementById('syUrl').value.trim();
@@ -3975,12 +3997,21 @@ function panelSync(){
     const url = document.getElementById('syUrl').value.trim();
     if(!url){ toast('Poné la URL primero.'); return; }
     mostrarCargando('Probando…');
-    try{ const r = await fetch(url.replace(/\/+$/,'')+'/ping'); toast(r.ok?'Conexión OK ✓':'Respondió HTTP '+r.status); }
+    try{
+      const r = await fetch(url.replace(/\/+$/,'')+'/ping');
+      const j = await r.json().catch(()=>({}));
+      toast(r.ok && j.ok ? 'Conexión OK ✓' : 'Respondió HTTP '+r.status+' — revisá la URL.');
+    }
     catch(e){ toast('No respondió: '+(e.message||e)); }
     finally{ ocultarCargando(); }
   };
   document.getElementById('sySubir').onclick = async ()=>{ await sincronizarNube(true); panelSync(); };
-  document.getElementById('syCapas').onclick = async ()=>{ await subirCapasNube(); panelSync(); };
+  document.getElementById('syReset').onclick = async ()=>{
+    if(!confirm('¿Marcar TODOS los puntos y tracks como pendientes de subir? La próxima sincronización los mandará de nuevo.')) return;
+    for(const p of S.puntos){ p.sincronizado = false; await dbPut('puntos', p); }
+    for(const t of (S.tracks||[])){ t.sincronizado = false; await dbPut('tracks', t); }
+    toast('Todo marcado como pendiente.'); panelSync();
+  };
 }
 
 /* =======================================================================
