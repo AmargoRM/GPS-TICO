@@ -3360,6 +3360,20 @@ async function agregarCapaURL(nombre, url){
   }catch(e){ toast('No se pudo cargar: '+(e.message||e)); }
   finally{ ocultarCargando(); }
 }
+// Vincula una capa existente (ej. cargada de archivo o antes de esta versión)
+// con una URL de origen, para poder refrescarla después con 🔄.
+async function vincularCapaAURL(capaId){
+  const c = S.capas.find(x=>x.id===capaId); if(!c) return;
+  const url = prompt('URL del GeoJSON de origen (o servicio WFS):\n\nEjemplo:\nhttps://raw.githubusercontent.com/AmargoRM/Nube-amarga/main/docs/casos.geojson', c.fuenteUrl||'');
+  if(url===null) return;
+  if(!url.trim()){ toast('URL vacía.'); return; }
+  c.fuenteTipo = 'url';
+  c.fuenteUrl = url.trim();
+  c.fuenteFecha = c.fuenteFecha || Date.now();
+  await dbPut('capas', c);
+  toast('Capa vinculada. Ahora podés usar el 🔄 para actualizar.');
+  panelCapas();
+}
 // Refresca una capa online que fue cargada por URL/WFS: vuelve a descargar
 // el GeoJSON del origen y reemplaza el geojson local. Si el servidor no
 // responde, se conserva el buffer actual (no se pierde nada).
@@ -4556,6 +4570,9 @@ function panelCapas(){
       const nElem = c.tipo==='wms' ? 'WMS' : c.tipo==='big' ? ('Grande · '+c.nFeats+' elem.') : 'Vector · '+((c.geojson&&c.geojson.features||[]).length)+' elem.';
       const online = !!(c.fuenteTipo || c.tipo==='wms');
       const fechaFmt = c.fuenteFecha ? ' · desde ' + new Date(c.fuenteFecha).toLocaleDateString('es-CR') : '';
+      // Capa vectorial (no wms, no big) que aún no está vinculada a una URL:
+      // mostramos botón 🔗 para vincularla y así poder refrescarla después.
+      const puedeVincular = c.tipo!=='wms' && c.tipo!=='big' && !c.fuenteTipo;
       return `<div class="fila">
         <div class="cuerpo"><div class="t"><span style="color:${c.color||'#8899AA'}">■</span> ${c.nombre}${online?' <span style="color:var(--musgo);font-size:10px">☁</span>':''}</div>
           <div class="s">${nElem} · ${c.consultable===false?'🔒 solo vista':'🔍 consultable'}${c.proyFuente&&c.proyFuente!=='geo'?' · 🌐 '+(c.proyFuente==='crtm05'?'CRTM05':c.proyFuente==='ln'?'Lambert N':'Lambert S'):''}${c.etiqueta?' · 🏷 '+escHtml(c.etiqueta):''}${fechaFmt}</div></div>
@@ -4563,6 +4580,7 @@ function panelCapas(){
           <button class="mini ${c.visible?'verde':''}" data-tg="${c.id}">${c.visible?'Ver':'off'}</button>
           <button class="mini ${c.consultable===false?'':'verde'}" data-tq="${c.id}">${c.consultable===false?'🔒':'🔍'}</button>
           ${online&&c.fuenteTipo?`<button class="mini" data-tr="${c.id}" title="Actualizar buffer desde el origen">🔄</button>`:''}
+          ${puedeVincular?`<button class="mini" data-vc="${c.id}" title="Vincular esta capa a una URL de origen">🔗</button>`:''}
         </div>
         ${c.tipo==='big'?`<div style="display:flex;flex-direction:column;gap:4px">
           <button class="mini" data-se="${c.id}" title="Estilo">🎨</button>
@@ -4593,6 +4611,7 @@ function panelCapas(){
   document.querySelectorAll('[data-tg]').forEach(b=> b.onclick = ()=> toggleCapa(b.dataset.tg));
   document.querySelectorAll('[data-tq]').forEach(b=> b.onclick = ()=> toggleConsultable(b.dataset.tq));
   document.querySelectorAll('[data-tr]').forEach(b=> b.onclick = async ()=>{ await refrescarCapaOnline(b.dataset.tr); panelCapas(); });
+  document.querySelectorAll('[data-vc]').forEach(b=> b.onclick = ()=> vincularCapaAURL(b.dataset.vc));
   document.querySelectorAll('[data-tb]').forEach(b=> b.onclick = ()=> tablaAtributos(b.dataset.tb));
   document.querySelectorAll('[data-sm]').forEach(b=> b.onclick = ()=> panelSimbologia(b.dataset.sm));
   document.querySelectorAll('[data-et]').forEach(b=> b.onclick = ()=> panelEtiqueta(b.dataset.et));
