@@ -110,6 +110,63 @@ export default {
         subido_en timestamptz DEFAULT now()
       )`);
       await sql(`CREATE INDEX IF NOT EXISTS fotos_punto_id_idx ON fotos (punto_id)`);
+
+      // Papelera de IDs: si el usuario borra un punto/track desde Neon (o QGIS),
+      // el ID queda acá y ya no se acepta nunca más en un POST (silenciosamente
+      // ignorado). La app también puede consultar /borrados para eliminar
+      // esos datos localmente y no ocupar espacio.
+      await sql(`CREATE TABLE IF NOT EXISTS puntos_borrados (
+        id text PRIMARY KEY, borrado_en timestamptz DEFAULT now())`);
+      await sql(`CREATE TABLE IF NOT EXISTS tracks_borrados (
+        id text PRIMARY KEY, borrado_en timestamptz DEFAULT now())`);
+
+      await sql(`CREATE OR REPLACE FUNCTION _reg_punto_borrado() RETURNS trigger AS $tr$
+        BEGIN INSERT INTO puntos_borrados (id) VALUES (OLD.id) ON CONFLICT DO NOTHING; RETURN OLD; END; $tr$ LANGUAGE plpgsql`);
+      await sql(`CREATE OR REPLACE FUNCTION _reg_track_borrado() RETURNS trigger AS $tr$
+        BEGIN INSERT INTO tracks_borrados (id) VALUES (OLD.id) ON CONFLICT DO NOTHING; RETURN OLD; END; $tr$ LANGUAGE plpgsql`);
+      // También borra fotos huérfanas cuando se borra un punto.
+      await sql(`CREATE OR REPLACE FUNCTION _limpiar_fotos_de_punto() RETURNS trigger AS $tr$
+        BEGIN DELETE FROM fotos WHERE punto_id = OLD.id; RETURN OLD; END; $tr$ LANGUAGE plpgsql`);
+
+      await sql(`DROP TRIGGER IF EXISTS trg_punto_borrado ON puntos`);
+      await sql(`CREATE TRIGGER trg_punto_borrado AFTER DELETE ON puntos
+                 FOR EACH ROW EXECUTE FUNCTION _reg_punto_borrado()`);
+      await sql(`DROP TRIGGER IF EXISTS trg_track_borrado ON tracks`);
+      await sql(`CREATE TRIGGER trg_track_borrado AFTER DELETE ON tracks
+                 FOR EACH ROW EXECUTE FUNCTION _reg_track_borrado()`);
+      await sql(`DROP TRIGGER IF EXISTS trg_punto_fotos ON puntos`);
+      await sql(`CREATE TRIGGER trg_punto_fotos AFTER DELETE ON puntos
+                 FOR EACH ROW EXECUTE FUNCTION _limpiar_fotos_de_punto()`);
+
+      // Función que crea/actualiza una vista por día con los datos: puntos_YYYY_MM_DD
+      // y tracks_YYYY_MM_DD (zona Costa Rica). QGIS las lista como capas separadas.
+      await sql(`CREATE OR REPLACE FUNCTION crear_vistas_por_dia() RETURNS void AS $fn$
+        DECLARE d date; vname text;
+        BEGIN
+          FOR d IN SELECT DISTINCT DATE(fecha AT TIME ZONE 'America/Costa_Rica')
+                   FROM puntos WHERE fecha IS NOT NULL LOOP
+            vname := 'puntos_' || to_char(d, 'YYYY_MM_DD');
+            EXECUTE format(
+              'CREATE OR REPLACE VIEW %I AS SELECT * FROM puntos
+               WHERE DATE(fecha AT TIME ZONE ''America/Costa_Rica'') = %L',
+              vname, d);
+          END LOOP;
+          FOR d IN SELECT DISTINCT DATE(fecha AT TIME ZONE 'America/Costa_Rica')
+                   FROM tracks WHERE fecha IS NOT NULL LOOP
+            vname := 'tracks_' || to_char(d, 'YYYY_MM_DD');
+            EXECUTE format(
+              'CREATE OR REPLACE VIEW %I AS SELECT * FROM tracks
+               WHERE DATE(fecha AT TIME ZONE ''America/Costa_Rica'') = %L',
+              vname, d);
+          END LOOP;
+        END;
+        $fn$ LANGUAGE plpgsql`);
+    }
+
+    // Refresca las vistas por día. Se llama al final de cada POST exitoso
+    // para que la vista del día aparezca sola en QGIS sin intervención.
+    async function refrescarVistasPorDia() {
+      try { await sql(`SELECT crear_vistas_por_dia()`); } catch (e) { /* no bloquea */ }
     }
 
     try {
@@ -117,8 +174,17 @@ export default {
         const body = await request.json();
         const puntos = Array.isArray(body.puntos) ? body.puntos : [];
         await asegurarTablas();
-        let n = 0;
+        // Filtrar IDs que ya fueron borrados: NUNCA se vuelven a aceptar.
+        const ids = puntos.map(p => p.id).filter(Boolean);
+        let borrados = new Set();
+        if (ids.length) {
+          const r = await sql(
+            `SELECT id FROM puntos_borrados WHERE id = ANY($1::text[])`, [ids]);
+          for (const row of (r.rows || r)) borrados.add(row.id);
+        }
+        let n = 0, ignorados = 0;
         for (const p of puntos) {
+          if (borrados.has(p.id)) { ignorados++; continue; }
           await sql(
             `INSERT INTO puntos (id, proy, nombre, detalle, fecha, lat, lon, alt_orto, exac, geom)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9,
@@ -138,15 +204,24 @@ export default {
           );
           n++;
         }
-        return json({ ok: true, recibidos: n });
+        await refrescarVistasPorDia();
+        return json({ ok: true, recibidos: n, ignorados_borrados: ignorados });
       }
 
       if (request.method === 'POST' && url.pathname === '/tracks') {
         const body = await request.json();
         const tracks = Array.isArray(body.tracks) ? body.tracks : [];
         await asegurarTablas();
-        let n = 0;
+        const ids = tracks.map(t => t.id).filter(Boolean);
+        let borrados = new Set();
+        if (ids.length) {
+          const r = await sql(
+            `SELECT id FROM tracks_borrados WHERE id = ANY($1::text[])`, [ids]);
+          for (const row of (r.rows || r)) borrados.add(row.id);
+        }
+        let n = 0, ignorados = 0;
         for (const t of tracks) {
+          if (borrados.has(t.id)) { ignorados++; continue; }
           const gj = t.geojson ? JSON.stringify(t.geojson) : null;
           await sql(
             `INSERT INTO tracks (id, proy, nombre, detalle, fecha, distancia_m, n_puntos, geojson, geom)
@@ -166,7 +241,21 @@ export default {
           );
           n++;
         }
-        return json({ ok: true, recibidos: n });
+        await refrescarVistasPorDia();
+        return json({ ok: true, recibidos: n, ignorados_borrados: ignorados });
+      }
+
+      // Lista de IDs borrados desde la última consulta. La app la usa para
+      // eliminar puntos/tracks localmente y liberar espacio.
+      if (request.method === 'GET' && url.pathname === '/borrados') {
+        await asegurarTablas();
+        const p = await sql(`SELECT id FROM puntos_borrados`);
+        const t = await sql(`SELECT id FROM tracks_borrados`);
+        return json({
+          ok: true,
+          puntos: (p.rows || p).map(r => r.id),
+          tracks: (t.rows || t).map(r => r.id),
+        });
       }
 
       if (request.method === 'POST' && url.pathname === '/fotos') {

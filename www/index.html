@@ -2614,7 +2614,9 @@ async function agregarCapaWFS(nombre, base, typeName){
     let gj;
     try{ gj = JSON.parse(txt); }
     catch(e){ toast('El servidor no devolvió GeoJSON (¿no soporta outputFormat=application/json?).'); return; }
-    await guardarCapaVector(nombre||typeName, gj);
+    // Guarda info para poder refrescar la capa después con un botón.
+    const capa = await guardarCapaVector(nombre||typeName, gj);
+    if(capa){ capa.fuenteTipo='wfs'; capa.fuenteBase=base; capa.fuenteTypeName=typeName; capa.fuenteFecha=Date.now(); await dbPut('capas', capa); }
   }catch(e){ toast('No se pudo descargar el WFS: '+(e.message||e)); }
 }
 
@@ -3353,8 +3355,40 @@ async function agregarCapaURL(nombre, url){
     let gj;
     try{ gj = JSON.parse(bytesATexto(r.bytes)); }
     catch(e){ toast('La URL no devolvió GeoJSON. Si es un servicio WFS/WMS, usá esa opción para escanear capas.'); return; }
-    await guardarCapaVector(nombre || 'Capa', gj);
+    const capa = await guardarCapaVector(nombre || 'Capa', gj);
+    if(capa){ capa.fuenteTipo='url'; capa.fuenteUrl=url; capa.fuenteFecha=Date.now(); await dbPut('capas', capa); }
   }catch(e){ toast('No se pudo cargar: '+(e.message||e)); }
+  finally{ ocultarCargando(); }
+}
+// Refresca una capa online que fue cargada por URL/WFS: vuelve a descargar
+// el GeoJSON del origen y reemplaza el geojson local. Si el servidor no
+// responde, se conserva el buffer actual (no se pierde nada).
+async function refrescarCapaOnline(capaId){
+  const c = S.capas.find(x=>x.id===capaId); if(!c) return;
+  if(!c.fuenteTipo){ toast('Esta capa no tiene origen online (fue cargada de archivo).'); return; }
+  if(c.tipo==='wms'){ toast('Las capas WMS se refrescan solas al mover el mapa.'); return; }
+  if(!navigator.onLine){ toast('Sin internet. Se usa el buffer que ya tenés.'); return; }
+  mostrarCargando('Actualizando "'+c.nombre+'"…');
+  try{
+    let url;
+    if(c.fuenteTipo==='url') url = c.fuenteUrl;
+    else if(c.fuenteTipo==='wfs') url = urlWfsGeoJSON(c.fuenteBase, c.fuenteTypeName);
+    else throw new Error('Origen desconocido');
+    const r = await httpGet(url);
+    if(r.status<200||r.status>=400) throw new Error('HTTP '+r.status);
+    let gj = null; try{ gj = JSON.parse(bytesATexto(r.bytes)); }catch(e){ throw new Error('respuesta no es GeoJSON'); }
+    // Normaliza a FeatureCollection.
+    if(gj.type !== 'FeatureCollection'){
+      gj = { type:'FeatureCollection', features: gj.type==='Feature' ? [gj] : [{type:'Feature',geometry:gj,properties:{}}] };
+    }
+    c.geojson = gj;
+    c.fuenteFecha = Date.now();
+    // Invalidar bboxes cacheadas.
+    for(const f of (gj.features||[])) if(f) f._bbox = null;
+    await dbPut('capas', c);
+    dibujar();
+    toast('"'+c.nombre+'" actualizada: '+((gj.features||[]).length)+' elementos.');
+  }catch(e){ toast('No se pudo actualizar: '+(e.message||e)+'. Se mantiene el buffer.'); }
   finally{ ocultarCargando(); }
 }
 async function agregarCapaWMS(nombre, url, layerName, version){
@@ -3953,9 +3987,52 @@ async function postNube(ruta, body){
   }
   return data;
 }
+// GET del proxy con validación estricta (mismo criterio que postNube).
+async function getNube(ruta){
+  if(!syncCfg.url) throw new Error('Falta la URL del proxy');
+  const base = syncCfg.url.replace(/\/+$/,'');
+  const r = await fetch(base + ruta, {
+    headers:{ 'Authorization':'Bearer '+(syncCfg.token||'') }
+  });
+  const txt = await r.text();
+  let data = {}; try{ data = JSON.parse(txt); }catch(e){}
+  if(!r.ok) throw new Error('HTTP '+r.status);
+  if(data.ok !== true) throw new Error('El proxy no confirmó éxito');
+  return data;
+}
+// Consulta la papelera del servidor y borra localmente los puntos/tracks
+// que ya fueron eliminados en Neon (por el usuario en QGIS o en el SQL Editor).
+// Así no vuelven a subirse y la app libera espacio.
+async function purgarBorradosDesdeNube(){
+  try{
+    const data = await getNube('/borrados');
+    const setP = new Set(data.puntos||[]);
+    const setT = new Set(data.tracks||[]);
+    let np = 0, nt = 0;
+    for(const p of S.puntos.slice()){
+      if(setP.has(p.id)){
+        S.puntos = S.puntos.filter(x=> x.id !== p.id);
+        try{ await dbDel('puntos', p.id); }catch(e){}
+        np++;
+      }
+    }
+    for(const t of (S.tracks||[]).slice()){
+      if(setT.has(t.id)){
+        S.tracks = S.tracks.filter(x=> x.id !== t.id);
+        try{ await dbDel('tracks', t.id); }catch(e){}
+        nt++;
+      }
+    }
+    if(np || nt) dibujar();
+    return { np, nt };
+  }catch(e){ return { np:0, nt:0, error:e.message||String(e) }; }
+}
 async function sincronizarNube(manual){
   if(!syncCfg.url){ if(manual) toast('Configurá la URL del proxy primero.'); return; }
   if(!navigator.onLine){ if(manual) toast('Sin conexión; se subirá cuando haya internet.'); return; }
+  // 1) Purga primero: si algo fue borrado en Neon, sacarlo local ANTES de
+  //    intentar subirlo (el server igual lo ignora, pero así queda limpio).
+  const purga = await purgarBorradosDesdeNube();
   const puntosPend = S.puntos.filter(p=> p.sincronizado!==true);
   const tracksPend = (S.tracks||[]).filter(t=> t.sincronizado!==true);
   // Puntos con fotos aún sin subir (independiente de si el punto ya se sincronizó).
@@ -4477,12 +4554,15 @@ function panelCapas(){
   abrirPanel('Capas del proyecto', `
     ${S.capas.length ? S.capas.map(c=>{
       const nElem = c.tipo==='wms' ? 'WMS' : c.tipo==='big' ? ('Grande · '+c.nFeats+' elem.') : 'Vector · '+((c.geojson&&c.geojson.features||[]).length)+' elem.';
+      const online = !!(c.fuenteTipo || c.tipo==='wms');
+      const fechaFmt = c.fuenteFecha ? ' · desde ' + new Date(c.fuenteFecha).toLocaleDateString('es-CR') : '';
       return `<div class="fila">
-        <div class="cuerpo"><div class="t"><span style="color:${c.color||'#8899AA'}">■</span> ${c.nombre}</div>
-          <div class="s">${nElem} · ${c.consultable===false?'🔒 solo vista':'🔍 consultable'}${c.proyFuente&&c.proyFuente!=='geo'?' · 🌐 '+(c.proyFuente==='crtm05'?'CRTM05':c.proyFuente==='ln'?'Lambert N':'Lambert S'):''}${c.etiqueta?' · 🏷 '+escHtml(c.etiqueta):''}</div></div>
+        <div class="cuerpo"><div class="t"><span style="color:${c.color||'#8899AA'}">■</span> ${c.nombre}${online?' <span style="color:var(--musgo);font-size:10px">☁</span>':''}</div>
+          <div class="s">${nElem} · ${c.consultable===false?'🔒 solo vista':'🔍 consultable'}${c.proyFuente&&c.proyFuente!=='geo'?' · 🌐 '+(c.proyFuente==='crtm05'?'CRTM05':c.proyFuente==='ln'?'Lambert N':'Lambert S'):''}${c.etiqueta?' · 🏷 '+escHtml(c.etiqueta):''}${fechaFmt}</div></div>
         <div style="display:flex;flex-direction:column;gap:4px">
           <button class="mini ${c.visible?'verde':''}" data-tg="${c.id}">${c.visible?'Ver':'off'}</button>
           <button class="mini ${c.consultable===false?'':'verde'}" data-tq="${c.id}">${c.consultable===false?'🔒':'🔍'}</button>
+          ${online&&c.fuenteTipo?`<button class="mini" data-tr="${c.id}" title="Actualizar buffer desde el origen">🔄</button>`:''}
         </div>
         ${c.tipo==='big'?`<div style="display:flex;flex-direction:column;gap:4px">
           <button class="mini" data-se="${c.id}" title="Estilo">🎨</button>
@@ -4512,6 +4592,7 @@ function panelCapas(){
   `);
   document.querySelectorAll('[data-tg]').forEach(b=> b.onclick = ()=> toggleCapa(b.dataset.tg));
   document.querySelectorAll('[data-tq]').forEach(b=> b.onclick = ()=> toggleConsultable(b.dataset.tq));
+  document.querySelectorAll('[data-tr]').forEach(b=> b.onclick = async ()=>{ await refrescarCapaOnline(b.dataset.tr); panelCapas(); });
   document.querySelectorAll('[data-tb]').forEach(b=> b.onclick = ()=> tablaAtributos(b.dataset.tb));
   document.querySelectorAll('[data-sm]').forEach(b=> b.onclick = ()=> panelSimbologia(b.dataset.sm));
   document.querySelectorAll('[data-et]').forEach(b=> b.onclick = ()=> panelEtiqueta(b.dataset.et));
