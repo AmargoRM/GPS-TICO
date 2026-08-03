@@ -114,6 +114,27 @@ label{display:block;font-size:9px;letter-spacing:.14em;text-transform:uppercase;
 #herrBotones{display:flex;gap:6px;margin-top:8px;flex-wrap:wrap}
 #herrBotones button{background:var(--cauce);border:none;color:var(--niebla);border-radius:6px;padding:7px 10px;font-size:12px;font-family:var(--ui)}
 #herrBotones button.pri{background:var(--fix);color:var(--abismo);font-weight:600}
+/* --- Menú radial (long-press) --- */
+#menuAccion{position:fixed;z-index:14;display:none;pointer-events:none}
+#menuAccion.on{display:block;pointer-events:auto}
+.mAcSector{position:absolute;background:rgba(18,32,35,.96);border:2px solid var(--fix);color:var(--niebla);font-family:var(--ui);font-weight:600;font-size:12px;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;cursor:pointer;backdrop-filter:blur(4px);box-shadow:0 4px 14px rgba(0,0,0,.5)}
+.mAcSector .ic{font-size:26px;margin-bottom:3px;line-height:1}
+.mAcSector.izq{border-radius:100px 0 0 100px;padding-right:8px}
+.mAcSector.der{border-radius:0 100px 100px 0;padding-left:8px}
+.mAcSector:active{background:var(--fix);color:var(--abismo)}
+#menuAccionBloq{position:fixed;inset:0;z-index:13;background:transparent;display:none}
+#menuAccion.on ~ #menuAccionBloq, #menuAccionBloq.on{display:block}
+/* --- Tabla lateral de resultados múltiples --- */
+#tablaLat{position:fixed;right:0;top:56px;bottom:56px;width:min(92vw,340px);background:var(--lecho);border-left:2px solid var(--fix);z-index:9;transform:translateX(105%);transition:transform .25s cubic-bezier(.2,.8,.3,1);display:flex;flex-direction:column;box-shadow:-3px 0 14px rgba(0,0,0,.4)}
+#tablaLat.on{transform:translateX(0)}
+#tablaLatHead{padding:10px 12px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid var(--cauce);flex:none;background:var(--alerta);color:var(--abismo);font-weight:700}
+#tablaLatHead h3{margin:0;font-size:13px}
+#tablaLatCerrar{background:none;border:none;color:var(--abismo);font-size:20px;padding:0 4px;font-weight:700}
+#tablaLatCuerpo{overflow-y:auto;flex:1;-webkit-overflow-scrolling:touch;padding:6px 10px 14px}
+.tabRow{padding:9px 8px;border-bottom:1px solid var(--cauce);cursor:pointer}
+.tabRow:hover{background:var(--cauce)}
+.tabRow .tt{font-size:12px;font-weight:600;color:var(--niebla)}
+.tabRow .ss{font-size:10px;color:var(--musgo);font-family:var(--mono);margin-top:2px}
 </style>
 </head>
 <body>
@@ -178,6 +199,15 @@ label{display:block;font-size:9px;letter-spacing:.14em;text-transform:uppercase;
 <div id="panel">
   <div id="panelHead"><div id="panelTitulo"></div><button id="panelCerrar">×</button></div>
   <div id="panelCuerpo"></div>
+</div>
+<div id="menuAccionBloq"></div>
+<div id="menuAccion">
+  <div class="mAcSector izq" id="mAcConsultar" style="width:105px;height:105px;left:-105px;top:-52px"><div class="ic">🔍</div><div>Consultar<br>(30 m)</div></div>
+  <div class="mAcSector der" id="mAcChincheta" style="width:105px;height:105px;left:0;top:-52px"><div class="ic">📍</div><div>Chincheta</div></div>
+</div>
+<div id="tablaLat">
+  <div id="tablaLatHead"><h3>Elementos consultados</h3><button id="tablaLatCerrar">×</button></div>
+  <div id="tablaLatCuerpo"></div>
 </div>
 <div id="cargando"><div class="caja"><div class="spin"></div><div id="cargandoTxt">Cargando…</div></div></div>
 
@@ -561,6 +591,8 @@ function bboxGeom(g){
   else if(g.coordinates) rec(g.coordinates);
   return a;
 }
+// ID de capa resaltada en amarillo (usada mientras la tabla lateral está abierta).
+let capaResaltada = null;
 // Calcula el color de un feature según simbología o color por defecto de capa.
 function colorDeFeature(capa, f){
   const sim = capa.simbologia;
@@ -593,6 +625,9 @@ function dibujarCapasVector(aPant, vista){
     const estBase = estiloCapa(capa);
     const etiq = capa.etiqueta || null;   // campo a rotular, si el usuario lo activó
     const rotulos = [];
+    // Si esta capa está resaltada (tabla lateral abierta), se pinta con
+    // grosor extra y color amarillo por encima para llamar la atención.
+    const esRes = (capaResaltada === capa.id);
     for(const f of feats){
       if(!f || !f.geometry) continue;
       if(featureOculto(capa, f)) continue;
@@ -602,6 +637,11 @@ function dibujarCapasVector(aPant, vista){
       if(vista && (b[2]<vista.oLon || b[0]>vista.eLon || b[3]<vista.sLat || b[1]>vista.nLat)) continue;
       const est = {...estBase, color: colorDeFeature(capa, f)};
       dibujarGeom(f.geometry, aPant, est);
+      if(esRes){
+        // Halo amarillo por encima para señalar la capa activa en la tabla.
+        const halo = { ...estBase, color:'#F2C94C', grosor:(estBase.grosor||2)+3, tam:(estBase.tam||5)+3, fillAlpha:0 };
+        dibujarGeom(f.geometry, aPant, halo);
+      }
       // Preparar etiqueta (se dibuja después, encima de todas las geometrías).
       // Se guarda [x_ancla, y_ancla, texto, esPunto] — la colocación real
       // (al lado del punto, sin tapar el símbolo) se resuelve en el bucle final.
@@ -891,14 +931,13 @@ cv.addEventListener('pointerdown', e=>{
   if(toques.size===1) tapInicio = {x:e.clientX, y:e.clientY, t:Date.now()};
   else tapInicio = null;
   if(toques.size===2){ const [a,b]=[...toques.values()]; ultDist = Math.hypot(a.x-b.x, a.y-b.y); }
-  // Clic sostenido (600 ms) con un solo dedo = poner chincheta.
+  // Clic sostenido (600 ms) con un solo dedo = abrir menú radial (Consultar/Chincheta).
   cancelarLongPress();
   if(toques.size===1){
     const dx0 = e.clientX, dy0 = e.clientY;
     lpTimer = setTimeout(()=>{
       lpTimer = null;
-      const r = cv.getBoundingClientRect();
-      ponerChincheta(dx0 - r.left, dy0 - r.top);
+      abrirMenuAccion(dx0, dy0);
     }, 600);
   }
   // Si el usuario explora el mapa, ocultar "buscando GPS" y no robarle el encuadre luego.
@@ -1101,7 +1140,18 @@ async function arrancarGPS(){
   await aplicarFuente();
   // Importar lo que haya grabado el widget en segundo plano.
   await importarPendientesWidget();
-  document.addEventListener('visibilitychange', ()=>{ if(!document.hidden){ importarPendientesWidget(); consumirArchivoAbierto(); } });
+  document.addEventListener('visibilitychange', ()=>{
+    if(!document.hidden){ importarPendientesWidget(); consumirArchivoAbierto(); }
+    else {
+      // La app se minimiza / pantalla se apaga: flush inmediato del track en curso
+      // para no perder datos si el sistema mata el WebView.
+      if(S.grabando){ try{ dbPut('tracks', JSON.parse(JSON.stringify(S.grabando))); }catch(e){} }
+    }
+  });
+  // Además, un guardado periódico cada 20 s siempre que estemos grabando.
+  setInterval(()=>{
+    if(S.grabando){ try{ dbPut('tracks', JSON.parse(JSON.stringify(S.grabando))); }catch(e){} }
+  }, 20000);
   // Archivo con el que se abrió la app (GeoJSON/GPX).
   if(P){ await P.addListener('fileOpened', (ev)=> abrirArchivoImportado(ev)); }
   await consumirArchivoAbierto();
@@ -1413,7 +1463,9 @@ function grabarPunto(pos){
   S.grabando.geojson.geometry.coordinates.push([pt.lon, pt.lat]);
   S.grabando.geojson.properties = { nom: S.grabando.nom, dist: S.grabando.dist, puntos: pts.length };
   document.getElementById('mRec').textContent = S.grabando.dist.toFixed(0);
-  if(pts.length % 10 === 0) dbPut('tracks', JSON.parse(JSON.stringify(S.grabando)));
+  // Guardar cada 3 puntos (antes 10). Trabajo de campo: si la app se mata,
+  // se pierde menos.
+  if(pts.length % 3 === 0) dbPut('tracks', JSON.parse(JSON.stringify(S.grabando)));
   // Actualizar la notificación del servicio cada 5 puntos.
   if(pts.length % 5 === 0){
     const P = pluginGnss();
@@ -1428,6 +1480,7 @@ async function alternarTrack(){
   const b = document.getElementById('btnTrack');
   if(S.grabando){
     await dbPut('tracks', JSON.parse(JSON.stringify(S.grabando)));
+    await dbDel('conf','trackEnCurso');
     const rech = S.grabando.rechazados||0;
     toast(`Track guardado · ${S.grabando.pts.length} puntos · ${S.grabando.dist.toFixed(0)} m` + (rech?` · ${rech} filtrados`:''));
     S.grabando = null;
@@ -1449,6 +1502,9 @@ async function alternarTrack(){
       aceptados:0, rechazados:0,
       filtroConfig: (S.filtros && S.filtros.activo) ? JSON.parse(JSON.stringify(S.filtros)) : null,
       geojson:{type:'Feature',geometry:{type:'LineString',coordinates:[]},properties:{}} };
+    // Marcar el track como "en curso" para poder recuperarlo si la app se mata.
+    await dbPut('tracks', JSON.parse(JSON.stringify(S.grabando)));
+    await dbPut('conf', S.grabando.id, 'trackEnCurso');
     b.dataset.on = '1'; b.textContent = 'Detener';
     await mantenerPantalla();
     await iniciarServicioTrack();
@@ -3397,6 +3453,125 @@ function ponerChincheta(px, py){
   if(navigator.vibrate){ try{ navigator.vibrate(35); }catch(e){} }
   pedirDibujo(); panelChincheta();
 }
+/* --- Menú radial al mantener presionado (Consultar / Chincheta) --- */
+let ultimoMenuXY = null;   // {x,y} en coords de cliente para reusar en la consulta
+let consultaRadioM = 30;   // radio en metros para "Consultar aquí" (editable en el panel)
+function abrirMenuAccion(clientX, clientY){
+  if(navigator.vibrate){ try{ navigator.vibrate(20); }catch(e){} }
+  ultimoMenuXY = { x: clientX, y: clientY };
+  const m = document.getElementById('menuAccion');
+  const b = document.getElementById('menuAccionBloq');
+  m.style.left = clientX + 'px';
+  m.style.top = clientY + 'px';
+  m.classList.add('on');
+  b.classList.add('on');
+  const cerrar = ()=>{ m.classList.remove('on'); b.classList.remove('on'); b.onclick = null; };
+  b.onclick = cerrar;
+  document.getElementById('mAcConsultar').onclick = (e)=>{
+    e.stopPropagation();
+    cerrar();
+    const r = cv.getBoundingClientRect();
+    consultarPorRadio(clientX - r.left, clientY - r.top, consultaRadioM);
+  };
+  document.getElementById('mAcChincheta').onclick = (e)=>{
+    e.stopPropagation();
+    cerrar();
+    const r = cv.getBoundingClientRect();
+    ponerChincheta(clientX - r.left, clientY - r.top);
+  };
+}
+/* --- Consulta por radio en metros: busca TODOS los features en un círculo --- */
+function metrosAPixeles(lat, metros){
+  // Un grado de latitud ≈ 111.32 km en el WGS84. Convertimos metros a grados y
+  // luego a píxeles usando la escala del último dibujo (ultimoT).
+  const gLat = metros / 111320;
+  if(!ultimoT) return 30;
+  const p1 = latlonAPantalla(lat, 0);
+  const p2 = latlonAPantalla(lat + gLat, 0);
+  if(!p1 || !p2) return 30;
+  return Math.abs(p2.y - p1.y);
+}
+function consultarPorRadio(px, py, radioM){
+  const ll = pantallaALatLon(px, py); if(!ll) return;
+  const radioPx = Math.max(30, metrosAPixeles(ll.lat, radioM));
+  // Margen en grados para el filtro previo por bbox.
+  const p1 = pantallaALatLon(px - radioPx, py - radioPx);
+  const p2 = pantallaALatLon(px + radioPx, py + radioPx);
+  const loMar = p1&&p2 ? Math.abs(p2.lon-p1.lon) : 0.01;
+  const laMar = p1&&p2 ? Math.abs(p1.lat-p2.lat) : 0.01;
+  // Recolectar todos los features que caen dentro del radio.
+  const encontrados = [];   // {capa, feature, dist}
+  for(let i=S.capas.length-1;i>=0;i--){
+    const c = S.capas[i];
+    if(!c.visible || c.tipo==='wms' || c.consultable===false || !c.geojson) continue;
+    const feats = c.geojson.type==='FeatureCollection' ? (c.geojson.features||[]) : c.geojson.type==='Feature' ? [c.geojson] : [];
+    for(const f of feats){
+      if(!f || !f.geometry) continue;
+      if(featureOculto(c, f)) continue;
+      if(!f._bbox){ try{ f._bbox = bboxGeom(f.geometry); }catch(e){ continue; } }
+      const b = f._bbox;
+      if(!b || b[2]<ll.lon-loMar || b[0]>ll.lon+loMar || b[3]<ll.lat-laMar || b[1]>ll.lat+laMar) continue;
+      let d = Infinity;
+      try{ d = distGeomPx(f.geometry, px, py, ll); }catch(e){}
+      if(d <= radioPx) encontrados.push({ capa:c, feature:f, dist:d });
+    }
+  }
+  encontrados.sort((a,b)=> a.dist - b.dist);
+  if(encontrados.length === 0){
+    // Consulta WMS como respaldo si hay capas WMS visibles y consultables.
+    for(let i=S.capas.length-1;i>=0;i--){
+      const c = S.capas[i];
+      if(!c.visible || c.tipo!=='wms' || c.consultable===false) continue;
+      consultarWMS(c, px, py); return;
+    }
+    toast('No hay elementos consultables en un radio de '+radioM+' m.');
+    return;
+  }
+  if(encontrados.length === 1){
+    mostrarAtributos(encontrados[0].capa, [encontrados[0].feature]);
+    return;
+  }
+  mostrarTablaLateral(encontrados);
+}
+/* --- Tabla lateral para listado de múltiples elementos consultados --- */
+function cerrarTablaLateral(){
+  const p = document.getElementById('tablaLat'); if(p) p.classList.remove('on');
+  capaResaltada = null; pedirDibujo();
+}
+function mostrarTablaLateral(encontrados){
+  // Marcar la capa que domina el resultado (la de más features) para resaltarla.
+  const conteo = {};
+  encontrados.forEach(x=>{ conteo[x.capa.id] = (conteo[x.capa.id]||0)+1; });
+  const capaTop = Object.entries(conteo).sort((a,b)=>b[1]-a[1])[0];
+  capaResaltada = capaTop ? capaTop[0] : null;
+  const capasList = Object.keys(conteo).map(id=> S.capas.find(c=>c.id===id)).filter(Boolean);
+  const nombresCapas = capasList.map(c=> c.nombre).join(' + ');
+  const cuerpo = encontrados.slice(0, 200).map((x, i)=>{
+    const props = x.feature.properties || {};
+    // Elegir 2 campos representativos para mostrar en la fila (nombre/id primero si existen).
+    const keys = Object.keys(props);
+    const prefer = ['nombre','name','id','tipo','clase','categoria','codigo'];
+    const ordenados = [...prefer.filter(k=> keys.includes(k)), ...keys.filter(k=> !prefer.includes(k))];
+    const k1 = ordenados[0], k2 = ordenados[1];
+    const titulo = k1 ? escHtml(String(props[k1]).slice(0,50)) : ('Elemento '+(i+1));
+    const sub = k2 ? `${escHtml(k2)}: ${escHtml(String(props[k2]).slice(0,60))}` : `${x.capa.nombre} · ${x.dist.toFixed(0)} px`;
+    return `<div class="tabRow" data-idx="${i}"><div class="tt">${titulo}</div><div class="ss">${sub}</div></div>`;
+  }).join('');
+  const p = document.getElementById('tablaLat');
+  p.querySelector('#tablaLatHead h3').textContent = `${encontrados.length} elementos · ${nombresCapas}`;
+  p.querySelector('#tablaLatCuerpo').innerHTML = `
+    <div class="nota" style="border-color:var(--alerta);color:var(--alerta)">La capa con más resultados se resalta en amarillo en el mapa.</div>
+    ${cuerpo}
+    ${encontrados.length>200?'<div class="nota">Mostrando 200 primeros.</div>':''}`;
+  p.classList.add('on');
+  document.getElementById('tablaLatCerrar').onclick = cerrarTablaLateral;
+  p.querySelectorAll('[data-idx]').forEach(r=> r.onclick = ()=>{
+    const idx = parseInt(r.dataset.idx,10);
+    const e = encontrados[idx]; if(!e) return;
+    mostrarAtributos(e.capa, [e.feature]);
+  });
+  pedirDibujo();
+}
 function panelChincheta(){
   if(!chincheta) return;
   const f = fmtCoord(chincheta.lat, chincheta.lon, S.modo);
@@ -4094,6 +4269,24 @@ function exportarDiagCSV(){
   document.getElementById('coordSys').textContent = PROY[S.modo].nom;
   const pa = await dbGet('conf','proyActivo');
   if(pa && await dbGet('proyectos', pa)) await cargarProyecto(pa);
+  // Recuperar track en progreso si la app se cerró/mató mientras grababa.
+  try{
+    const grabId = await dbGet('conf','trackEnCurso');
+    if(grabId){
+      const t = await dbGet('tracks', grabId);
+      if(t && t.pts && t.pts.length){
+        S.grabando = t;
+        const b = document.getElementById('btnTrack');
+        if(b){ b.dataset.on='1'; b.textContent='Detener'; }
+        toast(`Track recuperado: ${t.pts.length} puntos · ${t.dist.toFixed(0)} m`);
+        // Reactivar servicio de grabación en segundo plano.
+        try{ await mantenerPantalla(); }catch(e){}
+        try{ await iniciarServicioTrack(); }catch(e){}
+      } else {
+        await dbDel('conf','trackEnCurso');
+      }
+    }
+  }catch(e){ console.log('No pude recuperar track en curso:', e); }
   if(navigator.storage && navigator.storage.persist) navigator.storage.persist();
   // Mostrar "buscando GPS" hasta el primer fix.
   document.getElementById('cargaGps').classList.add('on');
