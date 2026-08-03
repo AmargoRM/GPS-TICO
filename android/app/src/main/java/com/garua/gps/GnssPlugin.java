@@ -59,6 +59,49 @@ public class GnssPlugin extends Plugin {
         call.resolve(o);
     }
 
+    // Descarga un APK (misma firma) a la caché y lanza el instalador del sistema.
+    // Permite que la app se actualice sola desde GitHub Releases sin pasar por
+    // Play. Requiere el permiso REQUEST_INSTALL_PACKAGES y usa el FileProvider ya
+    // configurado (cache-path "." cubre getCacheDir()).
+    @PluginMethod
+    public void instalarApkDesde(final PluginCall call) {
+        final String url = call.getString("url");
+        if (url == null || url.isEmpty()) { call.reject("URL vacía"); return; }
+        new Thread(new Runnable() {
+            @Override public void run() {
+                java.net.HttpURLConnection conn = null;
+                try {
+                    conn = (java.net.HttpURLConnection) new java.net.URL(url).openConnection();
+                    conn.setConnectTimeout(15000);
+                    conn.setReadTimeout(120000);
+                    conn.setInstanceFollowRedirects(true);
+                    conn.setRequestProperty("User-Agent", "GPS-TICO/1.0");
+                    int code = conn.getResponseCode();
+                    if (code < 200 || code >= 400) { call.reject("HTTP " + code); return; }
+                    java.io.File dir = new java.io.File(getContext().getCacheDir(), "updates");
+                    dir.mkdirs();
+                    java.io.File apk = new java.io.File(dir, "gps-tico-update.apk");
+                    java.io.InputStream is = conn.getInputStream();
+                    java.io.FileOutputStream fos = new java.io.FileOutputStream(apk);
+                    byte[] buf = new byte[8192]; int n;
+                    while ((n = is.read(buf)) > 0) fos.write(buf, 0, n);
+                    fos.close(); is.close();
+                    android.net.Uri uri = androidx.core.content.FileProvider.getUriForFile(
+                        getContext(), getContext().getPackageName() + ".fileprovider", apk);
+                    Intent i = new Intent(Intent.ACTION_VIEW);
+                    i.setDataAndType(uri, "application/vnd.android.package-archive");
+                    i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                    getContext().startActivity(i);
+                    call.resolve(new JSObject().put("ok", true));
+                } catch (Exception e) {
+                    call.reject("No se pudo instalar: " + e.getMessage());
+                } finally {
+                    if (conn != null) conn.disconnect();
+                }
+            }
+        }).start();
+    }
+
     // Abre una app externa (Waze, Maps, navegador) con una URL/intent.
     @PluginMethod
     public void abrirExterno(PluginCall call) {

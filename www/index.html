@@ -214,6 +214,10 @@ label{display:block;font-size:9px;letter-spacing:.14em;text-transform:uppercase;
 <script>
 "use strict";
 
+// Número de build (lo estampa el CI al compilar). En desarrollo local queda 0.
+const APP_BUILD = parseInt("__BUILD__", 10) || 0;
+const UPDATE_BASE = "https://github.com/AmargoRM/GPS-TICO/releases/download/apk-release";
+
 /* =======================================================================
    1. GEODESIA
    Implementado a mano, sin librerías externas, para que funcione
@@ -422,6 +426,8 @@ const dbPut   = (s,v,k)=> pedir(tx(s,'readwrite').put(v,k));
 const dbDel   = (s,k)=> pedir(tx(s,'readwrite').delete(k));
 const porIndice = (s,i,v)=> pedir(tx(s).index(i).getAll(v));
 const nid = ()=> Date.now().toString(36) + Math.random().toString(36).slice(2,7);
+// Centra el mapa en una coordenada (usable desde cualquier panel).
+function volarA(lat, lon){ S.centro.lat=lat; S.centro.lon=lon; S.zoom=Math.max(S.zoom,17); S.seguir=false; cerrarPanel(); dibujar(); }
 
 // Conversión a GeoJSON
 function puntoAFeature(p){
@@ -1251,6 +1257,7 @@ let ultimoGuardadoCentro = 0;
 function alFix(pos){
   S.fix = pos;
   const c = pos.coords;
+  try{ chequearAlertas(pos); }catch(e){}
   // Primer fix: quitar la pantalla de "buscando GPS" y centrar el mapa ahí.
   if(!primerFix){
     primerFix = true;
@@ -1413,8 +1420,13 @@ async function finalizarOcupacion(){
     vexac:null, fuente:S.fuente,
     promediado:true, muestras:r.n, desvStd:r.stdM, stdLat:r.stdLat, stdLon:r.stdLon,
     hdopMedio:r.hdopMean, cn0Medio:r.cn0Mean, duracion:ocupacion.dur,
+    tipo: ocuDatos&&ocuDatos.tipo || null,
+    datos: ocuDatos&&ocuDatos.datos || null,
+    fotos: ocuDatos&&ocuDatos.fotos&&ocuDatos.fotos.length ? ocuDatos.fotos : null,
+    sincronizado: false,
     t:Date.now()
   };
+  ocuDatos = null;
   await dbPut('puntos', p);
   S.puntos.push(p);
   const nMuestras = r.n;
@@ -1647,6 +1659,10 @@ document.getElementById('btnWp').onclick = ()=>{
     <div class="res"><div class="k">Fuente</div><div class="v">${srcTxt}${fx.mock?'  ·  ⚠ MOCK':''}</div></div>
     <label>Nombre</label><input id="wpNom" value="P${String(n).padStart(3,'0')}">
     <label>Descripción</label><textarea id="wpDesc" rows="2" placeholder="Naciente, punto de aforo, testigo..."></textarea>
+    ${htmlCamposPlantilla()}
+    <label>Fotos del punto</label>
+    <input type="file" id="wpFotos" accept="image/*" capture="environment" multiple>
+    <div id="wpFotosPrev" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:6px"></div>
     <button class="ancho" id="wpOk">Guardar ahora (instantáneo)</button>
     <label>Promediar (ocupación estática)</label>
     <select id="wpDur"><option value="30">30 segundos</option><option value="60" selected>60 segundos</option><option value="120">2 minutos</option><option value="300">5 minutos</option></select>
@@ -1659,16 +1675,35 @@ document.getElementById('btnWp').onclick = ()=>{
     altElip: fx.altElip!=null?fx.altElip:null, altOrto: fx.altOrto!=null?fx.altOrto:null,
     altOrtoFuente: fx.altOrtoFuente||null, geoide: fx.geoide!=null?fx.geoide:null
   });
+  // Vista previa de las fotos del punto a medida que se seleccionan.
+  const fotosPunto = [];
+  const inpF = document.getElementById('wpFotos');
+  if(inpF) inpF.onchange = async ()=>{
+    for(const file of inpF.files){ try{ fotosPunto.push(await comprimirImagen(file)); }catch(e){} }
+    inpF.value = '';
+    document.getElementById('wpFotosPrev').innerHTML = fotosPunto.map((s,i)=>`<img src="${s}" data-rmf="${i}" style="width:64px;height:64px;object-fit:cover;border-radius:6px;border:1px solid var(--cauce)">`).join('');
+    document.querySelectorAll('[data-rmf]').forEach(im=> im.onclick = ()=>{ fotosPunto.splice(parseInt(im.dataset.rmf,10),1); inpF.onchange(); });
+  };
   document.getElementById('wpOk').onclick = async ()=>{
+    const dp = await recolectarDatosPlantilla();
+    if(dp===null) return;   // faltó un campo obligatorio
+    const fotos = fotosPunto.concat(dp.fotos);
     const p = Object.assign({ id:nid(), proy:S.proy.id,
       nom: document.getElementById('wpNom').value.trim() || `P${n}`,
       desc: document.getElementById('wpDesc').value.trim(),
+      tipo: plantillaActiva || null,
+      datos: Object.keys(dp.datos).length ? dp.datos : null,
+      fotos: fotos.length ? fotos : null,
+      sincronizado: false,
       promediado:false, t:Date.now() }, construirPunto());
     await dbPut('puntos', p);
     S.puntos.push(p); cerrarPanel(); dibujar();
-    toast('Punto guardado.');
+    toast('Punto guardado' + (fotos.length?' · '+fotos.length+' foto(s)':'') + '.');
   };
-  document.getElementById('wpProm').onclick = ()=>{
+  document.getElementById('wpProm').onclick = async ()=>{
+    const dp = await recolectarDatosPlantilla();
+    if(dp===null) return;
+    ocuDatos = { datos: Object.keys(dp.datos).length?dp.datos:null, fotos: fotosPunto.concat(dp.fotos), tipo: plantillaActiva||null };
     const nom = document.getElementById('wpNom').value.trim() || `P${n}`;
     const desc = document.getElementById('wpDesc').value.trim();
     const dur = parseInt(document.getElementById('wpDur').value, 10) || 60;
@@ -1678,6 +1713,7 @@ document.getElementById('btnWp').onclick = ()=>{
     iniciarOcupacion(nom, desc, dur);
   };
 };
+let ocuDatos = null;   // datos/fotos de plantilla a adjuntar al punto promediado
 
 /* --- grabar track --- */
 document.getElementById('btnTrack').onclick = alternarTrack;
@@ -1690,12 +1726,18 @@ document.getElementById('btnMenu').onclick = ()=>{
     <div class="fila"><div class="cuerpo"><div class="t">Filtros de calidad</div><div class="s">${S.filtros.activo?'Activo · '+S.filtros.preset:'Apagado'}</div></div><button class="mini" id="mFilt">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Capas del proyecto</div><div class="s">${S.capas.length} capa(s) · GeoJSON · KML · SHP · WFS · WMS</div></div><button class="mini" id="mCapas">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Puntos y tracks</div><div class="s">${S.puntos.length} puntos · ${S.tracks.length} tracks</div></div><button class="mini" id="mDatos">Ver</button></div>
+    <div class="fila"><div class="cuerpo"><div class="t">Plantillas de captura</div><div class="s">${plantillas.length} plantilla(s) · ${plantillaActiva?'activa: '+escHtml((plantillas.find(t=>t.id===plantillaActiva)||{}).nombre||''):'ninguna activa'}</div></div><button class="mini" id="mPlant">Abrir</button></div>
+    <div class="fila"><div class="cuerpo"><div class="t">Alertas de proximidad</div><div class="s">${alertas.filter(a=>a.activa).length} activa(s) de ${alertas.length}</div></div><button class="mini" id="mAlert">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Convertir coordenadas</div><div class="s">Geo ↔ CRTM05 ↔ Lambert N/S</div></div><button class="mini" id="mConv">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Mapa sin conexión</div><div class="s">Zonas y parches descargables</div></div><button class="mini" id="mOff">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Exportar proyecto</div><div class="s">GPX · CSV · GeoJSON</div></div><button class="mini" id="mExp">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Exportar mapa</div><div class="s">PDF georreferenciado · PNG · grilla CRTM05</div></div><button class="mini" id="mExpMapa">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Precisión y advertencias</div><div class="s">Leer antes de usar en expedientes</div></div><button class="mini" id="mInfo">Abrir</button></div>
+    <div class="fila"><div class="cuerpo"><div class="t">Actualizar app</div><div class="s">Build actual: ${APP_BUILD||'dev'} · buscar versión nueva</div></div><button class="mini" id="mUpd">Buscar</button></div>
   `);
+  document.getElementById('mPlant').onclick = panelPlantillas;
+  document.getElementById('mAlert').onclick = panelAlertas;
+  document.getElementById('mUpd').onclick = ()=> buscarActualizacion(true);
   document.getElementById('mFuente').onclick = panelFuente;
   document.getElementById('mDiag').onclick  = panelDiagnosticos;
   document.getElementById('mFilt').onclick  = panelFiltros;
@@ -3754,7 +3796,240 @@ function mostrarPunto(p){
     ['Tipo', p.promediado?('promediado · '+(p.muestras||'?')+' muestras · σ'+(p.desvStd!=null?p.desvStd.toFixed(2):'?')+'m'):'instantáneo'],
     ['Fecha', new Date(p.t).toLocaleString('es-CR')]
   ];
-  abrirPanel('Punto · '+p.nom, rows.map(([k,v])=>`<div class="res"><div class="k">${escHtml(k)}</div><div class="v" style="font-size:12px;word-break:break-word">${escHtml(v)}</div></div>`).join(''));
+  // Datos de plantilla, si el punto los tiene.
+  if(p.datos && Object.keys(p.datos).length){
+    for(const [k,v] of Object.entries(p.datos)) rows.push([k, v==null?'':String(v)]);
+  }
+  let html = rows.map(([k,v])=>`<div class="res"><div class="k">${escHtml(k)}</div><div class="v" style="font-size:12px;word-break:break-word">${escHtml(v)}</div></div>`).join('');
+  // Fotos georreferenciadas.
+  if(p.fotos && p.fotos.length){
+    html += `<label>Fotos (${p.fotos.length})</label><div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:6px">` +
+      p.fotos.map((src,i)=>`<img src="${src}" data-foto="${i}" style="width:88px;height:88px;object-fit:cover;border-radius:8px;border:1px solid var(--cauce)">`).join('') + `</div>`;
+  }
+  abrirPanel('Punto · '+p.nom, html);
+  document.querySelectorAll('[data-foto]').forEach(im=> im.onclick = ()=>{
+    // Ver la foto a pantalla completa (overlay simple).
+    const ov = document.createElement('div');
+    ov.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.92);z-index:30;display:flex;align-items:center;justify-content:center';
+    ov.innerHTML = `<img src="${p.fotos[im.dataset.foto]}" style="max-width:96vw;max-height:92vh;object-fit:contain">`;
+    ov.onclick = ()=> ov.remove();
+    document.body.appendChild(ov);
+  });
+}
+
+/* =======================================================================
+   AUTO-ACTUALIZACIÓN desde GitHub Releases (solo APK sideloaded)
+   ======================================================================= */
+async function buscarActualizacion(manual){
+  const P = pluginGnss();
+  try{
+    // version.json trae {build:N}. Se compara con APP_BUILD horneado al compilar.
+    const r = await httpGet(UPDATE_BASE + '/version.json?ts=' + Date.now());
+    if(!r || r.status<200 || r.status>=400){ if(manual) toast('No pude consultar actualizaciones.'); return; }
+    const info = JSON.parse(bytesATexto(r.bytes));
+    const remoto = parseInt(info.build,10) || 0;
+    if(APP_BUILD===0){ if(manual) toast('Versión de desarrollo (sin número de build).'); return; }
+    if(remoto <= APP_BUILD){ if(manual) toast('Ya tenés la última versión (build '+APP_BUILD+').'); return; }
+    // Hay versión nueva.
+    abrirPanel('Actualización disponible', `
+      <div class="res"><div class="k">Instalada</div><div class="v">build ${APP_BUILD}</div></div>
+      <div class="res"><div class="k">Nueva</div><div class="v">build ${remoto}${info.fecha?' · '+escHtml(info.fecha.slice(0,10)):''}</div></div>
+      <div class="nota">Se descarga el APK firmado con la misma llave y se instala encima. <b>No se pierden proyectos.</b></div>
+      <button class="ancho" id="upOk">Descargar e instalar</button>
+      <button class="ancho borde" id="upNo">Ahora no</button>`);
+    document.getElementById('upNo').onclick = cerrarPanel;
+    document.getElementById('upOk').onclick = async ()=>{
+      const apkUrl = UPDATE_BASE + '/' + (info.apk || 'gps-tico.apk');
+      if(P && P.instalarApkDesde){
+        mostrarCargando('Descargando actualización…');
+        try{ await P.instalarApkDesde({ url: apkUrl }); toast('Seguí las instrucciones para instalar.'); }
+        catch(e){ toast('No se pudo instalar: '+(e.message||e)); }
+        finally{ ocultarCargando(); }
+      } else if(P && P.abrirExterno){
+        // Respaldo: abrir la descarga en el navegador.
+        await P.abrirExterno({ url: apkUrl });
+      } else {
+        window.open(apkUrl, '_system');
+      }
+    };
+  }catch(e){ if(manual) toast('Error buscando actualización.'); }
+}
+
+/* =======================================================================
+   PLANTILLAS DE CAPTURA (formularios por tipo de elemento)
+   ======================================================================= */
+let plantillas = [];   // [{id, nombre, campos:[{clave,tipo,req,opciones}]}]
+let plantillaActiva = null;   // id de la plantilla que se aplica al marcar punto
+async function cargarPlantillas(){
+  try{ plantillas = await dbGet('conf','plantillas') || []; }catch(e){ plantillas = []; }
+  try{ plantillaActiva = await dbGet('conf','plantillaActiva') || null; }catch(e){}
+}
+async function guardarPlantillas(){ await dbPut('conf', plantillas, 'plantillas'); }
+function panelPlantillas(){
+  abrirPanel('Plantillas de captura', `
+    <div class="nota">Definí campos para llenar al marcar un punto (ej. inspección de poste: estado, material, foto). La plantilla activa se aplica automáticamente al marcar.</div>
+    <label>Plantilla activa al marcar</label>
+    <select id="plActiva">
+      <option value="">— Ninguna (solo nombre/descripción) —</option>
+      ${plantillas.map(t=>`<option value="${t.id}" ${t.id===plantillaActiva?'selected':''}>${escHtml(t.nombre)}</option>`).join('')}
+    </select>
+    <div id="plLista" style="margin-top:12px"></div>
+    <button class="ancho" id="plNueva">+ Nueva plantilla</button>
+  `);
+  document.getElementById('plActiva').onchange = async e=>{ plantillaActiva = e.target.value || null; await dbPut('conf', plantillaActiva, 'plantillaActiva'); };
+  const pintar = ()=>{
+    document.getElementById('plLista').innerHTML = plantillas.length ? plantillas.map(t=>`
+      <div class="fila"><div class="cuerpo"><div class="t">${escHtml(t.nombre)}</div><div class="s">${t.campos.length} campo(s)</div></div>
+      <button class="mini" data-pled="${t.id}">Editar</button>
+      <button class="mini rojo" data-pldel="${t.id}">×</button></div>`).join('') : '<div class="vacio">Sin plantillas todavía.</div>';
+    document.querySelectorAll('[data-pled]').forEach(b=> b.onclick = ()=> editarPlantilla(b.dataset.pled));
+    document.querySelectorAll('[data-pldel]').forEach(b=> b.onclick = async ()=>{ plantillas = plantillas.filter(x=>x.id!==b.dataset.pldel); await guardarPlantillas(); panelPlantillas(); });
+  };
+  pintar();
+  document.getElementById('plNueva').onclick = ()=>{
+    const t = { id:nid(), nombre:'Nueva plantilla', campos:[] };
+    plantillas.push(t); editarPlantilla(t.id);
+  };
+}
+function editarPlantilla(id){
+  const t = plantillas.find(x=>x.id===id); if(!t) return;
+  const tipos = [['text','Texto'],['number','Número'],['select','Lista'],['foto','Foto']];
+  abrirPanel('Editar plantilla', `
+    <label>Nombre de la plantilla</label>
+    <input id="ptNom" value="${escHtml(t.nombre)}">
+    <label>Campos</label>
+    <div id="ptCampos"></div>
+    <button class="ancho borde" id="ptAdd">+ Agregar campo</button>
+    <button class="ancho" id="ptGuardar">Guardar plantilla</button>
+  `);
+  document.getElementById('ptNom').oninput = e=> t.nombre = e.target.value;
+  const pintar = ()=>{
+    document.getElementById('ptCampos').innerHTML = t.campos.map((c,i)=>`
+      <div class="res" style="margin-top:8px">
+        <input placeholder="Nombre del campo" value="${escHtml(c.clave||'')}" data-pc="${i}" style="margin:0">
+        <div class="grid2" style="margin-top:6px">
+          <select data-pt="${i}">${tipos.map(([v,n])=>`<option value="${v}" ${c.tipo===v?'selected':''}>${n}</option>`).join('')}</select>
+          <label style="display:flex;align-items:center;gap:6px;margin:0;text-transform:none;letter-spacing:0;font-size:12px"><input type="checkbox" data-pr="${i}" ${c.req?'checked':''} style="width:auto;margin:0"> Obligatorio</label>
+        </div>
+        ${c.tipo==='select'?`<input placeholder="Opciones separadas por coma" value="${escHtml((c.opciones||[]).join(', '))}" data-po="${i}" style="margin-top:6px">`:''}
+        <button class="mini rojo" data-pcdel="${i}" style="margin-top:6px">Quitar campo</button>
+      </div>`).join('');
+    document.querySelectorAll('[data-pc]').forEach(inp=> inp.oninput = e=> t.campos[inp.dataset.pc].clave = e.target.value);
+    document.querySelectorAll('[data-pt]').forEach(s=> s.onchange = e=>{ t.campos[s.dataset.pt].tipo = e.target.value; pintar(); });
+    document.querySelectorAll('[data-pr]').forEach(ch=> ch.onchange = e=> t.campos[ch.dataset.pr].req = e.target.checked);
+    document.querySelectorAll('[data-po]').forEach(inp=> inp.oninput = e=> t.campos[inp.dataset.po].opciones = e.target.value.split(',').map(s=>s.trim()).filter(Boolean));
+    document.querySelectorAll('[data-pcdel]').forEach(b=> b.onclick = ()=>{ t.campos.splice(parseInt(b.dataset.pcdel,10),1); pintar(); });
+  };
+  pintar();
+  document.getElementById('ptAdd').onclick = ()=>{ t.campos.push({clave:'', tipo:'text', req:false}); pintar(); };
+  document.getElementById('ptGuardar').onclick = async ()=>{ await guardarPlantillas(); toast('Plantilla guardada.'); panelPlantillas(); };
+}
+// Construye el HTML de los campos de la plantilla activa (para el panel Marcar punto).
+function htmlCamposPlantilla(){
+  if(!plantillaActiva) return '';
+  const t = plantillas.find(x=>x.id===plantillaActiva); if(!t || !t.campos.length) return '';
+  let h = `<label>Datos · ${escHtml(t.nombre)}</label>`;
+  for(let i=0;i<t.campos.length;i++){
+    const c = t.campos[i];
+    const req = c.req ? ' <span style="color:var(--sangre)">*</span>' : '';
+    if(c.tipo==='foto'){
+      h += `<div style="margin-top:6px"><div style="font-size:11px;color:var(--musgo)">${escHtml(c.clave)}${req}</div>
+        <input type="file" accept="image/*" capture="environment" data-pf="${i}" style="margin-top:4px">
+        <div data-pfprev="${i}" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:6px"></div></div>`;
+    } else if(c.tipo==='select'){
+      h += `<div style="font-size:11px;color:var(--musgo);margin-top:8px">${escHtml(c.clave)}${req}</div>
+        <select data-pd="${i}"><option value="">—</option>${(c.opciones||[]).map(o=>`<option>${escHtml(o)}</option>`).join('')}</select>`;
+    } else {
+      h += `<div style="font-size:11px;color:var(--musgo);margin-top:8px">${escHtml(c.clave)}${req}</div>
+        <input type="${c.tipo==='number'?'number':'text'}" data-pd="${i}">`;
+    }
+  }
+  return h;
+}
+// Reduce una imagen a JPEG ~1024px para no llenar la base de datos.
+function comprimirImagen(file){
+  return new Promise((resolve)=>{
+    const img = new Image();
+    const rd = new FileReader();
+    rd.onload = ()=>{ img.onload = ()=>{
+      const max = 1024; let w = img.width, hh = img.height;
+      if(w>hh && w>max){ hh = hh*max/w; w = max; } else if(hh>max){ w = w*max/hh; hh = max; }
+      const cv = document.createElement('canvas'); cv.width = w; cv.height = hh;
+      cv.getContext('2d').drawImage(img, 0, 0, w, hh);
+      resolve(cv.toDataURL('image/jpeg', 0.7));
+    }; img.src = rd.result; };
+    rd.readAsDataURL(file);
+  });
+}
+// Lee los valores de la plantilla activa desde el panel Marcar punto.
+async function recolectarDatosPlantilla(){
+  const datos = {}, fotos = [];
+  if(!plantillaActiva) return { datos, fotos };
+  const t = plantillas.find(x=>x.id===plantillaActiva); if(!t) return { datos, fotos };
+  for(let i=0;i<t.campos.length;i++){
+    const c = t.campos[i];
+    if(c.tipo==='foto'){
+      const inp = document.querySelector('[data-pf="'+i+'"]');
+      if(inp && inp.files){ for(const file of inp.files){ try{ fotos.push(await comprimirImagen(file)); }catch(e){} } }
+    } else {
+      const el = document.querySelector('[data-pd="'+i+'"]');
+      const v = el ? el.value.trim() : '';
+      if(c.req && !v){ toast('Falta el campo obligatorio: '+c.clave); return null; }
+      if(v) datos[c.clave || ('campo'+i)] = v;
+    }
+  }
+  return { datos, fotos };
+}
+
+/* =======================================================================
+   GEO-ALERTAS OFFLINE (avisar al acercarse a un punto)
+   ======================================================================= */
+let alertas = [];   // [{id, nombre, lat, lon, radio, activa, _dentro}]
+async function cargarAlertas(){ try{ alertas = await dbGet('conf','alertas') || []; }catch(e){ alertas = []; } }
+async function guardarAlertas(){ await dbPut('conf', alertas, 'alertas'); }
+function chequearAlertas(pos){
+  if(!alertas.length || !pos || !pos.coords) return;
+  const c = pos.coords;
+  for(const a of alertas){
+    if(!a.activa){ a._dentro = false; continue; }
+    const d = distM(c.latitude, c.longitude, a.lat, a.lon);
+    const dentro = d <= (a.radio||50);
+    if(dentro && !a._dentro){
+      // Entró al radio: avisar una sola vez hasta que salga y vuelva.
+      if(navigator.vibrate){ try{ navigator.vibrate([120,60,120]); }catch(e){} }
+      toast('📍 '+(a.nombre||'Alerta')+' · a '+d.toFixed(0)+' m');
+    }
+    a._dentro = dentro;
+  }
+}
+function panelAlertas(){
+  abrirPanel('Alertas de proximidad', `
+    <div class="nota">La app te avisa (vibra) cuando entrás en el radio de una alerta. Funciona sin conexión, mientras la app o el track estén activos.</div>
+    <div id="alLista"></div>
+    <button class="ancho" id="alNueva">+ Alerta en mi ubicación</button>
+    <button class="ancho borde" id="alChincheta">+ Alerta en la chincheta</button>
+  `);
+  const pintar = ()=>{
+    document.getElementById('alLista').innerHTML = alertas.length ? alertas.map(a=>`
+      <div class="fila"><div class="cuerpo"><div class="t">${escHtml(a.nombre||'Alerta')}</div>
+        <div class="s">radio ${a.radio||50} m · ${a.lat.toFixed(5)}, ${a.lon.toFixed(5)}</div></div>
+      <button class="mini ${a.activa?'verde':''}" data-alt="${a.id}">${a.activa?'On':'Off'}</button>
+      <button class="mini" data-alir="${a.id}">Ir</button>
+      <button class="mini rojo" data-aldel="${a.id}">×</button></div>`).join('') : '<div class="vacio">Sin alertas todavía.</div>';
+    document.querySelectorAll('[data-alt]').forEach(b=> b.onclick = async ()=>{ const a=alertas.find(x=>x.id===b.dataset.alt); a.activa=!a.activa; a._dentro=false; await guardarAlertas(); pintar(); });
+    document.querySelectorAll('[data-alir]').forEach(b=> b.onclick = ()=>{ const a=alertas.find(x=>x.id===b.dataset.alir); if(a) volarA(a.lat, a.lon); });
+    document.querySelectorAll('[data-aldel]').forEach(b=> b.onclick = async ()=>{ alertas = alertas.filter(x=>x.id!==b.dataset.aldel); await guardarAlertas(); pintar(); });
+  };
+  pintar();
+  const crear = async (lat, lon)=>{
+    const nombre = prompt('Nombre de la alerta:', 'Punto de interés');
+    if(nombre===null) return;
+    const radio = parseInt(prompt('Radio en metros:', '50'),10) || 50;
+    alertas.push({ id:nid(), nombre:nombre||'Alerta', lat, lon, radio, activa:true, _dentro:false });
+    await guardarAlertas(); pintar();
+  };
+  document.getElementById('alNueva').onclick = ()=>{ if(!S.fix){ toast('Sin posición GPS todavía.'); return; } crear(S.fix.coords.latitude, S.fix.coords.longitude); };
+  document.getElementById('alChincheta').onclick = ()=>{ if(!chincheta){ toast('Poné una chincheta primero.'); return; } crear(chincheta.lat, chincheta.lon); };
 }
 function lon2merc(lon){ return lon*MERC_MAX/180; }
 function lat2merc(lat){ const y = Math.log(Math.tan((90+lat)*Math.PI/360))/(Math.PI/180); return y*MERC_MAX/180; }
@@ -4261,6 +4536,8 @@ function exportarDiagCSV(){
   const filtGuardados = await dbGet('conf','filtros');
   if(filtGuardados) S.filtros = Object.assign(S.filtros, filtGuardados);
   try{ S.capas = await dbAll('capas') || []; }catch(e){ S.capas = []; }
+  await cargarPlantillas();
+  await cargarAlertas();
   // Última ubicación conocida: evita arrancar en una zona random (Quepos por defecto).
   const uc = await dbGet('conf','ultimoCentro');
   if(uc && uc.lat!=null){ S.centro.lat = uc.lat; S.centro.lon = uc.lon; if(uc.zoom) S.zoom = uc.zoom; }
@@ -4302,6 +4579,8 @@ function exportarDiagCSV(){
     if(Geo) await Geo.requestPermissions();
   }catch(e){}
   await arrancarGPS();
+  // Buscar actualización en silencio al arrancar (si hay red).
+  if(navigator.onLine){ setTimeout(()=> buscarActualizacion(false), 4000); }
 })();
 </script>
 </body>
