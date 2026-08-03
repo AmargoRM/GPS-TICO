@@ -3958,9 +3958,13 @@ async function sincronizarNube(manual){
   if(!navigator.onLine){ if(manual) toast('Sin conexión; se subirá cuando haya internet.'); return; }
   const puntosPend = S.puntos.filter(p=> p.sincronizado!==true);
   const tracksPend = (S.tracks||[]).filter(t=> t.sincronizado!==true);
-  if(!puntosPend.length && !tracksPend.length){ if(manual) toast('No hay nada pendiente de subir.'); return; }
+  // Puntos con fotos aún sin subir (independiente de si el punto ya se sincronizó).
+  const puntosConFotosPend = S.puntos.filter(p=> p.fotos && p.fotos.length && p.fotosSincronizadas!==true);
+  if(!puntosPend.length && !tracksPend.length && !puntosConFotosPend.length){
+    if(manual) toast('No hay nada pendiente de subir.'); return;
+  }
   if(manual) mostrarCargando('Subiendo…');
-  let nP = 0, nT = 0, err = null;
+  let nP = 0, nT = 0, nF = 0, err = null;
   try{
     if(puntosPend.length){
       const rr = await postNube('/puntos', { puntos: puntosPend.map(puntoParaNube) });
@@ -3972,16 +3976,41 @@ async function sincronizarNube(manual){
       for(const t of tracksPend){ t.sincronizado = true; await dbPut('tracks', t); }
       nT = rr.recibidos || tracksPend.length;
     }
+    // Fotos: se suben por lotes para no armar cuerpos gigantes (cada foto ~100KB base64).
+    // Cada punto puede tener varias, y todas se envían en tandas de hasta 5.
+    if(puntosConFotosPend.length){
+      const LOTE = 5;
+      let procesados = 0;
+      for(const p of puntosConFotosPend){
+        const paquete = [];
+        for(let i=0;i<p.fotos.length;i++){
+          // La foto viene como data URL "data:image/jpeg;base64,XXXX"; enviamos solo la parte base64.
+          const raw = String(p.fotos[i]||'');
+          const b64 = raw.includes(',') ? raw.slice(raw.indexOf(',')+1) : raw;
+          paquete.push({ id: p.id+'_'+i, punto_id: p.id, ord: i, data_base64: b64 });
+        }
+        // Enviar en tandas.
+        for(let i=0;i<paquete.length;i+=LOTE){
+          const rr = await postNube('/fotos', { fotos: paquete.slice(i, i+LOTE) });
+          nF += rr.recibidas || 0;
+        }
+        p.fotosSincronizadas = true;
+        await dbPut('puntos', p);
+        procesados++;
+      }
+    }
   }catch(e){ err = e; }
   finally{ if(manual) ocultarCargando(); }
   if(err){ if(manual) toast('No se pudo subir: '+(err.message||err)); return; }
-  if(manual) toast('Subidos '+nP+' punto(s) y '+nT+' track(s) a Neon.');
+  if(manual) toast('Subidos '+nP+' punto(s), '+nT+' track(s) y '+nF+' foto(s) a Neon.');
 }
 function panelSync(){
   const puntosPend = S.puntos.filter(p=> p.sincronizado!==true).length;
   const tracksPend = (S.tracks||[]).filter(t=> t.sincronizado!==true).length;
+  const fotosPend = S.puntos.filter(p=> p.fotos && p.fotos.length && p.fotosSincronizadas!==true)
+                            .reduce((s,p)=> s + p.fotos.length, 0);
   abrirPanel('Sincronizar a la nube (Neon)', `
-    <div class="nota" style="border-color:var(--fix)">Sube tus <b>puntos</b> y <b>tracks</b> a dos tablas separadas en tu base Neon a través de un proxy propio (Cloudflare Worker). Funciona offline: lo pendiente se sube cuando hay internet. Las tablas se crean solas la primera vez.</div>
+    <div class="nota" style="border-color:var(--fix)">Sube <b>puntos</b>, <b>tracks</b> y <b>fotos</b> a tu base Neon a través de un proxy propio (Cloudflare Worker). Funciona offline: lo pendiente se sube cuando hay internet. Las tablas se crean solas la primera vez.</div>
     <label>Dirección del proxy (URL)</label>
     <input id="syUrl" value="${escHtml(syncCfg.url)}" placeholder="https://nube.tucuenta.workers.dev">
     <label>Token de acceso</label>
@@ -3992,10 +4021,10 @@ function panelSync(){
       <button class="mini" id="syProbar">Probar conexión</button>
       <button class="mini" id="syGuardar">Guardar ajustes</button>
     </div>
-    <div class="res" style="margin-top:12px"><div class="k">Pendientes de subir</div><div class="v">${puntosPend} punto(s) · ${tracksPend} track(s)</div></div>
+    <div class="res" style="margin-top:12px"><div class="k">Pendientes de subir</div><div class="v">${puntosPend} punto(s) · ${tracksPend} track(s) · ${fotosPend} foto(s)</div></div>
     <button class="ancho" id="sySubir">Subir ahora</button>
     <button class="ancho borde" id="syReset">Volver a marcar todo como pendiente</button>
-    <div class="nota">Si algo se marcó como "subido" sin haber llegado (ej. con un proxy mal configurado), tocá el segundo botón para reenviar. Las fotos no se suben todavía (van aparte).</div>
+    <div class="nota">Si algo se marcó como "subido" sin haber llegado, tocá el segundo botón para reenviar. Las fotos se guardan en la tabla <b>fotos</b> como base64, enlazadas al punto por <b>punto_id</b>.</div>
   `);
   document.getElementById('syGuardar').onclick = async ()=>{
     syncCfg.url = document.getElementById('syUrl').value.trim();
@@ -4033,8 +4062,8 @@ function panelSync(){
   };
   document.getElementById('sySubir').onclick = async ()=>{ await sincronizarNube(true); panelSync(); };
   document.getElementById('syReset').onclick = async ()=>{
-    if(!confirm('¿Marcar TODOS los puntos y tracks como pendientes de subir? La próxima sincronización los mandará de nuevo.')) return;
-    for(const p of S.puntos){ p.sincronizado = false; await dbPut('puntos', p); }
+    if(!confirm('¿Marcar TODOS los puntos, tracks y fotos como pendientes de subir? La próxima sincronización los mandará de nuevo.')) return;
+    for(const p of S.puntos){ p.sincronizado = false; p.fotosSincronizadas = false; await dbPut('puntos', p); }
     for(const t of (S.tracks||[])){ t.sincronizado = false; await dbPut('tracks', t); }
     toast('Todo marcado como pendiente.'); panelSync();
   };
