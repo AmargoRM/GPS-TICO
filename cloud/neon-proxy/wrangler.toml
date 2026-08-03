@@ -1,0 +1,8 @@
+name = "gps-tico-proxy"
+main = "worker.js"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
+
+# Los secretos NO van acá. Se cargan con:
+#   wrangler secret put DATABASE_URL
+#   wrangler secret put API_TOKEN

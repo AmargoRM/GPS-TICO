@@ -36,6 +36,9 @@ body{display:flex;flex-direction:column;padding-top:env(safe-area-inset-top);pad
 #mapa{width:100%;height:100%;display:block;touch-action:none}
 #capaBtns{position:absolute;top:10px;right:10px;display:flex;flex-direction:column;gap:6px}
 .flot{background:rgba(18,32,35,.92);border:1px solid var(--cauce);color:var(--niebla);border-radius:6px;padding:8px 10px;font-size:11px;font-family:var(--mono);backdrop-filter:blur(6px)}
+/* Botón de fuente de posición: fused = ámbar (aprox), gps = verde (satelital puro) */
+#btnFuente[data-src="fused"]{border-color:var(--alerta);color:var(--alerta)}
+#btnFuente[data-src="gps"]{border-color:var(--fix);color:var(--fix)}
 button.flot:active{background:var(--cauce)}
 #estadoRed{position:absolute;top:10px;left:10px;font-family:var(--mono);font-size:9px;letter-spacing:.1em;color:var(--musgo);background:rgba(10,18,20,.8);padding:4px 7px;border-radius:4px}
 #toast{position:absolute;left:50%;bottom:14px;transform:translateX(-50%);background:var(--cauce);color:var(--niebla);font-size:12px;padding:8px 14px;border-radius:20px;opacity:0;transition:opacity .25s;pointer-events:none;max-width:88%;text-align:center}
@@ -163,6 +166,7 @@ label{display:block;font-size:9px;letter-spacing:.14em;text-transform:uppercase;
     <button class="flot" id="btnCentrar">◎</button>
     <button class="flot" id="btnMedir" title="Medir">📏</button>
     <button class="flot" id="btnNav" title="Navegar">🧭</button>
+    <button class="flot" id="btnFuente" title="Fuente de posición" data-src="fused">📡 FUSED</button>
   </div>
   <div id="herramienta">
     <div id="herrTexto">—</div>
@@ -1087,6 +1091,13 @@ async function aplicarFuente(){
   }
   if(S.fuente==='gps') detenerFused(); else arrancarFused();
   await gnssStopSiOcioso();
+  actualizarBotonFuente();
+}
+// Refleja la fuente actual en el botón del mapa (color + texto).
+function actualizarBotonFuente(){
+  const b = document.getElementById('btnFuente'); if(!b) return;
+  b.dataset.src = S.fuente==='gps' ? 'gps' : 'fused';
+  b.textContent = S.fuente==='gps' ? '🛰 GPS PURO' : '📡 FUSED';
 }
 // Convierten cada fuente a la forma de un Position del navegador (coords + timestamp)
 // altElip = altura elipsoidal (WGS84, cruda del GPS)
@@ -1634,6 +1645,7 @@ document.getElementById('btnCentrar').onclick = ()=>{
 };
 document.getElementById('btnMedir').onclick = ()=> setModoMapa('medir');
 document.getElementById('btnNav').onclick   = ()=> setModoMapa('navegar');
+document.getElementById('btnFuente').onclick = panelFuente;
 
 /* --- marcar punto --- */
 document.getElementById('btnWp').onclick = ()=>{
@@ -1659,7 +1671,12 @@ document.getElementById('btnWp').onclick = ()=>{
     <div class="res"><div class="k">Fuente</div><div class="v">${srcTxt}${fx.mock?'  ·  ⚠ MOCK':''}</div></div>
     <label>Nombre</label><input id="wpNom" value="P${String(n).padStart(3,'0')}">
     <label>Descripción</label><textarea id="wpDesc" rows="2" placeholder="Naciente, punto de aforo, testigo..."></textarea>
-    ${htmlCamposPlantilla()}
+    ${plantillas.length?`<label>Formulario de captura</label>
+    <select id="wpPlantilla">
+      <option value="">— Sin formulario (solo nombre/descripción) —</option>
+      ${plantillas.map(t=>`<option value="${t.id}" ${t.id===plantillaActiva?'selected':''}>${escHtml(t.nombre)}</option>`).join('')}
+    </select>`:''}
+    <div id="wpCamposPlant"></div>
     <label>Fotos del punto</label>
     <input type="file" id="wpFotos" accept="image/*" capture="environment" multiple>
     <div id="wpFotosPrev" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:6px"></div>
@@ -1675,6 +1692,17 @@ document.getElementById('btnWp').onclick = ()=>{
     altElip: fx.altElip!=null?fx.altElip:null, altOrto: fx.altOrto!=null?fx.altOrto:null,
     altOrtoFuente: fx.altOrtoFuente||null, geoide: fx.geoide!=null?fx.geoide:null
   });
+  // Formulario de captura: renderiza los campos de la plantilla elegida y se
+  // actualiza al cambiar la selección. Guarda la elección como predeterminada.
+  const selPl = document.getElementById('wpPlantilla');
+  const renderCampos = ()=>{
+    const id = selPl ? selPl.value : (plantillaActiva||'');
+    document.getElementById('wpCamposPlant').innerHTML = htmlCamposPlantilla(id);
+  };
+  if(selPl){
+    selPl.onchange = async ()=>{ plantillaActiva = selPl.value || null; await dbPut('conf', plantillaActiva, 'plantillaActiva'); renderCampos(); };
+  }
+  renderCampos();
   // Vista previa de las fotos del punto a medida que se seleccionan.
   const fotosPunto = [];
   const inpF = document.getElementById('wpFotos');
@@ -1720,35 +1748,45 @@ document.getElementById('btnTrack').onclick = alternarTrack;
 
 /* --- menú --- */
 document.getElementById('btnMenu').onclick = ()=>{
+  const pend = S.puntos.filter(p=> p.sincronizado!==true).length;
   abrirPanel('Menú', `
-    <div class="fila"><div class="cuerpo"><div class="t">Fuente de posición</div><div class="s">${S.fuente==='gps'?'GPS puro (nativo)':'Fusionada (GPS+WiFi+celda)'}</div></div><button class="mini" id="mFuente">Cambiar</button></div>
-    <div class="fila"><div class="cuerpo"><div class="t">Diagnóstico GNSS</div><div class="s">Satélites, L5, exactitud</div></div><button class="mini" id="mDiag">Abrir</button></div>
-    <div class="fila"><div class="cuerpo"><div class="t">Filtros de calidad</div><div class="s">${S.filtros.activo?'Activo · '+S.filtros.preset:'Apagado'}</div></div><button class="mini" id="mFilt">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Capas del proyecto</div><div class="s">${S.capas.length} capa(s) · GeoJSON · KML · SHP · WFS · WMS</div></div><button class="mini" id="mCapas">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Puntos y tracks</div><div class="s">${S.puntos.length} puntos · ${S.tracks.length} tracks</div></div><button class="mini" id="mDatos">Ver</button></div>
-    <div class="fila"><div class="cuerpo"><div class="t">Plantillas de captura</div><div class="s">${plantillas.length} plantilla(s) · ${plantillaActiva?'activa: '+escHtml((plantillas.find(t=>t.id===plantillaActiva)||{}).nombre||''):'ninguna activa'}</div></div><button class="mini" id="mPlant">Abrir</button></div>
-    <div class="fila"><div class="cuerpo"><div class="t">Alertas de proximidad</div><div class="s">${alertas.filter(a=>a.activa).length} activa(s) de ${alertas.length}</div></div><button class="mini" id="mAlert">Abrir</button></div>
+    <div class="fila"><div class="cuerpo"><div class="t">Plantillas de captura</div><div class="s">${plantillas.length} plantilla(s) · se eligen al marcar un punto</div></div><button class="mini" id="mPlant">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Convertir coordenadas</div><div class="s">Geo ↔ CRTM05 ↔ Lambert N/S</div></div><button class="mini" id="mConv">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Mapa sin conexión</div><div class="s">Zonas y parches descargables</div></div><button class="mini" id="mOff">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Exportar proyecto</div><div class="s">GPX · CSV · GeoJSON</div></div><button class="mini" id="mExp">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Exportar mapa</div><div class="s">PDF georreferenciado · PNG · grilla CRTM05</div></div><button class="mini" id="mExpMapa">Abrir</button></div>
-    <div class="fila"><div class="cuerpo"><div class="t">Precisión y advertencias</div><div class="s">Leer antes de usar en expedientes</div></div><button class="mini" id="mInfo">Abrir</button></div>
+    <div class="fila"><div class="cuerpo"><div class="t">☁ Sincronizar a la nube</div><div class="s">${pend?pend+' punto(s) sin subir':'todo sincronizado'} · Neon</div></div><button class="mini" id="mSync">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Actualizar app</div><div class="s">Build actual: ${APP_BUILD||'dev'} · buscar versión nueva</div></div><button class="mini" id="mUpd">Buscar</button></div>
+    <div class="fila"><div class="cuerpo"><div class="t">⚙ Configuración y términos de uso</div><div class="s">Fuente, diagnóstico, filtros, alertas, precisión</div></div><button class="mini" id="mConfig">Abrir</button></div>
   `);
   document.getElementById('mPlant').onclick = panelPlantillas;
-  document.getElementById('mAlert').onclick = panelAlertas;
   document.getElementById('mUpd').onclick = ()=> buscarActualizacion(true);
-  document.getElementById('mFuente').onclick = panelFuente;
-  document.getElementById('mDiag').onclick  = panelDiagnosticos;
-  document.getElementById('mFilt').onclick  = panelFiltros;
   document.getElementById('mCapas').onclick = panelCapas;
   document.getElementById('mDatos').onclick = panelDatos;
   document.getElementById('mConv').onclick  = panelConv;
   document.getElementById('mOff').onclick   = panelOffline;
   document.getElementById('mExp').onclick   = panelExport;
   document.getElementById('mExpMapa').onclick = panelExportMapa;
-  document.getElementById('mInfo').onclick  = panelInfo;
+  document.getElementById('mSync').onclick  = panelSync;
+  document.getElementById('mConfig').onclick = panelConfig;
 };
+// Panel agrupado: Configuración y términos de uso.
+function panelConfig(){
+  abrirPanel('Configuración y términos de uso', `
+    <div class="fila"><div class="cuerpo"><div class="t">Diagnóstico GNSS</div><div class="s">Satélites, L5, exactitud</div></div><button class="mini" id="cDiag">Abrir</button></div>
+    <div class="fila"><div class="cuerpo"><div class="t">Filtros de calidad</div><div class="s">${S.filtros.activo?'Activo · '+S.filtros.preset:'Apagado'}</div></div><button class="mini" id="cFilt">Abrir</button></div>
+    <div class="fila"><div class="cuerpo"><div class="t">Alertas de proximidad</div><div class="s">${alertas.filter(a=>a.activa).length} activa(s) de ${alertas.length}</div></div><button class="mini" id="cAlert">Abrir</button></div>
+    <div class="fila"><div class="cuerpo"><div class="t">Fuente de posición</div><div class="s">${S.fuente==='gps'?'GPS puro (nativo)':'Fusionada (GPS+WiFi+celda)'}</div></div><button class="mini" id="cFuente">Cambiar</button></div>
+    <div class="fila"><div class="cuerpo"><div class="t">Precisión y advertencias</div><div class="s">Términos de uso · leer antes de usar en expedientes</div></div><button class="mini" id="cInfo">Abrir</button></div>
+  `);
+  document.getElementById('cDiag').onclick  = panelDiagnosticos;
+  document.getElementById('cFilt').onclick  = panelFiltros;
+  document.getElementById('cAlert').onclick = panelAlertas;
+  document.getElementById('cFuente').onclick = panelFuente;
+  document.getElementById('cInfo').onclick  = panelInfo;
+}
 
 /* --- proyectos --- */
 document.getElementById('proyBtn').onclick = panelProyectos;
@@ -3856,6 +3894,96 @@ async function buscarActualizacion(manual){
 }
 
 /* =======================================================================
+   SINCRONIZACIÓN A LA NUBE (Neon vía proxy propio — opción B)
+   El proxy (Cloudflare Worker) guarda el secreto de Neon; la app solo conoce
+   la URL del proxy y un token. Cola offline: sube lo que tenga sincronizado:false.
+   ======================================================================= */
+let syncCfg = { url:'', token:'', auto:true };
+async function cargarSyncCfg(){ try{ const c = await dbGet('conf','syncCfg'); if(c) syncCfg = Object.assign(syncCfg, c); }catch(e){} }
+async function guardarSyncCfg(){ await dbPut('conf', syncCfg, 'syncCfg'); }
+// Punto listo para subir (sin las fotos, que son pesadas; se cuentan aparte).
+function puntoParaNube(p){
+  return { id:p.id, proy:p.proy, nom:p.nom, desc:p.desc||'', lat:p.lat, lon:p.lon,
+           alt_orto:p.altOrto!=null?p.altOrto:null, alt_elip:p.altElip!=null?p.altElip:null,
+           exac:p.exac!=null?p.exac:null, fuente:p.fuente||'fused', tipo:p.tipo||null,
+           datos:p.datos||null, promediado:!!p.promediado, muestras:p.muestras||null,
+           desv_std:p.desvStd!=null?p.desvStd:null, n_fotos:(p.fotos?p.fotos.length:0),
+           t: new Date(p.t||Date.now()).toISOString() };
+}
+async function postNube(ruta, body){
+  if(!syncCfg.url) throw new Error('Falta la URL del proxy');
+  const base = syncCfg.url.replace(/\/+$/,'');
+  const r = await fetch(base + ruta, {
+    method:'POST',
+    headers:{ 'Content-Type':'application/json', 'Authorization':'Bearer '+(syncCfg.token||'') },
+    body: JSON.stringify(body)
+  });
+  if(!r.ok) throw new Error('HTTP '+r.status+' '+(await r.text()).slice(0,120));
+  return r.json().catch(()=>({}));
+}
+async function sincronizarNube(manual){
+  if(!syncCfg.url){ if(manual) toast('Configurá la URL del proxy primero.'); return; }
+  if(!navigator.onLine){ if(manual) toast('Sin conexión; se subirá cuando haya internet.'); return; }
+  const pend = S.puntos.filter(p=> p.sincronizado!==true);
+  if(!pend.length){ if(manual) toast('No hay puntos pendientes de subir.'); return; }
+  if(manual) mostrarCargando('Subiendo '+pend.length+' punto(s)…');
+  try{
+    await postNube('/puntos', { puntos: pend.map(puntoParaNube) });
+    for(const p of pend){ p.sincronizado = true; await dbPut('puntos', p); }
+    if(manual) toast('Subidos '+pend.length+' punto(s) a Neon.');
+  }catch(e){ if(manual) toast('No se pudo subir: '+(e.message||e)); }
+  finally{ if(manual) ocultarCargando(); }
+}
+async function subirCapasNube(){
+  const capas = S.capas.filter(c=> c.tipo==='geojson' && c.geojson && c.sincronizado!==true);
+  if(!capas.length){ toast('No hay capas vectoriales nuevas para subir.'); return; }
+  mostrarCargando('Subiendo '+capas.length+' capa(s)…');
+  try{
+    await postNube('/capas', { capas: capas.map(c=>({ id:c.id, nombre:c.nombre, geojson:c.geojson, t:new Date().toISOString() })) });
+    for(const c of capas){ c.sincronizado = true; await dbPut('capas', c); }
+    toast('Subidas '+capas.length+' capa(s) a Neon.');
+  }catch(e){ toast('No se pudo subir: '+(e.message||e)); }
+  finally{ ocultarCargando(); }
+}
+function panelSync(){
+  const pend = S.puntos.filter(p=> p.sincronizado!==true).length;
+  const capasPend = S.capas.filter(c=> c.tipo==='geojson' && c.sincronizado!==true).length;
+  abrirPanel('Sincronizar a la nube (Neon)', `
+    <div class="nota" style="border-color:var(--fix)">Tus puntos y capas se suben a <b>tu</b> base Neon a través de un proxy propio (un Cloudflare Worker que guarda la clave secreta). La app solo necesita la <b>dirección del proxy</b> y un <b>token</b>. Funciona offline: lo pendiente se sube cuando hay internet.</div>
+    <label>Dirección del proxy (URL)</label>
+    <input id="syUrl" value="${escHtml(syncCfg.url)}" placeholder="https://gps-tico-proxy.tucuenta.workers.dev">
+    <label>Token de acceso</label>
+    <input id="syTok" value="${escHtml(syncCfg.token)}" placeholder="el que pusiste en el Worker">
+    <label style="display:flex;align-items:center;gap:8px;text-transform:none;letter-spacing:0;font-size:13px;margin-top:12px">
+      <input type="checkbox" id="syAuto" ${syncCfg.auto?'checked':''} style="width:auto;margin:0"> Subir automáticamente cuando haya internet</label>
+    <div class="grid2" style="margin-top:12px">
+      <button class="mini" id="syProbar">Probar conexión</button>
+      <button class="mini" id="syGuardar">Guardar ajustes</button>
+    </div>
+    <div class="res" style="margin-top:12px"><div class="k">Pendientes de subir</div><div class="v">${pend} punto(s) · ${capasPend} capa(s)</div></div>
+    <button class="ancho" id="sySubir">Subir puntos ahora</button>
+    <button class="ancho borde" id="syCapas">Subir capas vectoriales (KML/GeoJSON)</button>
+    <div class="nota">Las fotos no se suben todavía (son pesadas); se sube el conteo. El almacenamiento de fotos en la nube es un paso aparte.</div>
+  `);
+  document.getElementById('syGuardar').onclick = async ()=>{
+    syncCfg.url = document.getElementById('syUrl').value.trim();
+    syncCfg.token = document.getElementById('syTok').value.trim();
+    syncCfg.auto = document.getElementById('syAuto').checked;
+    await guardarSyncCfg(); toast('Ajustes guardados.');
+  };
+  document.getElementById('syProbar').onclick = async ()=>{
+    const url = document.getElementById('syUrl').value.trim();
+    if(!url){ toast('Poné la URL primero.'); return; }
+    mostrarCargando('Probando…');
+    try{ const r = await fetch(url.replace(/\/+$/,'')+'/ping'); toast(r.ok?'Conexión OK ✓':'Respondió HTTP '+r.status); }
+    catch(e){ toast('No respondió: '+(e.message||e)); }
+    finally{ ocultarCargando(); }
+  };
+  document.getElementById('sySubir').onclick = async ()=>{ await sincronizarNube(true); panelSync(); };
+  document.getElementById('syCapas').onclick = async ()=>{ await subirCapasNube(); panelSync(); };
+}
+
+/* =======================================================================
    PLANTILLAS DE CAPTURA (formularios por tipo de elemento)
    ======================================================================= */
 let plantillas = [];   // [{id, nombre, campos:[{clave,tipo,req,opciones}]}]
@@ -3867,37 +3995,33 @@ async function cargarPlantillas(){
 async function guardarPlantillas(){ await dbPut('conf', plantillas, 'plantillas'); }
 function panelPlantillas(){
   abrirPanel('Plantillas de captura', `
-    <div class="nota">Definí campos para llenar al marcar un punto (ej. inspección de poste: estado, material, foto). La plantilla activa se aplica automáticamente al marcar.</div>
-    <label>Plantilla activa al marcar</label>
-    <select id="plActiva">
-      <option value="">— Ninguna (solo nombre/descripción) —</option>
-      ${plantillas.map(t=>`<option value="${t.id}" ${t.id===plantillaActiva?'selected':''}>${escHtml(t.nombre)}</option>`).join('')}
-    </select>
-    <div id="plLista" style="margin-top:12px"></div>
-    <button class="ancho" id="plNueva">+ Nueva plantilla</button>
+    <div class="nota" style="border-color:var(--fix)">Una <b>plantilla</b> es un formulario propio (ej. "Inspección de poste" con estado, material y foto). No se activan acá: cuando tocás <b>Marcar punto</b>, elegís la plantilla en el desplegable <b>"Formulario de captura"</b> y llenás sus campos.</div>
+    <label>Tus plantillas</label>
+    <div id="plLista" style="margin-top:6px"></div>
+    <button class="ancho" id="plNueva">+ Crear plantilla nueva</button>
   `);
-  document.getElementById('plActiva').onchange = async e=>{ plantillaActiva = e.target.value || null; await dbPut('conf', plantillaActiva, 'plantillaActiva'); };
   const pintar = ()=>{
     document.getElementById('plLista').innerHTML = plantillas.length ? plantillas.map(t=>`
-      <div class="fila"><div class="cuerpo"><div class="t">${escHtml(t.nombre)}</div><div class="s">${t.campos.length} campo(s)</div></div>
+      <div class="fila"><div class="cuerpo"><div class="t">📋 ${escHtml(t.nombre)}</div><div class="s">${t.campos.length} campo(s): ${escHtml(t.campos.map(c=>c.clave).filter(Boolean).slice(0,4).join(', '))||'sin campos'}</div></div>
       <button class="mini" data-pled="${t.id}">Editar</button>
-      <button class="mini rojo" data-pldel="${t.id}">×</button></div>`).join('') : '<div class="vacio">Sin plantillas todavía.</div>';
+      <button class="mini rojo" data-pldel="${t.id}">×</button></div>`).join('') : '<div class="vacio">Todavía no creaste ninguna.<br>Tocá "Crear plantilla nueva" para empezar.</div>';
     document.querySelectorAll('[data-pled]').forEach(b=> b.onclick = ()=> editarPlantilla(b.dataset.pled));
-    document.querySelectorAll('[data-pldel]').forEach(b=> b.onclick = async ()=>{ plantillas = plantillas.filter(x=>x.id!==b.dataset.pldel); await guardarPlantillas(); panelPlantillas(); });
+    document.querySelectorAll('[data-pldel]').forEach(b=> b.onclick = async ()=>{ if(!confirm('¿Borrar esta plantilla?')) return; plantillas = plantillas.filter(x=>x.id!==b.dataset.pldel); await guardarPlantillas(); panelPlantillas(); });
   };
   pintar();
   document.getElementById('plNueva').onclick = ()=>{
-    const t = { id:nid(), nombre:'Nueva plantilla', campos:[] };
+    const t = { id:nid(), nombre:'', campos:[{clave:'', tipo:'text', req:false}] };
     plantillas.push(t); editarPlantilla(t.id);
   };
 }
 function editarPlantilla(id){
   const t = plantillas.find(x=>x.id===id); if(!t) return;
-  const tipos = [['text','Texto'],['number','Número'],['select','Lista'],['foto','Foto']];
+  const tipos = [['text','Texto'],['number','Número'],['select','Lista de opciones'],['foto','Foto']];
   abrirPanel('Editar plantilla', `
+    <div class="nota">Paso 1: ponele nombre. Paso 2: agregá los campos que querés llenar en el campo. Paso 3: Guardar. Después aparecerá al Marcar punto.</div>
     <label>Nombre de la plantilla</label>
-    <input id="ptNom" value="${escHtml(t.nombre)}">
-    <label>Campos</label>
+    <input id="ptNom" value="${escHtml(t.nombre)}" placeholder="Ej. Inspección de poste">
+    <label>Campos del formulario</label>
     <div id="ptCampos"></div>
     <button class="ancho borde" id="ptAdd">+ Agregar campo</button>
     <button class="ancho" id="ptGuardar">Guardar plantilla</button>
@@ -3922,13 +4046,18 @@ function editarPlantilla(id){
   };
   pintar();
   document.getElementById('ptAdd').onclick = ()=>{ t.campos.push({clave:'', tipo:'text', req:false}); pintar(); };
-  document.getElementById('ptGuardar').onclick = async ()=>{ await guardarPlantillas(); toast('Plantilla guardada.'); panelPlantillas(); };
+  document.getElementById('ptGuardar').onclick = async ()=>{
+    if(!t.nombre.trim()){ toast('Ponele un nombre a la plantilla.'); return; }
+    t.campos = t.campos.filter(c=> (c.clave||'').trim());   // descartar campos sin nombre
+    await guardarPlantillas(); toast('Plantilla "'+t.nombre+'" guardada.'); panelPlantillas();
+  };
 }
-// Construye el HTML de los campos de la plantilla activa (para el panel Marcar punto).
-function htmlCamposPlantilla(){
-  if(!plantillaActiva) return '';
-  const t = plantillas.find(x=>x.id===plantillaActiva); if(!t || !t.campos.length) return '';
-  let h = `<label>Datos · ${escHtml(t.nombre)}</label>`;
+// Construye el HTML de los campos de una plantilla (para el panel Marcar punto).
+function htmlCamposPlantilla(id){
+  id = id || plantillaActiva;
+  if(!id) return '';
+  const t = plantillas.find(x=>x.id===id); if(!t || !t.campos.length) return '';
+  let h = `<div style="font-size:11px;color:var(--fix);margin-top:10px;font-weight:600">📋 ${escHtml(t.nombre)}</div>`;
   for(let i=0;i<t.campos.length;i++){
     const c = t.campos[i];
     const req = c.req ? ' <span style="color:var(--sangre)">*</span>' : '';
@@ -3961,11 +4090,12 @@ function comprimirImagen(file){
     rd.readAsDataURL(file);
   });
 }
-// Lee los valores de la plantilla activa desde el panel Marcar punto.
-async function recolectarDatosPlantilla(){
+// Lee los valores de la plantilla elegida desde el panel Marcar punto.
+async function recolectarDatosPlantilla(id){
+  id = id || plantillaActiva;
   const datos = {}, fotos = [];
-  if(!plantillaActiva) return { datos, fotos };
-  const t = plantillas.find(x=>x.id===plantillaActiva); if(!t) return { datos, fotos };
+  if(!id) return { datos, fotos };
+  const t = plantillas.find(x=>x.id===id); if(!t) return { datos, fotos };
   for(let i=0;i<t.campos.length;i++){
     const c = t.campos[i];
     if(c.tipo==='foto'){
@@ -4538,6 +4668,7 @@ function exportarDiagCSV(){
   try{ S.capas = await dbAll('capas') || []; }catch(e){ S.capas = []; }
   await cargarPlantillas();
   await cargarAlertas();
+  await cargarSyncCfg();
   // Última ubicación conocida: evita arrancar en una zona random (Quepos por defecto).
   const uc = await dbGet('conf','ultimoCentro');
   if(uc && uc.lat!=null){ S.centro.lat = uc.lat; S.centro.lon = uc.lon; if(uc.zoom) S.zoom = uc.zoom; }
@@ -4570,7 +4701,7 @@ function exportarDiagCSV(){
   document.getElementById('cargaGpsCerrar').onclick = ()=> document.getElementById('cargaGps').classList.remove('on');
   medir(); dibujarAnillo(null);
   window.addEventListener('resize', medir);
-  window.addEventListener('online',  ()=> dibujar());
+  window.addEventListener('online',  ()=>{ dibujar(); if(syncCfg.auto) sincronizarNube(false); });
   window.addEventListener('offline', ()=>{ document.getElementById('estadoRed').textContent = 'SIN RED · MAPA CACHÉ'; });
   // Capacitor: pedir permiso de ubicación nativo ANTES de arrancar la fuente
   // (el GPS puro nativo también requiere ACCESS_FINE_LOCATION).
@@ -4581,6 +4712,8 @@ function exportarDiagCSV(){
   await arrancarGPS();
   // Buscar actualización en silencio al arrancar (si hay red).
   if(navigator.onLine){ setTimeout(()=> buscarActualizacion(false), 4000); }
+  // Subir a la nube lo pendiente al arrancar (si está configurado y en auto).
+  if(navigator.onLine && syncCfg.auto && syncCfg.url){ setTimeout(()=> sincronizarNube(false), 6000); }
 })();
 </script>
 </body>
