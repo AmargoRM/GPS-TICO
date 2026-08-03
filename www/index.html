@@ -3926,8 +3926,9 @@ function trackParaNube(t){
            n_puntos: (t.pts && t.pts.length) || 0,
            geojson: t.geojson || (t.pts ? { type:'Feature', geometry:{ type:'LineString', coordinates: t.pts.map(pt=>[pt.lon, pt.lat]) }, properties:{ nom:t.nom, dist:t.dist } } : null) };
 }
-// POST al proxy con validación estricta: si el servidor responde ok:false
-// (aunque el HTTP sea 200), lanzamos error para NO marcar como sincronizado.
+// POST al proxy con validación ESTRICTA: solo consideramos éxito si HTTP 2xx
+// y el JSON trae ok:true. Cualquier otra cosa (Worker viejo, error de red,
+// error de Neon) es error → NO se marca como sincronizado.
 async function postNube(ruta, body){
   if(!syncCfg.url) throw new Error('Falta la URL del proxy');
   const base = syncCfg.url.replace(/\/+$/,'');
@@ -3938,9 +3939,18 @@ async function postNube(ruta, body){
   });
   const txt = await r.text();
   let data = {}; try{ data = JSON.parse(txt); }catch(e){}
-  if(!r.ok) throw new Error('HTTP '+r.status+': '+(data.error||txt.slice(0,140)));
-  // El proxy siempre incluye ok:true/false. Si viene false, es error lógico.
-  if(data.ok === false) throw new Error(data.error || 'El proxy rechazó la petición');
+  if(!r.ok){
+    let hint = '';
+    if(r.status===401) hint = ' — token incorrecto';
+    else if(r.status===404) hint = ' — ¿hiciste Deploy del Worker nuevo?';
+    else if(r.status>=500) hint = ' — error en Neon (revisá tabla)';
+    throw new Error('HTTP '+r.status+hint+': '+(data.error||txt.slice(0,120)));
+  }
+  // Solo aceptamos éxito real. Un Worker viejo devuelve {success:true,...} sin
+  // el campo ok → lo tratamos como error para no falsear "sincronizado".
+  if(data.ok !== true){
+    throw new Error('El proxy no confirmó éxito. Respuesta: '+txt.slice(0,180));
+  }
   return data;
 }
 async function sincronizarNube(manual){
@@ -3997,13 +4007,29 @@ function panelSync(){
     const url = document.getElementById('syUrl').value.trim();
     if(!url){ toast('Poné la URL primero.'); return; }
     mostrarCargando('Probando…');
+    let txt = '', st = '?', ok = false, diag = '';
     try{
       const r = await fetch(url.replace(/\/+$/,'')+'/ping');
-      const j = await r.json().catch(()=>({}));
-      toast(r.ok && j.ok ? 'Conexión OK ✓' : 'Respondió HTTP '+r.status+' — revisá la URL.');
+      st = r.status;
+      txt = await r.text();
+      let j = {}; try{ j = JSON.parse(txt); }catch(e){}
+      ok = r.ok && j.ok === true;
+      if(ok) diag = '✅ Conexión OK con el Worker nuevo';
+      else if(r.status===401) diag = '⚠ El Worker responde 401 en /ping — todavía tenés el código VIEJO. Pegá el nuevo worker.js en Cloudflare y tocá "Deploy".';
+      else if(r.status===404) diag = '⚠ 404 — la URL está mal o el Worker no está publicado. Verificá la URL en Cloudflare.';
+      else if(j.success!==undefined && j.ok===undefined) diag = '⚠ El Worker responde en formato viejo (success). Necesitás pegar el nuevo worker.js y hacer Deploy.';
+      else diag = 'Respondió HTTP '+r.status;
     }
-    catch(e){ toast('No respondió: '+(e.message||e)); }
+    catch(e){ diag = '❌ No respondió: '+(e.message||e); }
     finally{ ocultarCargando(); }
+    // Panel con el detalle completo para diagnosticar.
+    abrirPanel('Prueba de conexión', `
+      <div class="res"><div class="k">Resultado</div><div class="v">${escHtml(diag)}</div></div>
+      <div class="res"><div class="k">HTTP status</div><div class="v">${escHtml(String(st))}</div></div>
+      <div class="res"><div class="k">Respuesta cruda</div><div class="v" style="font-size:11px;white-space:pre-wrap;word-break:break-word">${escHtml(txt.slice(0,600) || '(vacío)')}</div></div>
+      <div class="nota">Si dice que el Worker es viejo o responde 401 en /ping: en Cloudflare → Workers & Pages → tu worker → <b>Edit code</b>, pegá el contenido nuevo de worker.js, y tocá <b>Deploy</b> (botón azul arriba a la derecha). Después probá otra vez.</div>
+      <button class="ancho" id="pcVolver">Volver</button>`);
+    document.getElementById('pcVolver').onclick = panelSync;
   };
   document.getElementById('sySubir').onclick = async ()=>{ await sincronizarNube(true); panelSync(); };
   document.getElementById('syReset').onclick = async ()=>{
