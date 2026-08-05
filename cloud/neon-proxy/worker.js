@@ -33,10 +33,47 @@ export default {
       return json({ ok: true, ts: Date.now() });
     }
 
+    // Autenticación: acepta Authorization: Bearer <token> O ?t=<token> en la URL
+    // (para links directos desde QGIS/navegador que no envían headers).
     const auth = request.headers.get('Authorization') || '';
-    const token = auth.replace(/^Bearer\s+/i, '').trim();
+    const tokenHeader = auth.replace(/^Bearer\s+/i, '').trim();
+    const tokenQuery = url.searchParams.get('t') || '';
+    const token = tokenHeader || tokenQuery;
     if (!env.API_TOKEN || token !== env.API_TOKEN) {
       return json({ ok: false, error: 'Acceso denegado: token inválido o no enviado.' }, 401);
+    }
+
+    // GET /foto/:id  — devuelve el JPEG binario para abrir en QGIS/navegador.
+    // Usa ?t=TOKEN para autenticar sin headers.
+    const mFoto = url.pathname.match(/^\/foto\/(.+)$/);
+    if (request.method === 'GET' && mFoto) {
+      const connStr2 = (env.nube || '').trim().replace(/^["']|["']$/g, '');
+      const host2 = connStr2.split('@')[1]?.split('/')[0];
+      const rr = await fetch(`https://${host2}/sql`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Neon-Connection-String': connStr2 },
+        body: JSON.stringify({
+          query: `SELECT data_base64, nombre_punto, tomada_en FROM fotos WHERE id = $1`,
+          params: [decodeURIComponent(mFoto[1])]
+        })
+      });
+      const dd = await rr.json().catch(() => ({}));
+      const rows = dd.rows || dd || [];
+      if (!rows.length || !rows[0].data_base64) {
+        return new Response('Foto no encontrada', { status: 404, headers: cors });
+      }
+      const b64 = rows[0].data_base64;
+      // Decodificar base64 a bytes (Uint8Array).
+      const bin = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+      const nombreArch = 'foto_' + (rows[0].nombre_punto || decodeURIComponent(mFoto[1])).replace(/[^\w\-]/g,'_') + '.jpg';
+      return new Response(bin, {
+        headers: {
+          ...cors,
+          'Content-Type': 'image/jpeg',
+          'Content-Disposition': 'inline; filename="' + nombreArch + '"',
+          'Cache-Control': 'public, max-age=3600',
+        },
+      });
     }
 
     const connStr = (env.nube || '').trim().replace(/^["']|["']$/g, '');
@@ -130,11 +167,9 @@ export default {
                  WHERE f.punto_id = p.id AND f.lat IS NULL AND p.lat IS NOT NULL`);
       await sql(`CREATE INDEX IF NOT EXISTS fotos_punto_id_idx ON fotos (punto_id)`);
       await sql(`CREATE INDEX IF NOT EXISTS fotos_geom_idx ON fotos USING GIST (geom)`);
-      // Vista fotos_geo: solo metadatos + geometría (sin data_base64) para
-      // cargar en QGIS sin traer megabytes de imágenes.
-      await sql(`CREATE OR REPLACE VIEW fotos_geo AS
-                 SELECT id, punto_id, ord, nombre_punto, tomada_en, lat, lon, subido_en, geom
-                 FROM fotos WHERE geom IS NOT NULL`);
+      // fotos_geo se elimina: la información de fotos ahora va JOIN'd
+      // directamente en las vistas de puntos (n_fotos + foto_url).
+      await sql(`DROP VIEW IF EXISTS fotos_geo`);
 
       // Papelera de IDs: si el usuario borra un punto/track desde Neon (o QGIS),
       // el ID queda acá y ya no se acepta nunca más en un POST (silenciosamente
@@ -163,24 +198,59 @@ export default {
       await sql(`CREATE TRIGGER trg_punto_fotos AFTER DELETE ON puntos
                  FOR EACH ROW EXECUTE FUNCTION _limpiar_fotos_de_punto()`);
 
-      // Función que crea/actualiza una vista por día con los datos: puntos_YYYY_MM_DD
-      // y tracks_YYYY_MM_DD (zona Costa Rica). QGIS las lista como capas separadas.
-      await sql(`CREATE OR REPLACE FUNCTION crear_vistas_por_dia() RETURNS void AS $fn$
+      // Limpiar versiones anteriores de la función (firmas viejas quedaban).
+      await sql(`DROP FUNCTION IF EXISTS crear_vistas_por_dia()`);
+      await sql(`DROP FUNCTION IF EXISTS crear_vistas_por_dia(text)`);
+      // Función que crea/actualiza:
+      //   - VIEW puntos_geo (todos los puntos + n_fotos + foto_url + fotos_urls)
+      //   - Una VIEW por día para puntos y otra para tracks
+      // Las URLs se construyen como: prefix || id || suffix   → así se puede
+      // embeber ?t=TOKEN en el suffix sin exponer el token en el schema aparte.
+      // Usa DROP+CREATE (no CREATE OR REPLACE) porque las columnas cambian.
+      await sql(`CREATE OR REPLACE FUNCTION crear_vistas_por_dia(prefix text, suffix text) RETURNS void AS $fn$
         DECLARE d date; vname text;
         BEGIN
+          EXECUTE format('DROP VIEW IF EXISTS puntos_geo CASCADE');
+          EXECUTE format(
+            'CREATE VIEW puntos_geo AS
+             SELECT p.*, COALESCE(fc.n_fotos, 0) AS n_fotos,
+                    fc.foto_url, fc.fotos_urls
+             FROM puntos p
+             LEFT JOIN (
+               SELECT punto_id,
+                      count(*) AS n_fotos,
+                      MIN(%L || id || %L) AS foto_url,
+                      string_agg(%L || id || %L, '' | '' ORDER BY ord) AS fotos_urls
+               FROM fotos WHERE punto_id IS NOT NULL
+               GROUP BY punto_id
+             ) fc ON fc.punto_id = p.id',
+            prefix, suffix, prefix, suffix);
           FOR d IN SELECT DISTINCT DATE(fecha AT TIME ZONE 'America/Costa_Rica')
                    FROM puntos WHERE fecha IS NOT NULL LOOP
             vname := 'puntos_' || to_char(d, 'YYYY_MM_DD');
+            EXECUTE format('DROP VIEW IF EXISTS %I CASCADE', vname);
             EXECUTE format(
-              'CREATE OR REPLACE VIEW %I AS SELECT * FROM puntos
-               WHERE DATE(fecha AT TIME ZONE ''America/Costa_Rica'') = %L',
-              vname, d);
+              'CREATE VIEW %I AS
+               SELECT p.*, COALESCE(fc.n_fotos, 0) AS n_fotos,
+                      fc.foto_url, fc.fotos_urls
+               FROM puntos p
+               LEFT JOIN (
+                 SELECT punto_id,
+                        count(*) AS n_fotos,
+                        MIN(%L || id || %L) AS foto_url,
+                        string_agg(%L || id || %L, '' | '' ORDER BY ord) AS fotos_urls
+                 FROM fotos WHERE punto_id IS NOT NULL
+                 GROUP BY punto_id
+               ) fc ON fc.punto_id = p.id
+               WHERE DATE(p.fecha AT TIME ZONE ''America/Costa_Rica'') = %L',
+              vname, prefix, suffix, prefix, suffix, d);
           END LOOP;
           FOR d IN SELECT DISTINCT DATE(fecha AT TIME ZONE 'America/Costa_Rica')
                    FROM tracks WHERE fecha IS NOT NULL LOOP
             vname := 'tracks_' || to_char(d, 'YYYY_MM_DD');
+            EXECUTE format('DROP VIEW IF EXISTS %I CASCADE', vname);
             EXECUTE format(
-              'CREATE OR REPLACE VIEW %I AS SELECT * FROM tracks
+              'CREATE VIEW %I AS SELECT * FROM tracks
                WHERE DATE(fecha AT TIME ZONE ''America/Costa_Rica'') = %L',
               vname, d);
           END LOOP;
@@ -188,10 +258,14 @@ export default {
         $fn$ LANGUAGE plpgsql`);
     }
 
-    // Refresca las vistas por día. Se llama al final de cada POST exitoso
-    // para que la vista del día aparezca sola en QGIS sin intervención.
+    // prefijo y sufijo para armar URLs de foto: prefix + id + suffix
+    // → https://nube.xxx.workers.dev/foto/  +  ID  +  ?t=TOKEN
+    const URL_FOTO_PREFIX = url.origin + '/foto/';
+    const URL_FOTO_SUFFIX = '?t=' + encodeURIComponent(env.API_TOKEN || '');
     async function refrescarVistasPorDia() {
-      try { await sql(`SELECT crear_vistas_por_dia()`); } catch (e) { /* no bloquea */ }
+      try { await sql(`SELECT crear_vistas_por_dia($1::text, $2::text)`,
+                      [URL_FOTO_PREFIX, URL_FOTO_SUFFIX]); }
+      catch (e) { /* no bloquea */ }
     }
 
     try {
