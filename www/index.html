@@ -101,7 +101,11 @@ label{display:block;font-size:9px;letter-spacing:.14em;text-transform:uppercase;
 .spin{width:22px;height:22px;border:3px solid var(--cauce);border-top-color:var(--fix);border-radius:50%;animation:girar .8s linear infinite;display:inline-block;vertical-align:middle}
 #cargando{position:fixed;inset:0;z-index:30;display:none;align-items:center;justify-content:center;background:rgba(10,18,20,.55)}
 #cargando.on{display:flex}
-#cargando .caja{background:var(--lecho);border:1px solid var(--cauce);border-radius:12px;padding:20px 26px;display:flex;gap:14px;align-items:center;font-size:13px;color:var(--niebla);max-width:80%}
+#cargando .caja{background:var(--lecho);border:1px solid var(--cauce);border-radius:12px;padding:20px 26px;display:flex;flex-direction:column;gap:10px;font-size:13px;color:var(--niebla);max-width:85%;min-width:260px}
+#cargando .caja .cabecera{display:flex;gap:14px;align-items:center}
+#cargProg{width:100%;height:8px;background:var(--cauce);border-radius:4px;overflow:hidden;display:none}
+#cargProg.on{display:block}
+#cargProgBarra{height:100%;background:var(--fix);width:0%;transition:width .25s}
 #cargaGps{position:absolute;inset:0;z-index:8;display:none;flex-direction:column;align-items:center;justify-content:center;gap:14px;background:var(--abismo);text-align:center;padding:24px}
 #cargaGps.on{display:flex}
 #cargaGps .t{font-size:14px;color:var(--niebla)}
@@ -213,7 +217,7 @@ label{display:block;font-size:9px;letter-spacing:.14em;text-transform:uppercase;
   <div id="tablaLatHead"><h3>Elementos consultados</h3><button id="tablaLatCerrar">×</button></div>
   <div id="tablaLatCuerpo"></div>
 </div>
-<div id="cargando"><div class="caja"><div class="spin"></div><div id="cargandoTxt">Cargando…</div></div></div>
+<div id="cargando"><div class="caja"><div class="cabecera"><div class="spin"></div><div id="cargandoTxt">Cargando…</div></div><div id="cargProg"><div id="cargProgBarra"></div></div></div></div>
 
 <script>
 "use strict";
@@ -1444,6 +1448,7 @@ async function finalizarOcupacion(){
   ocupacion = null;
   cerrarPanel(); dibujar();
   toast(`Punto promediado: ${nMuestras} muestras · ±${r.stdM.toFixed(2)} m`);
+  disparoAutoSync();
 }
 function cancelarOcupacion(){
   if(ocupacion && ocupacion.timer) clearInterval(ocupacion.timer);
@@ -1508,6 +1513,7 @@ async function alternarTrack(){
     await dbDel('conf','trackEnCurso');
     const rech = S.grabando.rechazados||0;
     toast(`Track guardado · ${S.grabando.pts.length} puntos · ${S.grabando.dist.toFixed(0)} m` + (rech?` · ${rech} filtrados`:''));
+    disparoAutoSync();
     S.grabando = null;
     b.dataset.on = '0'; b.textContent = 'Grabar track';
     await detenerServicioTrack();
@@ -1729,6 +1735,7 @@ document.getElementById('btnWp').onclick = ()=>{
     await dbPut('puntos', p);
     S.puntos.push(p); cerrarPanel(); dibujar();
     toast('Punto guardado' + (fotos.length?' · '+fotos.length+' foto(s)':'') + '.');
+    disparoAutoSync();
   };
   document.getElementById('wpProm').onclick = async ()=>{
     const dp = await recolectarDatosPlantilla();
@@ -1756,7 +1763,6 @@ document.getElementById('btnMenu').onclick = ()=>{
   abrirPanel('Menú', `
     <div class="fila"><div class="cuerpo"><div class="t">Capas del proyecto</div><div class="s">${S.capas.length} capa(s) · GeoJSON · KML · SHP · WFS · WMS</div></div><button class="mini" id="mCapas">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Puntos y tracks</div><div class="s">${S.puntos.length} puntos · ${S.tracks.length} tracks</div></div><button class="mini" id="mDatos">Ver</button></div>
-    <div class="fila"><div class="cuerpo"><div class="t">Plantillas de captura</div><div class="s">${plantillas.length} plantilla(s) · se eligen al marcar un punto</div></div><button class="mini" id="mPlant">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Convertir coordenadas</div><div class="s">Geo ↔ CRTM05 ↔ Lambert N/S</div></div><button class="mini" id="mConv">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Mapa sin conexión</div><div class="s">Zonas y parches descargables</div></div><button class="mini" id="mOff">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Exportar proyecto</div><div class="s">GPX · CSV · GeoJSON</div></div><button class="mini" id="mExp">Abrir</button></div>
@@ -1765,7 +1771,6 @@ document.getElementById('btnMenu').onclick = ()=>{
     <div class="fila"><div class="cuerpo"><div class="t">Actualizar app</div><div class="s">Build actual: ${APP_BUILD||'dev'} · buscar versión nueva</div></div><button class="mini" id="mUpd">Buscar</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">⚙ Configuración y términos de uso</div><div class="s">Fuente, diagnóstico, filtros, alertas, precisión</div></div><button class="mini" id="mConfig">Abrir</button></div>
   `);
-  document.getElementById('mPlant').onclick = panelPlantillas;
   document.getElementById('mUpd').onclick = ()=> buscarActualizacion(true);
   document.getElementById('mCapas').onclick = panelCapas;
   document.getElementById('mDatos').onclick = panelDatos;
@@ -1779,12 +1784,14 @@ document.getElementById('btnMenu').onclick = ()=>{
 // Panel agrupado: Configuración y términos de uso.
 function panelConfig(){
   abrirPanel('Configuración y términos de uso', `
+    <div class="fila"><div class="cuerpo"><div class="t">Plantillas de captura</div><div class="s">${plantillas.length} plantilla(s) · se eligen al marcar un punto</div></div><button class="mini" id="cPlant">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Diagnóstico GNSS</div><div class="s">Satélites, L5, exactitud</div></div><button class="mini" id="cDiag">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Filtros de calidad</div><div class="s">${S.filtros.activo?'Activo · '+S.filtros.preset:'Apagado'}</div></div><button class="mini" id="cFilt">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Alertas de proximidad</div><div class="s">${alertas.filter(a=>a.activa).length} activa(s) de ${alertas.length}</div></div><button class="mini" id="cAlert">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Fuente de posición</div><div class="s">${S.fuente==='gps'?'GPS puro (nativo)':'Fusionada (GPS+WiFi+celda)'}</div></div><button class="mini" id="cFuente">Cambiar</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Precisión y advertencias</div><div class="s">Términos de uso · leer antes de usar en expedientes</div></div><button class="mini" id="cInfo">Abrir</button></div>
   `);
+  document.getElementById('cPlant').onclick = panelPlantillas;
   document.getElementById('cDiag').onclick  = panelDiagnosticos;
   document.getElementById('cFilt').onclick  = panelFiltros;
   document.getElementById('cAlert').onclick = panelAlertas;
@@ -3414,8 +3421,21 @@ async function agregarCapaWMS(nombre, url, layerName, version){
   panelCapas();
 }
 /* --- overlay de carga --- */
-function mostrarCargando(txt){ document.getElementById('cargandoTxt').textContent = txt||'Cargando…'; document.getElementById('cargando').classList.add('on'); }
-function ocultarCargando(){ document.getElementById('cargando').classList.remove('on'); }
+function mostrarCargando(txt, conProgreso){
+  document.getElementById('cargandoTxt').textContent = txt||'Cargando…';
+  document.getElementById('cargando').classList.add('on');
+  const p = document.getElementById('cargProg');
+  if(conProgreso){ p.classList.add('on'); document.getElementById('cargProgBarra').style.width = '0%'; }
+  else p.classList.remove('on');
+}
+function actualizarProgreso(pct, txt){
+  document.getElementById('cargProgBarra').style.width = Math.max(0, Math.min(100, pct)) + '%';
+  if(txt) document.getElementById('cargandoTxt').textContent = txt;
+}
+function ocultarCargando(){
+  document.getElementById('cargando').classList.remove('on');
+  document.getElementById('cargProg').classList.remove('on');
+}
 /* --- consulta de capas (tabla de atributos) --- */
 let ultimoT = null;
 function latlonAPantalla(lat,lon){ if(!ultimoT) return null; const t=ultimoT; return { x:(lon2px(lon,t.zi)-t.x0)*t.esc, y:(lat2px(lat,t.zi)-t.y0)*t.esc }; }
@@ -4041,59 +4061,100 @@ async function purgarBorradosDesdeNube(){
     return { np, nt };
   }catch(e){ return { np:0, nt:0, error:e.message||String(e) }; }
 }
+let syncEnCurso = false;   // evita reentradas del auto-sync
 async function sincronizarNube(manual){
+  if(syncEnCurso){ if(manual) toast('Ya hay una sincronización en curso.'); return; }
   if(!syncCfg.url){ if(manual) toast('Configurá la URL del proxy primero.'); return; }
   if(!navigator.onLine){ if(manual) toast('Sin conexión; se subirá cuando haya internet.'); return; }
-  // 1) Purga primero: si algo fue borrado en Neon, sacarlo local ANTES de
-  //    intentar subirlo (el server igual lo ignora, pero así queda limpio).
-  const purga = await purgarBorradosDesdeNube();
-  const puntosPend = S.puntos.filter(p=> p.sincronizado!==true);
-  const tracksPend = (S.tracks||[]).filter(t=> t.sincronizado!==true);
-  // Puntos con fotos aún sin subir (independiente de si el punto ya se sincronizó).
-  const puntosConFotosPend = S.puntos.filter(p=> p.fotos && p.fotos.length && p.fotosSincronizadas!==true);
-  if(!puntosPend.length && !tracksPend.length && !puntosConFotosPend.length){
-    if(manual) toast('No hay nada pendiente de subir.'); return;
-  }
-  if(manual) mostrarCargando('Subiendo…');
-  let nP = 0, nT = 0, nF = 0, err = null;
+  syncEnCurso = true;
+  if(manual) mostrarCargando('Preparando…', true);
   try{
+    // 1) Purga: si algo se borró en Neon, sacarlo local primero.
+    if(manual) actualizarProgreso(5, 'Consultando borrados…');
+    const purga = await purgarBorradosDesdeNube();
+    const puntosPend = S.puntos.filter(p=> p.sincronizado!==true);
+    const tracksPend = (S.tracks||[]).filter(t=> t.sincronizado!==true);
+    const puntosConFotosPend = S.puntos.filter(p=> p.fotos && p.fotos.length && p.fotosSincronizadas!==true);
+    // Pasos totales para la barra de progreso.
+    const totalFotos = puntosConFotosPend.reduce((s,p)=> s + Math.ceil(p.fotos.length/5), 0);
+    const pasos = 1 /* purga */ + (puntosPend.length?1:0) + (tracksPend.length?1:0) + totalFotos;
+    if(!puntosPend.length && !tracksPend.length && !puntosConFotosPend.length){
+      if(manual){ ocultarCargando(); toast(purga.np||purga.nt ? 'Nada pendiente. Purgados '+purga.np+' punto(s) y '+purga.nt+' track(s).' : 'No hay nada pendiente de subir.'); }
+      syncEnCurso = false; return;
+    }
+    let paso = 1, nP=0, nT=0, nF=0;
+    const avance = (extraTxt)=>{
+      if(!manual) return;
+      const pct = 5 + Math.round((paso/pasos) * 95);
+      actualizarProgreso(pct, extraTxt);
+    };
     if(puntosPend.length){
+      if(manual) actualizarProgreso(Math.round((paso/pasos)*95)+5, 'Subiendo '+puntosPend.length+' punto(s)…');
       const rr = await postNube('/puntos', { puntos: puntosPend.map(puntoParaNube) });
       for(const p of puntosPend){ p.sincronizado = true; await dbPut('puntos', p); }
       nP = rr.recibidos || puntosPend.length;
+      paso++; avance();
     }
     if(tracksPend.length){
+      if(manual) actualizarProgreso(Math.round((paso/pasos)*95)+5, 'Subiendo '+tracksPend.length+' track(s)…');
       const rr = await postNube('/tracks', { tracks: tracksPend.map(trackParaNube) });
       for(const t of tracksPend){ t.sincronizado = true; await dbPut('tracks', t); }
       nT = rr.recibidos || tracksPend.length;
+      paso++; avance();
     }
-    // Fotos: se suben por lotes para no armar cuerpos gigantes (cada foto ~100KB base64).
-    // Cada punto puede tener varias, y todas se envían en tandas de hasta 5.
     if(puntosConFotosPend.length){
       const LOTE = 5;
-      let procesados = 0;
       for(const p of puntosConFotosPend){
         const paquete = [];
         for(let i=0;i<p.fotos.length;i++){
-          // La foto viene como data URL "data:image/jpeg;base64,XXXX"; enviamos solo la parte base64.
           const raw = String(p.fotos[i]||'');
           const b64 = raw.includes(',') ? raw.slice(raw.indexOf(',')+1) : raw;
           paquete.push({ id: p.id+'_'+i, punto_id: p.id, ord: i, data_base64: b64 });
         }
-        // Enviar en tandas.
         for(let i=0;i<paquete.length;i+=LOTE){
+          if(manual) actualizarProgreso(Math.round((paso/pasos)*95)+5,
+            'Subiendo fotos ('+paso+'/'+pasos+')…');
           const rr = await postNube('/fotos', { fotos: paquete.slice(i, i+LOTE) });
           nF += rr.recibidas || 0;
+          paso++;
         }
         p.fotosSincronizadas = true;
         await dbPut('puntos', p);
-        procesados++;
       }
     }
-  }catch(e){ err = e; }
-  finally{ if(manual) ocultarCargando(); }
-  if(err){ if(manual) toast('No se pudo subir: '+(err.message||err)); return; }
-  if(manual) toast('Subidos '+nP+' punto(s), '+nT+' track(s) y '+nF+' foto(s) a Neon.');
+    if(manual) actualizarProgreso(100, 'Listo');
+    if(manual) toast('Subidos '+nP+' punto(s), '+nT+' track(s) y '+nF+' foto(s).');
+  }catch(e){
+    if(manual) toast('No se pudo subir: '+(e.message||e));
+  }finally{
+    if(manual) setTimeout(ocultarCargando, 400);
+    syncEnCurso = false;
+  }
+}
+// Auto-sync que corre cada N segundos si está activo y hay internet.
+// Además se dispara al hacer visible la app y al recuperar internet.
+function programarAutoSync(){
+  // Cada 60 segundos, si está activo el auto-sync, intentar subir pendientes.
+  setInterval(()=>{
+    if(syncCfg && syncCfg.auto && syncCfg.url && navigator.onLine && !syncEnCurso){
+      const pend = S.puntos.filter(p=>p.sincronizado!==true).length
+                 + (S.tracks||[]).filter(t=>t.sincronizado!==true).length
+                 + S.puntos.filter(p=>p.fotos&&p.fotos.length&&p.fotosSincronizadas!==true).length;
+      if(pend > 0) sincronizarNube(false);
+    }
+  }, 60000);
+  document.addEventListener('visibilitychange', ()=>{
+    if(!document.hidden && syncCfg && syncCfg.auto && syncCfg.url && navigator.onLine){
+      setTimeout(()=> sincronizarNube(false), 2000);
+    }
+  });
+}
+// Se llama después de marcar un punto o guardar un track para intentar
+// subirlo enseguida (silenciosa) si hay internet y auto-sync activado.
+function disparoAutoSync(){
+  if(syncCfg && syncCfg.auto && syncCfg.url && navigator.onLine && !syncEnCurso){
+    setTimeout(()=> sincronizarNube(false), 500);
+  }
 }
 function panelSync(){
   const puntosPend = S.puntos.filter(p=> p.sincronizado!==true).length;
@@ -4564,40 +4625,92 @@ function panelSimbologia(id){
   };
   render();
 }
+// Devuelve las capas agrupadas por c.grupo (o "Sin grupo"), preservando el orden.
+function capasPorGrupo(){
+  const grupos = new Map();
+  for(const c of S.capas){
+    const g = c.grupo || 'Sin grupo';
+    if(!grupos.has(g)) grupos.set(g, []);
+    grupos.get(g).push(c);
+  }
+  return grupos;
+}
+// Estado de colapso de cada grupo en el panel (se conserva mientras el panel viva).
+let grupoColapsado = {};
+// Cambia el grupo de una capa (pide texto). Vacío = "Sin grupo".
+async function cambiarGrupoCapa(id){
+  const c = S.capas.find(x=>x.id===id); if(!c) return;
+  const g = prompt('Nombre del grupo (dejar vacío para quitar del grupo):', c.grupo||'');
+  if(g===null) return;
+  c.grupo = g.trim() || null;
+  await dbPut('capas', c); panelCapas();
+}
+// Mueve una capa arriba/abajo dentro de S.capas y persiste.
+async function moverCapa(id, dir){
+  const i = S.capas.findIndex(x=>x.id===id); if(i<0) return;
+  const j = i + dir;
+  if(j<0 || j>=S.capas.length) return;
+  const tmp = S.capas[i]; S.capas[i] = S.capas[j]; S.capas[j] = tmp;
+  // Persistir el orden asignando índices explícitos.
+  for(let k=0;k<S.capas.length;k++){ S.capas[k].orden = k; await dbPut('capas', S.capas[k]); }
+  dibujar(); panelCapas();
+}
+function renderFilaCapa(c, idx, total){
+  const nElem = c.tipo==='wms' ? 'WMS' : c.tipo==='big' ? ('Grande · '+c.nFeats+' elem.') : 'Vector · '+((c.geojson&&c.geojson.features||[]).length)+' elem.';
+  const online = !!(c.fuenteTipo || c.tipo==='wms');
+  const fechaFmt = c.fuenteFecha ? ' · desde ' + new Date(c.fuenteFecha).toLocaleDateString('es-CR') : '';
+  const puedeVincular = c.tipo!=='wms' && c.tipo!=='big' && !c.fuenteTipo;
+  return `<div class="fila">
+    <div style="display:flex;flex-direction:column;gap:2px">
+      <button class="mini" data-up="${c.id}" ${idx===0?'disabled style="opacity:.3"':''} title="Subir">▲</button>
+      <button class="mini" data-dn="${c.id}" ${idx===total-1?'disabled style="opacity:.3"':''} title="Bajar">▼</button>
+    </div>
+    <div class="cuerpo"><div class="t"><span style="color:${c.color||'#8899AA'}">■</span> ${escHtml(c.nombre)}${online?' <span style="color:var(--musgo);font-size:10px">☁</span>':''}</div>
+      <div class="s">${nElem} · ${c.consultable===false?'🔒 solo vista':'🔍 consultable'}${c.proyFuente&&c.proyFuente!=='geo'?' · 🌐 '+(c.proyFuente==='crtm05'?'CRTM05':c.proyFuente==='ln'?'Lambert N':'Lambert S'):''}${c.etiqueta?' · 🏷 '+escHtml(c.etiqueta):''}${fechaFmt}</div></div>
+    <div style="display:flex;flex-direction:column;gap:4px">
+      <button class="mini ${c.visible?'verde':''}" data-tg="${c.id}">${c.visible?'Ver':'off'}</button>
+      <button class="mini ${c.consultable===false?'':'verde'}" data-tq="${c.id}">${c.consultable===false?'🔒':'🔍'}</button>
+      ${online&&c.fuenteTipo?`<button class="mini" data-tr="${c.id}" title="Actualizar buffer desde el origen">🔄</button>`:''}
+      ${puedeVincular?`<button class="mini" data-vc="${c.id}" title="Vincular esta capa a una URL de origen">🔗</button>`:''}
+      <button class="mini" data-gr="${c.id}" title="Cambiar grupo">📁</button>
+    </div>
+    ${c.tipo==='big'?`<div style="display:flex;flex-direction:column;gap:4px">
+      <button class="mini" data-se="${c.id}" title="Estilo">🎨</button>
+      <button class="mini" data-cir="${c.id}" title="Ir a la capa">◎</button>
+    </div>` : c.tipo!=='wms'?`<div style="display:flex;flex-direction:column;gap:4px">
+      <button class="mini" data-tb="${c.id}">Tabla</button>
+      <button class="mini" data-sm="${c.id}" title="Simbología por atributo">🎨</button>
+      <button class="mini ${c.etiqueta?'verde':''}" data-et="${c.id}">🏷</button>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:4px">
+      <button class="mini" data-se="${c.id}" title="Estilo">🎨</button>
+      <button class="mini" data-pj="${c.id}" title="Proyección">🌐</button>
+    </div>
+    <button class="mini" data-cir="${c.id}" title="Ir a la capa" style="align-self:center">◎</button>`:''}
+    <button class="mini rojo" data-bc="${c.id}">×</button>
+  </div>`;
+}
 function panelCapas(){
-  abrirPanel('Capas del proyecto', `
-    ${S.capas.length ? S.capas.map(c=>{
-      const nElem = c.tipo==='wms' ? 'WMS' : c.tipo==='big' ? ('Grande · '+c.nFeats+' elem.') : 'Vector · '+((c.geojson&&c.geojson.features||[]).length)+' elem.';
-      const online = !!(c.fuenteTipo || c.tipo==='wms');
-      const fechaFmt = c.fuenteFecha ? ' · desde ' + new Date(c.fuenteFecha).toLocaleDateString('es-CR') : '';
-      // Capa vectorial (no wms, no big) que aún no está vinculada a una URL:
-      // mostramos botón 🔗 para vincularla y así poder refrescarla después.
-      const puedeVincular = c.tipo!=='wms' && c.tipo!=='big' && !c.fuenteTipo;
-      return `<div class="fila">
-        <div class="cuerpo"><div class="t"><span style="color:${c.color||'#8899AA'}">■</span> ${c.nombre}${online?' <span style="color:var(--musgo);font-size:10px">☁</span>':''}</div>
-          <div class="s">${nElem} · ${c.consultable===false?'🔒 solo vista':'🔍 consultable'}${c.proyFuente&&c.proyFuente!=='geo'?' · 🌐 '+(c.proyFuente==='crtm05'?'CRTM05':c.proyFuente==='ln'?'Lambert N':'Lambert S'):''}${c.etiqueta?' · 🏷 '+escHtml(c.etiqueta):''}${fechaFmt}</div></div>
-        <div style="display:flex;flex-direction:column;gap:4px">
-          <button class="mini ${c.visible?'verde':''}" data-tg="${c.id}">${c.visible?'Ver':'off'}</button>
-          <button class="mini ${c.consultable===false?'':'verde'}" data-tq="${c.id}">${c.consultable===false?'🔒':'🔍'}</button>
-          ${online&&c.fuenteTipo?`<button class="mini" data-tr="${c.id}" title="Actualizar buffer desde el origen">🔄</button>`:''}
-          ${puedeVincular?`<button class="mini" data-vc="${c.id}" title="Vincular esta capa a una URL de origen">🔗</button>`:''}
+  const grupos = capasPorGrupo();
+  let contenido = '';
+  if(!S.capas.length){
+    contenido = '<div class="vacio">Sin capas todavía. Agregá una abajo.<br>Tocá un elemento en el mapa para ver sus atributos.</div>';
+  } else {
+    for(const [nombreGrupo, capasG] of grupos){
+      const col = !!grupoColapsado[nombreGrupo];
+      contenido += `<div style="margin-top:10px;background:var(--abismo);border:1px solid var(--cauce);border-radius:8px;overflow:hidden">
+        <div data-tgg="${escHtml(nombreGrupo)}" style="padding:8px 12px;background:var(--cauce);cursor:pointer;display:flex;justify-content:space-between;align-items:center;user-select:none;font-weight:600;font-size:12px">
+          <span>${col?'▸':'▾'} 📁 ${escHtml(nombreGrupo)} <span style="color:var(--musgo);font-weight:400">· ${capasG.length}</span></span>
         </div>
-        ${c.tipo==='big'?`<div style="display:flex;flex-direction:column;gap:4px">
-          <button class="mini" data-se="${c.id}" title="Estilo">🎨</button>
-          <button class="mini" data-cir="${c.id}" title="Ir a la capa">◎</button>
-        </div>` : c.tipo!=='wms'?`<div style="display:flex;flex-direction:column;gap:4px">
-          <button class="mini" data-tb="${c.id}">Tabla</button>
-          <button class="mini" data-sm="${c.id}" title="Simbología por atributo">🎨</button>
-          <button class="mini ${c.etiqueta?'verde':''}" data-et="${c.id}">🏷</button>
-        </div>
-        <div style="display:flex;flex-direction:column;gap:4px">
-          <button class="mini" data-se="${c.id}" title="Estilo">🎨</button>
-          <button class="mini" data-pj="${c.id}" title="Proyección">🌐</button>
-        </div>
-        <button class="mini" data-cir="${c.id}" title="Ir a la capa" style="align-self:center">◎</button>`:''}
-        <button class="mini rojo" data-bc="${c.id}">×</button>
+        ${col?'':`<div style="padding:0 12px">${capasG.map((c)=>{
+          const idxGlobal = S.capas.indexOf(c);
+          return renderFilaCapa(c, idxGlobal, S.capas.length);
+        }).join('')}</div>`}
       </div>`;
-    }).join('') : '<div class="vacio">Sin capas todavía. Agregá una abajo.<br>Tocá un elemento en el mapa para ver sus atributos.</div>'}
+    }
+  }
+  abrirPanel('Capas del proyecto', `
+    ${contenido}
     <label>Agregar capa</label>
     <select id="capTipo">
       <option value="wms">WMS (servicio) — escanear capas</option>
@@ -4612,6 +4725,12 @@ function panelCapas(){
   document.querySelectorAll('[data-tq]').forEach(b=> b.onclick = ()=> toggleConsultable(b.dataset.tq));
   document.querySelectorAll('[data-tr]').forEach(b=> b.onclick = async ()=>{ await refrescarCapaOnline(b.dataset.tr); panelCapas(); });
   document.querySelectorAll('[data-vc]').forEach(b=> b.onclick = ()=> vincularCapaAURL(b.dataset.vc));
+  document.querySelectorAll('[data-up]').forEach(b=> b.onclick = ()=> moverCapa(b.dataset.up, -1));
+  document.querySelectorAll('[data-dn]').forEach(b=> b.onclick = ()=> moverCapa(b.dataset.dn, +1));
+  document.querySelectorAll('[data-gr]').forEach(b=> b.onclick = ()=> cambiarGrupoCapa(b.dataset.gr));
+  document.querySelectorAll('[data-tgg]').forEach(el=> el.onclick = ()=>{
+    const n = el.dataset.tgg; grupoColapsado[n] = !grupoColapsado[n]; panelCapas();
+  });
   document.querySelectorAll('[data-tb]').forEach(b=> b.onclick = ()=> tablaAtributos(b.dataset.tb));
   document.querySelectorAll('[data-sm]').forEach(b=> b.onclick = ()=> panelSimbologia(b.dataset.sm));
   document.querySelectorAll('[data-et]').forEach(b=> b.onclick = ()=> panelEtiqueta(b.dataset.et));
@@ -4851,7 +4970,11 @@ function exportarDiagCSV(){
   S.capa = await dbGet('conf','capa') || 'sat';
   const filtGuardados = await dbGet('conf','filtros');
   if(filtGuardados) S.filtros = Object.assign(S.filtros, filtGuardados);
-  try{ S.capas = await dbAll('capas') || []; }catch(e){ S.capas = []; }
+  try{
+    S.capas = await dbAll('capas') || [];
+    // Respetar orden manual guardado (c.orden). Capas sin orden van al final.
+    S.capas.sort((a,b)=> ((a.orden??1e9) - (b.orden??1e9)));
+  }catch(e){ S.capas = []; }
   await cargarPlantillas();
   await cargarAlertas();
   await cargarSyncCfg();
@@ -4900,6 +5023,8 @@ function exportarDiagCSV(){
   if(navigator.onLine){ setTimeout(()=> buscarActualizacion(false), 4000); }
   // Subir a la nube lo pendiente al arrancar (si está configurado y en auto).
   if(navigator.onLine && syncCfg.auto && syncCfg.url){ setTimeout(()=> sincronizarNube(false), 6000); }
+  // Auto-sync periódico + al volver de background + al recuperar internet.
+  programarAutoSync();
 })();
 </script>
 </body>

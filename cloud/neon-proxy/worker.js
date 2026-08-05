@@ -185,11 +185,16 @@ export default {
         let n = 0, ignorados = 0;
         for (const p of puntos) {
           if (borrados.has(p.id)) { ignorados++; continue; }
+          // Casts explícitos: sin ellos Postgres no infiere el tipo cuando
+          // el parámetro es NULL dentro de un CASE (falla con "could not
+          // determine data type of parameter $N").
           await sql(
             `INSERT INTO puntos (id, proy, nombre, detalle, fecha, lat, lon, alt_orto, exac, geom)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9,
-                     CASE WHEN $6 IS NULL OR $7 IS NULL THEN NULL
-                          ELSE ST_SetSRID(ST_MakePoint($7, $6), 4326) END)
+             VALUES ($1::text, $2::text, $3::text, $4::text, $5::timestamptz,
+                     $6::double precision, $7::double precision,
+                     $8::double precision, $9::double precision,
+                     CASE WHEN $6::double precision IS NULL OR $7::double precision IS NULL THEN NULL
+                          ELSE ST_SetSRID(ST_MakePoint($7::double precision, $6::double precision), 4326) END)
              ON CONFLICT (id) DO UPDATE SET
                nombre = EXCLUDED.nombre,
                detalle = EXCLUDED.detalle,
@@ -225,8 +230,9 @@ export default {
           const gj = t.geojson ? JSON.stringify(t.geojson) : null;
           await sql(
             `INSERT INTO tracks (id, proy, nombre, detalle, fecha, distancia_m, n_puntos, geojson, geom)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb,
-                     CASE WHEN $8 IS NULL THEN NULL
+             VALUES ($1::text, $2::text, $3::text, $4::text, $5::timestamptz,
+                     $6::double precision, $7::integer, $8::jsonb,
+                     CASE WHEN $8::text IS NULL THEN NULL
                           ELSE ST_SetSRID(ST_GeomFromGeoJSON(($8::jsonb)->>'geometry'), 4326) END)
              ON CONFLICT (id) DO UPDATE SET
                nombre = EXCLUDED.nombre,
@@ -266,7 +272,7 @@ export default {
         for (const f of fotos) {
           await sql(
             `INSERT INTO fotos (id, punto_id, ord, data_base64)
-             VALUES ($1, $2, $3, $4)
+             VALUES ($1::text, $2::text, $3::integer, $4::text)
              ON CONFLICT (id) DO UPDATE SET
                data_base64 = EXCLUDED.data_base64,
                ord = EXCLUDED.ord`,
