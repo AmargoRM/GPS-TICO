@@ -107,9 +107,34 @@ export default {
         punto_id text,
         ord integer,
         data_base64 text,
+        lat double precision,
+        lon double precision,
+        nombre_punto text,
+        tomada_en timestamptz,
+        geom geometry(Point, 4326),
         subido_en timestamptz DEFAULT now()
       )`);
+      // Migración: agregar columnas a la tabla si ya existía sin ellas.
+      await sql(`ALTER TABLE fotos ADD COLUMN IF NOT EXISTS lat double precision`);
+      await sql(`ALTER TABLE fotos ADD COLUMN IF NOT EXISTS lon double precision`);
+      await sql(`ALTER TABLE fotos ADD COLUMN IF NOT EXISTS nombre_punto text`);
+      await sql(`ALTER TABLE fotos ADD COLUMN IF NOT EXISTS tomada_en timestamptz`);
+      await sql(`ALTER TABLE fotos ADD COLUMN IF NOT EXISTS geom geometry(Point, 4326)`);
+      // Rellenar geom desde lat/lon si es NULL.
+      await sql(`UPDATE fotos SET geom = ST_SetSRID(ST_MakePoint(lon, lat), 4326)
+                 WHERE geom IS NULL AND lat IS NOT NULL AND lon IS NOT NULL`);
+      // Rellenar lat/lon/nombre_punto desde el punto padre (para fotos viejas).
+      await sql(`UPDATE fotos f SET lat = p.lat, lon = p.lon, nombre_punto = p.nombre, tomada_en = p.fecha,
+                                     geom = ST_SetSRID(ST_MakePoint(p.lon, p.lat), 4326)
+                 FROM puntos p
+                 WHERE f.punto_id = p.id AND f.lat IS NULL AND p.lat IS NOT NULL`);
       await sql(`CREATE INDEX IF NOT EXISTS fotos_punto_id_idx ON fotos (punto_id)`);
+      await sql(`CREATE INDEX IF NOT EXISTS fotos_geom_idx ON fotos USING GIST (geom)`);
+      // Vista fotos_geo: solo metadatos + geometría (sin data_base64) para
+      // cargar en QGIS sin traer megabytes de imágenes.
+      await sql(`CREATE OR REPLACE VIEW fotos_geo AS
+                 SELECT id, punto_id, ord, nombre_punto, tomada_en, lat, lon, subido_en, geom
+                 FROM fotos WHERE geom IS NOT NULL`);
 
       // Papelera de IDs: si el usuario borra un punto/track desde Neon (o QGIS),
       // el ID queda acá y ya no se acepta nunca más en un POST (silenciosamente
@@ -271,12 +296,21 @@ export default {
         let n = 0;
         for (const f of fotos) {
           await sql(
-            `INSERT INTO fotos (id, punto_id, ord, data_base64)
-             VALUES ($1::text, $2::text, $3::integer, $4::text)
+            `INSERT INTO fotos (id, punto_id, ord, data_base64, lat, lon, nombre_punto, tomada_en, geom)
+             VALUES ($1::text, $2::text, $3::integer, $4::text,
+                     $5::double precision, $6::double precision, $7::text, $8::timestamptz,
+                     CASE WHEN $5::double precision IS NULL OR $6::double precision IS NULL THEN NULL
+                          ELSE ST_SetSRID(ST_MakePoint($6::double precision, $5::double precision), 4326) END)
              ON CONFLICT (id) DO UPDATE SET
                data_base64 = EXCLUDED.data_base64,
-               ord = EXCLUDED.ord`,
-            [f.id, f.punto_id || null, f.ord ?? 0, f.data_base64 || '']
+               ord = EXCLUDED.ord,
+               lat = EXCLUDED.lat,
+               lon = EXCLUDED.lon,
+               nombre_punto = EXCLUDED.nombre_punto,
+               tomada_en = EXCLUDED.tomada_en,
+               geom = EXCLUDED.geom`,
+            [f.id, f.punto_id || null, f.ord ?? 0, f.data_base64 || '',
+             f.lat ?? null, f.lon ?? null, f.nombre_punto || null, f.tomada_en || null]
           );
           n++;
         }

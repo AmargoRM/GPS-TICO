@@ -151,7 +151,7 @@ public class TrackForegroundService extends Service {
         double lat = loc.getLatitude(), lon = loc.getLongitude();
         if (ultimoPt != null) {
             double d = distanciaM(ultimoPt[0], ultimoPt[1], lat, lon);
-            if (d < 3.0) return; // filtro de distancia mínima
+            if (d < 1.5) return; // filtro de distancia mínima (más denso en background)
         }
         ultimoPt = new double[]{lat, lon};
         try {

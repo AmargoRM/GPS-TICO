@@ -151,8 +151,15 @@ public class GnssPlugin extends Plugin {
     public void startForegroundTracking(PluginCall call) {
         try {
             String text = call.getString("text", "Grabando track…");
+            // 'track' = graba puntos por sí solo con LocationManager (sobrevive
+            // a la pantalla apagada). 'keepalive' = solo mantiene el proceso vivo.
+            String modo = call.getString("modo", "keepalive");
             Intent i = new Intent(getContext(), TrackForegroundService.class);
-            i.setAction(TrackForegroundService.ACTION_KEEPALIVE);
+            if ("track".equals(modo)) {
+                i.setAction(TrackForegroundService.ACTION_TRACK_START);
+            } else {
+                i.setAction(TrackForegroundService.ACTION_KEEPALIVE);
+            }
             i.putExtra(TrackForegroundService.EXTRA_TEXT, text);
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 getContext().startForegroundService(i);
@@ -163,6 +170,20 @@ public class GnssPlugin extends Plugin {
         } catch (Exception e) {
             call.reject("No se pudo iniciar el servicio: " + e.getMessage());
         }
+    }
+    // Para el track nativo (deja de grabar puntos en background pero mantiene la app viva).
+    @PluginMethod
+    public void stopNativeTrack(PluginCall call) {
+        try {
+            Intent i = new Intent(getContext(), TrackForegroundService.class);
+            i.setAction(TrackForegroundService.ACTION_TRACK_STOP);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                getContext().startForegroundService(i);
+            } else {
+                getContext().startService(i);
+            }
+            call.resolve();
+        } catch (Exception e) { call.reject(e.getMessage()); }
     }
 
     // Guarda la fuente (fused/gps) para que el servicio nativo del widget la use.

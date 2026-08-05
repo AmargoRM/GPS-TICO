@@ -1162,8 +1162,13 @@ async function arrancarGPS(){
   // Importar lo que haya grabado el widget en segundo plano.
   await importarPendientesWidget();
   document.addEventListener('visibilitychange', ()=>{
-    if(!document.hidden){ importarPendientesWidget(); consumirArchivoAbierto(); }
-    else {
+    if(!document.hidden){
+      // Al volver al frente: si estábamos grabando, absorber los puntos que el
+      // servicio nativo grabó mientras el WebView estaba dormido.
+      if(S.grabando){ fusionarPuntosNativosAlTrack().catch(()=>{}); }
+      importarPendientesWidget();
+      consumirArchivoAbierto();
+    } else {
       // La app se minimiza / pantalla se apaga: flush inmediato del track en curso
       // para no perder datos si el sistema mata el WebView.
       if(S.grabando){ try{ dbPut('tracks', JSON.parse(JSON.stringify(S.grabando))); }catch(e){} }
@@ -1553,8 +1558,11 @@ async function iniciarServicioTrack(){
   if(!P){ toast('Grabando.'); return; }
   try{
     await P.requestNotifPermission();
-    await P.startForegroundTracking({ text: 'Grabando… tocá para volver a la app' });
-    toast('Grabando. Podés apagar la pantalla; sigue registrando.');
+    // modo:'track' activa la grabación NATIVA con LocationManager. Esto sobrevive
+    // a la pantalla apagada y a que Android pause el WebView. Los puntos se
+    // fusionan al track del JS cuando la app vuelve al frente.
+    await P.startForegroundTracking({ text: 'Grabando… tocá para volver a la app', modo:'track' });
+    toast('Grabando. Podés apagar la pantalla; sigue registrando en background.');
   }catch(e){
     console.log('servicio track error', e);
     toast('Grabando.');
@@ -1563,7 +1571,44 @@ async function iniciarServicioTrack(){
 async function detenerServicioTrack(){
   const P = pluginGnss();
   if(!P) return;
+  try{ if(P.stopNativeTrack) await P.stopNativeTrack(); }catch(e){}
   try{ await P.stopForegroundTracking(); }catch(e){}
+}
+// Fusiona los puntos que el servicio nativo grabó mientras el WebView estaba
+// dormido con el track actual (S.grabando). Se llama al volver al foreground.
+async function fusionarPuntosNativosAlTrack(){
+  if(!S.grabando) return;
+  const P = pluginGnss(); if(!P || !P.importarPendientes) return;
+  let data; try{ data = await P.importarPendientes(); }catch(e){ return; }
+  if(!data || !data.track || !Array.isArray(data.track.pts) || !data.track.pts.length) return;
+  // data.track.pts vienen como [lat, lon, alt, exac, vexac, t].
+  // Se agregan los que aún no están (comparando por timestamp) al track actual.
+  const yaTiene = new Set(S.grabando.pts.map(p=> p.t));
+  let agregados = 0;
+  for(const a of data.track.pts){
+    const t = a[5]; if(!t || yaTiene.has(t)) continue;
+    S.grabando.pts.push({
+      lat:a[0], lon:a[1],
+      alt:(a[2]==null?null:a[2]), exac:(a[3]==null?null:a[3]),
+      vexac:(a[4]==null?null:a[4]),
+      altElip:(a[2]==null?null:a[2]), altOrto:null, fuente:'nativo', t
+    });
+    agregados++;
+  }
+  if(!agregados) return;
+  // Reordenar cronológicamente y recalcular distancia.
+  S.grabando.pts.sort((a,b)=> a.t - b.t);
+  let d = 0;
+  for(let i=1;i<S.grabando.pts.length;i++)
+    d += distM(S.grabando.pts[i-1].lat, S.grabando.pts[i-1].lon, S.grabando.pts[i].lat, S.grabando.pts[i].lon);
+  S.grabando.dist = d;
+  S.grabando.geojson.geometry.coordinates = S.grabando.pts.map(p=>[p.lon, p.lat]);
+  S.grabando.geojson.properties = { nom: S.grabando.nom, dist: S.grabando.dist, puntos: S.grabando.pts.length };
+  S.grabando.aceptados = (S.grabando.aceptados||0) + agregados;
+  await dbPut('tracks', JSON.parse(JSON.stringify(S.grabando)));
+  const mr = document.getElementById('mRec'); if(mr) mr.textContent = S.grabando.dist.toFixed(0);
+  dibujar();
+  toast(agregados+' punto(s) recuperados del background.');
 }
 
 /* --- widget de la pantalla de inicio --- */
@@ -1723,10 +1768,20 @@ document.getElementById('btnWp').onclick = ()=>{
   document.getElementById('wpOk').onclick = async ()=>{
     const dp = await recolectarDatosPlantilla();
     if(dp===null) return;   // faltó un campo obligatorio
-    const fotos = fotosPunto.concat(dp.fotos);
+    const nombreFinal = document.getElementById('wpNom').value.trim() || `P${n}`;
+    const descFinal = document.getElementById('wpDesc').value.trim();
+    const fotosOriginales = fotosPunto.concat(dp.fotos);
+    // Aplicar watermark con nombre + WGS84 + CRTM05 + fecha/hora a cada foto
+    // ahora que el nombre está definitivo.
+    const cr = tmFwd(c.latitude, c.longitude, CRTM05);
+    const info = { nombre: nombreFinal, lat: c.latitude, lon: c.longitude,
+                   crtmE: cr.x, crtmN: cr.y,
+                   fecha: new Date().toLocaleString('es-CR') };
+    const fotos = [];
+    for(const f of fotosOriginales){ try{ fotos.push(await aplicarWatermarkAFoto(f, info)); }catch(e){ fotos.push(f); } }
     const p = Object.assign({ id:nid(), proy:S.proy.id,
-      nom: document.getElementById('wpNom').value.trim() || `P${n}`,
-      desc: document.getElementById('wpDesc').value.trim(),
+      nom: nombreFinal,
+      desc: descFinal,
       tipo: plantillaActiva || null,
       datos: Object.keys(dp.datos).length ? dp.datos : null,
       fotos: fotos.length ? fotos : null,
@@ -1768,7 +1823,7 @@ document.getElementById('btnMenu').onclick = ()=>{
     <div class="fila"><div class="cuerpo"><div class="t">Exportar proyecto</div><div class="s">GPX · CSV · GeoJSON</div></div><button class="mini" id="mExp">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Exportar mapa</div><div class="s">PDF georreferenciado · PNG · grilla CRTM05</div></div><button class="mini" id="mExpMapa">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">☁ Sincronizar a la nube</div><div class="s">${pend?(pendP+' punto(s) · '+pendT+' track(s) pendientes'):'todo sincronizado'} · Neon</div></div><button class="mini" id="mSync">Abrir</button></div>
-    <div class="fila"><div class="cuerpo"><div class="t">Actualizar app</div><div class="s">Build actual: ${APP_BUILD||'dev'} · buscar versión nueva</div></div><button class="mini" id="mUpd">Buscar</button></div>
+    <div class="fila" style="${hayActualizacion?'background:rgba(199,81,70,.12);border-left:3px solid var(--sangre);padding-left:8px;margin-left:-8px':''}"><div class="cuerpo"><div class="t" style="${hayActualizacion?'color:var(--sangre)':''}">${hayActualizacion?'🔴 Actualización disponible':'Actualizar app'}</div><div class="s">${hayActualizacion?'Build '+APP_BUILD+' → '+(infoActualizacion?infoActualizacion.build:'?'):'Build actual: '+(APP_BUILD||'dev')+' · buscar versión nueva'}</div></div><button class="mini ${hayActualizacion?'rojo':''}" id="mUpd">${hayActualizacion?'Instalar':'Buscar'}</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">⚙ Configuración y términos de uso</div><div class="s">Fuente, diagnóstico, filtros, alertas, precisión</div></div><button class="mini" id="mConfig">Abrir</button></div>
   `);
   document.getElementById('mUpd').onclick = ()=> buscarActualizacion(true);
@@ -3930,6 +3985,26 @@ function mostrarPunto(p){
 /* =======================================================================
    AUTO-ACTUALIZACIÓN desde GitHub Releases (solo APK sideloaded)
    ======================================================================= */
+let hayActualizacion = false;   // se marca al detectar build nuevo; pinta un badge rojo
+let infoActualizacion = null;
+function pintarBadgeActualizacion(){
+  const b = document.getElementById('btnMenu');
+  if(!b) return;
+  if(hayActualizacion){
+    b.dataset.upd = '1';
+    if(!b.querySelector('.badgeUpd')){
+      const d = document.createElement('span');
+      d.className = 'badgeUpd';
+      d.style.cssText = 'position:absolute;top:-4px;right:-4px;background:var(--sangre);color:#fff;border-radius:50%;width:12px;height:12px;font-size:9px;line-height:12px;text-align:center;font-weight:800;box-shadow:0 0 0 2px var(--lecho)';
+      d.textContent = '!';
+      b.style.position = 'relative';
+      b.appendChild(d);
+    }
+  } else {
+    b.dataset.upd = '';
+    const d = b.querySelector('.badgeUpd'); if(d) d.remove();
+  }
+}
 async function buscarActualizacion(manual){
   const P = pluginGnss();
   try{
@@ -3939,7 +4014,14 @@ async function buscarActualizacion(manual){
     const info = JSON.parse(bytesATexto(r.bytes));
     const remoto = parseInt(info.build,10) || 0;
     if(APP_BUILD===0){ if(manual) toast('Versión de desarrollo (sin número de build).'); return; }
-    if(remoto <= APP_BUILD){ if(manual) toast('Ya tenés la última versión (build '+APP_BUILD+').'); return; }
+    if(remoto <= APP_BUILD){
+      hayActualizacion = false; infoActualizacion = null; pintarBadgeActualizacion();
+      if(manual) toast('Ya tenés la última versión (build '+APP_BUILD+').'); return;
+    }
+    // ¡Hay versión nueva!
+    hayActualizacion = true;
+    infoActualizacion = { build: remoto, fecha: info.fecha, apk: info.apk || 'gps-tico.apk' };
+    pintarBadgeActualizacion();
     // Hay versión nueva.
     abrirPanel('Actualización disponible', `
       <div class="res"><div class="k">Instalada</div><div class="v">build ${APP_BUILD}</div></div>
@@ -4109,7 +4191,13 @@ async function sincronizarNube(manual){
         for(let i=0;i<p.fotos.length;i++){
           const raw = String(p.fotos[i]||'');
           const b64 = raw.includes(',') ? raw.slice(raw.indexOf(',')+1) : raw;
-          paquete.push({ id: p.id+'_'+i, punto_id: p.id, ord: i, data_base64: b64 });
+          paquete.push({
+            id: p.id+'_'+i, punto_id: p.id, ord: i, data_base64: b64,
+            // Metadatos: cada foto queda ubicable en QGIS por la geometría
+            // del punto donde se tomó.
+            lat: p.lat, lon: p.lon, nombre_punto: p.nom,
+            tomada_en: new Date(p.t || Date.now()).toISOString()
+          });
         }
         for(let i=0;i<paquete.length;i+=LOTE){
           if(manual) actualizarProgreso(Math.round((paso/pasos)*95)+5,
@@ -4313,8 +4401,10 @@ function htmlCamposPlantilla(id){
   }
   return h;
 }
-// Reduce una imagen a JPEG ~1024px para no llenar la base de datos.
-function comprimirImagen(file){
+// Reduce una imagen a JPEG ~1024px. Opcionalmente le imprime un watermark
+// con nombre del punto, coord WGS84, coord CRTM05 y fecha/hora (para que
+// la foto sea auto-documentada aunque se saque de la base de datos).
+function comprimirImagen(file, info){
   return new Promise((resolve)=>{
     const img = new Image();
     const rd = new FileReader();
@@ -4322,11 +4412,56 @@ function comprimirImagen(file){
       const max = 1024; let w = img.width, hh = img.height;
       if(w>hh && w>max){ hh = hh*max/w; w = max; } else if(hh>max){ w = w*max/hh; hh = max; }
       const cv = document.createElement('canvas'); cv.width = w; cv.height = hh;
-      cv.getContext('2d').drawImage(img, 0, 0, w, hh);
-      resolve(cv.toDataURL('image/jpeg', 0.7));
+      const ctx = cv.getContext('2d');
+      ctx.drawImage(img, 0, 0, w, hh);
+      if(info) pintarWatermark(ctx, w, hh, info);
+      resolve(cv.toDataURL('image/jpeg', 0.72));
     }; img.src = rd.result; };
     rd.readAsDataURL(file);
   });
+}
+// Re-abre una imagen ya guardada (dataURL) y le imprime un watermark.
+// Se usa al momento de GUARDAR el punto (así el nombre final queda estampado).
+function aplicarWatermarkAFoto(dataUrl, info){
+  return new Promise((resolve)=>{
+    const img = new Image();
+    img.onload = ()=>{
+      const cv = document.createElement('canvas');
+      cv.width = img.width; cv.height = img.height;
+      const ctx = cv.getContext('2d');
+      ctx.drawImage(img, 0, 0);
+      pintarWatermark(ctx, img.width, img.height, info);
+      resolve(cv.toDataURL('image/jpeg', 0.72));
+    };
+    img.onerror = ()=> resolve(dataUrl);
+    img.src = dataUrl;
+  });
+}
+function pintarWatermark(ctx, w, h, info){
+  const lines = [];
+  if(info.nombre) lines.push('📍 ' + info.nombre);
+  if(info.lat!=null && info.lon!=null) lines.push('WGS84  ' + Number(info.lat).toFixed(6) + ', ' + Number(info.lon).toFixed(6));
+  if(info.crtmE!=null && info.crtmN!=null) lines.push('CRTM05  E ' + Math.round(info.crtmE) + '   N ' + Math.round(info.crtmN));
+  if(info.fecha) lines.push(info.fecha);
+  if(!lines.length) return;
+  const escala = Math.max(1, w/1024);
+  const fs = Math.round(14 * escala);
+  const lh = Math.round(fs * 1.35);
+  const pad = Math.round(10 * escala);
+  const boxH = pad*2 + lh*lines.length;
+  ctx.save();
+  ctx.fillStyle = 'rgba(0,0,0,.62)';
+  ctx.fillRect(0, h - boxH, w, boxH);
+  // Borde superior amarillo sutil.
+  ctx.fillStyle = 'rgba(242,201,76,.9)';
+  ctx.fillRect(0, h - boxH, w, Math.max(1, Math.round(escala)));
+  ctx.font = '600 ' + fs + 'px system-ui, sans-serif';
+  ctx.textBaseline = 'top';
+  ctx.fillStyle = '#fff';
+  for(let i=0;i<lines.length;i++){
+    ctx.fillText(lines[i], pad, h - boxH + pad + i*lh);
+  }
+  ctx.restore();
 }
 // Lee los valores de la plantilla elegida desde el panel Marcar punto.
 async function recolectarDatosPlantilla(id){
@@ -4637,22 +4772,77 @@ function capasPorGrupo(){
 }
 // Estado de colapso de cada grupo en el panel (se conserva mientras el panel viva).
 let grupoColapsado = {};
-// Cambia el grupo de una capa (pide texto). Vacío = "Sin grupo".
-async function cambiarGrupoCapa(id){
+// Lista de nombres de grupos existentes (para el selector).
+function gruposExistentes(){
+  const set = new Set();
+  for(const c of S.capas) if(c.grupo) set.add(c.grupo);
+  return [...set].sort();
+}
+// Abre un panel con selector de grupo (existentes + crear nuevo + quitar).
+function cambiarGrupoCapa(id){
   const c = S.capas.find(x=>x.id===id); if(!c) return;
-  const g = prompt('Nombre del grupo (dejar vacío para quitar del grupo):', c.grupo||'');
-  if(g===null) return;
-  c.grupo = g.trim() || null;
-  await dbPut('capas', c); panelCapas();
+  const gs = gruposExistentes();
+  abrirPanel('Grupo de "' + c.nombre + '"', `
+    <label>Elegí un grupo existente</label>
+    <select id="gCambSel">
+      <option value="">— Sin grupo —</option>
+      ${gs.map(g=>`<option value="${escHtml(g)}" ${g===c.grupo?'selected':''}>${escHtml(g)}</option>`).join('')}
+      <option value="__nuevo__">➕ Crear nuevo grupo…</option>
+    </select>
+    <div id="gCambNuevo" style="display:none">
+      <label>Nombre del nuevo grupo</label>
+      <input id="gCambNuevoInp" placeholder="Ej. Fincas, Hidrografía, Casos">
+    </div>
+    <button class="ancho" id="gCambOk">Guardar</button>
+    <button class="ancho borde" id="gCambNo">Cancelar</button>
+  `);
+  const sel = document.getElementById('gCambSel');
+  const divNuevo = document.getElementById('gCambNuevo');
+  sel.onchange = ()=>{ divNuevo.style.display = sel.value==='__nuevo__' ? 'block' : 'none'; };
+  document.getElementById('gCambNo').onclick = panelCapas;
+  document.getElementById('gCambOk').onclick = async ()=>{
+    let g = sel.value;
+    if(g==='__nuevo__'){
+      g = (document.getElementById('gCambNuevoInp').value||'').trim();
+      if(!g){ toast('Escribí el nombre del grupo.'); return; }
+    }
+    c.grupo = g || null;
+    await dbPut('capas', c);
+    toast(g ? 'Movida a "'+g+'".' : 'Sacada del grupo.');
+    panelCapas();
+  };
+}
+// Renombra un grupo completo: cambia c.grupo en todas las capas que lo tengan.
+async function renombrarGrupo(nombreActual){
+  const nuevo = prompt('Nuevo nombre del grupo (vacío para eliminar el grupo y dejar las capas sueltas):', nombreActual);
+  if(nuevo===null) return;
+  const n = nuevo.trim();
+  let cambiadas = 0;
+  for(const c of S.capas){
+    if((c.grupo||'') === nombreActual){
+      c.grupo = n || null;
+      await dbPut('capas', c);
+      cambiadas++;
+    }
+  }
+  // Mantener el estado de colapso bajo el nuevo nombre.
+  if(n){ grupoColapsado[n] = grupoColapsado[nombreActual]; }
+  delete grupoColapsado[nombreActual];
+  toast(cambiadas+' capa(s) actualizadas.');
+  panelCapas();
 }
 // Mueve una capa arriba/abajo dentro de S.capas y persiste.
+// Optimizado: solo persiste las 2 capas afectadas por el swap (rápido con
+// muchas capas), y reasigna el orden en memoria a las demás.
 async function moverCapa(id, dir){
   const i = S.capas.findIndex(x=>x.id===id); if(i<0) return;
   const j = i + dir;
   if(j<0 || j>=S.capas.length) return;
   const tmp = S.capas[i]; S.capas[i] = S.capas[j]; S.capas[j] = tmp;
-  // Persistir el orden asignando índices explícitos.
-  for(let k=0;k<S.capas.length;k++){ S.capas[k].orden = k; await dbPut('capas', S.capas[k]); }
+  // Renumerar todas en memoria, pero solo persistir las 2 que cambiaron.
+  for(let k=0;k<S.capas.length;k++) S.capas[k].orden = k;
+  await dbPut('capas', S.capas[i]);
+  await dbPut('capas', S.capas[j]);
   dibujar(); panelCapas();
 }
 function renderFilaCapa(c, idx, total){
@@ -4698,9 +4888,11 @@ function panelCapas(){
   } else {
     for(const [nombreGrupo, capasG] of grupos){
       const col = !!grupoColapsado[nombreGrupo];
+      const puedeRenombrar = nombreGrupo !== 'Sin grupo';
       contenido += `<div style="margin-top:10px;background:var(--abismo);border:1px solid var(--cauce);border-radius:8px;overflow:hidden">
-        <div data-tgg="${escHtml(nombreGrupo)}" style="padding:8px 12px;background:var(--cauce);cursor:pointer;display:flex;justify-content:space-between;align-items:center;user-select:none;font-weight:600;font-size:12px">
-          <span>${col?'▸':'▾'} 📁 ${escHtml(nombreGrupo)} <span style="color:var(--musgo);font-weight:400">· ${capasG.length}</span></span>
+        <div style="padding:8px 12px;background:var(--cauce);display:flex;justify-content:space-between;align-items:center;user-select:none;font-weight:600;font-size:12px">
+          <span data-tgg="${escHtml(nombreGrupo)}" style="cursor:pointer;flex:1">${col?'▸':'▾'} 📁 ${escHtml(nombreGrupo)} <span style="color:var(--musgo);font-weight:400">· ${capasG.length}</span></span>
+          ${puedeRenombrar?`<button class="mini" data-gren="${escHtml(nombreGrupo)}" title="Renombrar grupo" style="margin-left:6px">✎</button>`:''}
         </div>
         ${col?'':`<div style="padding:0 12px">${capasG.map((c)=>{
           const idxGlobal = S.capas.indexOf(c);
@@ -4731,6 +4923,7 @@ function panelCapas(){
   document.querySelectorAll('[data-tgg]').forEach(el=> el.onclick = ()=>{
     const n = el.dataset.tgg; grupoColapsado[n] = !grupoColapsado[n]; panelCapas();
   });
+  document.querySelectorAll('[data-gren]').forEach(b=> b.onclick = (e)=>{ e.stopPropagation(); renombrarGrupo(b.dataset.gren); });
   document.querySelectorAll('[data-tb]').forEach(b=> b.onclick = ()=> tablaAtributos(b.dataset.tb));
   document.querySelectorAll('[data-sm]').forEach(b=> b.onclick = ()=> panelSimbologia(b.dataset.sm));
   document.querySelectorAll('[data-et]').forEach(b=> b.onclick = ()=> panelEtiqueta(b.dataset.et));
@@ -5020,7 +5213,10 @@ function exportarDiagCSV(){
   }catch(e){}
   await arrancarGPS();
   // Buscar actualización en silencio al arrancar (si hay red).
+  pintarBadgeActualizacion();
   if(navigator.onLine){ setTimeout(()=> buscarActualizacion(false), 4000); }
+  // Re-chequear cada 30 min por si el user deja la app abierta.
+  setInterval(()=>{ if(navigator.onLine) buscarActualizacion(false); }, 30*60*1000);
   // Subir a la nube lo pendiente al arrancar (si está configurado y en auto).
   if(navigator.onLine && syncCfg.auto && syncCfg.url){ setTimeout(()=> sincronizarNube(false), 6000); }
   // Auto-sync periódico + al volver de background + al recuperar internet.
