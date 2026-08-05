@@ -210,6 +210,51 @@ export default {
         BEGIN DELETE FROM puntos WHERE id = OLD.id; RETURN OLD; END; $$ LANGUAGE plpgsql`);
       await sql(`CREATE OR REPLACE FUNCTION _v_del_track() RETURNS trigger AS $$
         BEGIN DELETE FROM tracks WHERE id = OLD.id; RETURN OLD; END; $$ LANGUAGE plpgsql`);
+
+      // Función helper para borrar un día entero desde el SQL Editor de QGIS/Neon.
+      // Uso: SELECT borrar_dia('2026-07-24');
+      // Borra puntos y tracks cuya fecha (hora CR) sea ese día. Los triggers
+      // se encargan de registrar los IDs en la papelera.
+      await sql(`CREATE OR REPLACE FUNCTION borrar_dia(dia date) RETURNS text AS $$
+        DECLARE nP integer; nT integer;
+        BEGIN
+          DELETE FROM puntos WHERE DATE(fecha AT TIME ZONE 'America/Costa_Rica') = dia;
+          GET DIAGNOSTICS nP = ROW_COUNT;
+          DELETE FROM tracks WHERE DATE(fecha AT TIME ZONE 'America/Costa_Rica') = dia;
+          GET DIAGNOSTICS nT = ROW_COUNT;
+          RETURN 'Borrados ' || nP || ' punto(s) y ' || nT || ' track(s) del ' || dia;
+        END; $$ LANGUAGE plpgsql`);
+
+      // EVENT TRIGGER (Postgres): captura DROP VIEW puntos_YYYY_MM_DD /
+      // tracks_YYYY_MM_DD. Cuando el user borra la vista desde QGIS con
+      // "Borrar capa", también se borran los datos de ese día. Se ignora
+      // silenciosamente si el rol no tiene permisos para crear event triggers.
+      try {
+        await sql(`CREATE OR REPLACE FUNCTION _et_al_borrar_vista() RETURNS event_trigger AS $$
+          DECLARE r record; fecha_str text; dia date;
+          BEGIN
+            FOR r IN SELECT object_name FROM pg_event_trigger_dropped_objects() WHERE object_type = 'view' LOOP
+              IF r.object_name ~ '^puntos_[0-9]{4}_[0-9]{2}_[0-9]{2}$' THEN
+                fecha_str := replace(substring(r.object_name from 8), '_', '-');
+                BEGIN
+                  dia := fecha_str::date;
+                  DELETE FROM puntos WHERE DATE(fecha AT TIME ZONE 'America/Costa_Rica') = dia;
+                EXCEPTION WHEN OTHERS THEN NULL; END;
+              ELSIF r.object_name ~ '^tracks_[0-9]{4}_[0-9]{2}_[0-9]{2}$' THEN
+                fecha_str := replace(substring(r.object_name from 8), '_', '-');
+                BEGIN
+                  dia := fecha_str::date;
+                  DELETE FROM tracks WHERE DATE(fecha AT TIME ZONE 'America/Costa_Rica') = dia;
+                EXCEPTION WHEN OTHERS THEN NULL; END;
+              END IF;
+            END LOOP;
+          END;
+          $$ LANGUAGE plpgsql`);
+        await sql(`DROP EVENT TRIGGER IF EXISTS _et_borrar_vista_dia`);
+        await sql(`CREATE EVENT TRIGGER _et_borrar_vista_dia ON sql_drop
+                   WHEN TAG IN ('DROP VIEW')
+                   EXECUTE FUNCTION _et_al_borrar_vista()`);
+      } catch (e) { /* Neon puede no permitir EVENT TRIGGER al owner; usar borrar_dia() */ }
       // Función que crea/actualiza:
       //   - VIEW puntos_geo (todos los puntos + n_fotos + foto_url + fotos_urls)
       //   - Una VIEW por día para puntos y otra para tracks
