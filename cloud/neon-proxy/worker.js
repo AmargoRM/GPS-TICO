@@ -201,6 +201,15 @@ export default {
       // Limpiar versiones anteriores de la función (firmas viejas quedaban).
       await sql(`DROP FUNCTION IF EXISTS crear_vistas_por_dia()`);
       await sql(`DROP FUNCTION IF EXISTS crear_vistas_por_dia(text)`);
+
+      // Funciones INSTEAD OF DELETE para las vistas: cuando borrás features
+      // desde QGIS en una vista (por día o puntos_geo), se propaga a la tabla
+      // base y ahí se dispara el trigger de la papelera. Sin esto, borrar en
+      // una vista con JOIN no elimina nada y los datos "reaparecen".
+      await sql(`CREATE OR REPLACE FUNCTION _v_del_punto() RETURNS trigger AS $$
+        BEGIN DELETE FROM puntos WHERE id = OLD.id; RETURN OLD; END; $$ LANGUAGE plpgsql`);
+      await sql(`CREATE OR REPLACE FUNCTION _v_del_track() RETURNS trigger AS $$
+        BEGIN DELETE FROM tracks WHERE id = OLD.id; RETURN OLD; END; $$ LANGUAGE plpgsql`);
       // Función que crea/actualiza:
       //   - VIEW puntos_geo (todos los puntos + n_fotos + foto_url + fotos_urls)
       //   - Una VIEW por día para puntos y otra para tracks
@@ -225,6 +234,10 @@ export default {
                GROUP BY punto_id
              ) fc ON fc.punto_id = p.id',
             prefix, suffix, prefix, suffix);
+          -- INSTEAD OF DELETE en la vista global de puntos.
+          EXECUTE 'CREATE TRIGGER _trg_v_del_puntos_geo INSTEAD OF DELETE ON puntos_geo
+                   FOR EACH ROW EXECUTE FUNCTION _v_del_punto()';
+
           FOR d IN SELECT DISTINCT DATE(fecha AT TIME ZONE 'America/Costa_Rica')
                    FROM puntos WHERE fecha IS NOT NULL LOOP
             vname := 'puntos_' || to_char(d, 'YYYY_MM_DD');
@@ -244,6 +257,10 @@ export default {
                ) fc ON fc.punto_id = p.id
                WHERE DATE(p.fecha AT TIME ZONE ''America/Costa_Rica'') = %L',
               vname, prefix, suffix, prefix, suffix, d);
+            -- Trigger: borrar desde la vista propaga a la tabla puntos.
+            EXECUTE format(
+              'CREATE TRIGGER _trg_v_del INSTEAD OF DELETE ON %I
+               FOR EACH ROW EXECUTE FUNCTION _v_del_punto()', vname);
           END LOOP;
           FOR d IN SELECT DISTINCT DATE(fecha AT TIME ZONE 'America/Costa_Rica')
                    FROM tracks WHERE fecha IS NOT NULL LOOP
@@ -253,6 +270,9 @@ export default {
               'CREATE VIEW %I AS SELECT * FROM tracks
                WHERE DATE(fecha AT TIME ZONE ''America/Costa_Rica'') = %L',
               vname, d);
+            EXECUTE format(
+              'CREATE TRIGGER _trg_v_del INSTEAD OF DELETE ON %I
+               FOR EACH ROW EXECUTE FUNCTION _v_del_track()', vname);
           END LOOP;
         END;
         $fn$ LANGUAGE plpgsql`);
