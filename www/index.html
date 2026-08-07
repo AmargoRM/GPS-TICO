@@ -417,6 +417,21 @@ const dbDel   = (s,k)=> pedir(tx(s,'readwrite').delete(k));
 const porIndice = (s,i,v)=> pedir(tx(s).index(i).getAll(v));
 const nid = ()=> Date.now().toString(36) + Math.random().toString(36).slice(2,7);
 
+// ISO 8601 en la zona America/Costa_Rica (UTC-06:00, sin horario de verano
+// desde 1992). Fijamos el offset explícito en el string para que la fecha
+// llegue igual al servidor aunque el celular esté en otra zona.
+function isoFechaCR(ts){
+  if(ts==null) return '';
+  const d = new Date(ts);
+  if(isNaN(d.getTime())) return '';
+  const OFFSET_MIN = -360; // UTC-06:00
+  const local = new Date(d.getTime() + OFFSET_MIN*60*1000);
+  const p = n => String(n).padStart(2,'0');
+  return local.getUTCFullYear() + '-' + p(local.getUTCMonth()+1) + '-' + p(local.getUTCDate())
+       + 'T' + p(local.getUTCHours()) + ':' + p(local.getUTCMinutes()) + ':' + p(local.getUTCSeconds())
+       + '-06:00';
+}
+
 // Conversión a GeoJSON
 function puntoAFeature(p){
   return { type:'Feature', geometry:{type:'Point',coordinates:[p.lon,p.lat]},
@@ -1647,7 +1662,21 @@ async function panelProyectos(){
   });
   document.querySelectorAll('[data-borrar]').forEach(b=> b.onclick = async ()=>{
     const id = b.dataset.borrar;
-    if(!confirm('Se borra el proyecto con todos sus puntos y tracks. Esto no se puede deshacer. ¿Seguir?')) return;
+    const proy = ps.find(x=> x.id===id);
+    const nombre = proy ? (proy.nom||'') : '';
+    // Confirmación por tipeo: la sola pulsación de "Aceptar" en un confirm()
+    // es demasiado fácil de disparar por accidente cuando el proyecto lleva
+    // meses de campo. Exigimos escribir el nombre exacto.
+    const entrada = prompt(
+      'Se borra el proyecto "' + nombre + '" con TODOS sus puntos y tracks.\n' +
+      'Esto NO se puede deshacer.\n\n' +
+      'Para confirmar, escribí exactamente el nombre del proyecto:'
+    );
+    if(entrada == null) return;
+    if(entrada.trim() !== nombre.trim()){
+      toast('El nombre no coincide. Borrado cancelado.');
+      return;
+    }
     for(const p of await porIndice('puntos','proy',id)) await dbDel('puntos', p.id);
     for(const t of await porIndice('tracks','proy',id)) await dbDel('tracks', t.id);
     await dbDel('proyectos', id);
@@ -1745,6 +1774,9 @@ async function panelDatos(){
   const vt=document.getElementById('verTodos'); if(vt) vt.onclick = ()=> setVisTodos(true);
   const ot=document.getElementById('ocuTodos'); if(ot) ot.onclick = ()=> setVisTodos(false);
   document.querySelectorAll('[data-dp]').forEach(b=> b.onclick = async ()=>{
+    const p = S.puntos.find(x=> x.id===b.dataset.dp);
+    const nombre = p ? (p.nom||'este punto') : 'este punto';
+    if(!confirm('¿Borrar el punto "' + nombre + '"?\nNo se puede deshacer.')) return;
     await dbDel('puntos', b.dataset.dp); await cargarProyecto(S.proy.id); panelDatos();
   });
   document.querySelectorAll('[data-dt]').forEach(b=> b.onclick = async ()=>{
@@ -2036,7 +2068,7 @@ function panelExport(){
                     p.cn0Medio!=null?p.cn0Medio.toFixed(1):'', p.duracion!=null?p.duracion:'' ];
       const base = [p.nom, ...c, orto, elip, p.geoide!=null?p.geoide.toFixed(1):'', p.altOrtoFuente||'',
                     p.exac.toFixed(1), p.vexac!=null?p.vexac.toFixed(1):'', p.fuente||'fused', ...cal,
-                    new Date(p.t).toISOString(), p.desc||''];
+                    isoFechaCR(p.t), p.desc||''];
       if(m!=='geo') base.push(PROY[m].epsg);
       return base.map(v=>`"${String(v).replace(/"/g,'""')}"`).join(',');
     });
@@ -2049,11 +2081,11 @@ function panelExport(){
     const ele = o => (o.altOrto!=null ? o.altOrto : (o.altElip!=null ? o.altElip : o.alt));
     for(const p of S.puntos){
       const e = ele(p);
-      g += `<wpt lat="${p.lat}" lon="${p.lon}">${e!=null?`<ele>${e.toFixed(1)}</ele>`:''}<time>${new Date(p.t).toISOString()}</time><name>${esc(p.nom)}</name><desc>${esc(p.desc)}</desc></wpt>\n`;
+      g += `<wpt lat="${p.lat}" lon="${p.lon}">${e!=null?`<ele>${e.toFixed(1)}</ele>`:''}<time>${isoFechaCR(p.t)}</time><name>${esc(p.nom)}</name><desc>${esc(p.desc)}</desc></wpt>\n`;
     }
     for(const t of S.tracks){
       g += `<trk><name>${esc(t.nom)}</name><trkseg>\n`;
-      for(const q of t.pts){ const e = ele(q); g += `<trkpt lat="${q.lat}" lon="${q.lon}">${e!=null?`<ele>${e.toFixed(1)}</ele>`:''}<time>${new Date(q.t).toISOString()}</time></trkpt>\n`; }
+      for(const q of t.pts){ const e = ele(q); g += `<trkpt lat="${q.lat}" lon="${q.lon}">${e!=null?`<ele>${e.toFixed(1)}</ele>`:''}<time>${isoFechaCR(q.t)}</time></trkpt>\n`; }
       g += `</trkseg></trk>\n`;
     }
     bajar(S.proy.nom+'.gpx', g+'</gpx>', 'application/gpx+xml');
@@ -2071,13 +2103,14 @@ function panelExport(){
           tipo:(p.promediado?'promediado':'instantaneo'), muestras:(p.muestras!=null?p.muestras:null),
           desv_std_m:(p.desvStd!=null?p.desvStd:null), hdop_medio:(p.hdopMedio!=null?p.hdopMedio:null),
           cn0_medio:(p.cn0Medio!=null?p.cn0Medio:null), duracion_s:(p.duracion!=null?p.duracion:null),
-          fecha:new Date(p.t).toISOString() },
+          fecha:isoFechaCR(p.t) },
         geometry:{ type:'Point', coordinates:[p.lon, p.lat, (zOrto!=null?zOrto:(zElip!=null?zElip:0))] } });
     }
     for(const t of S.tracks) fc.features.push({ type:'Feature',
       properties:{ nombre:t.nom, distancia_m:Math.round(t.dist), puntos:t.pts.length,
         puntos_aceptados:(t.aceptados!=null?t.aceptados:null), puntos_filtrados:(t.rechazados!=null?t.rechazados:null),
-        filtro: t.filtroConfig ? `HDOP<=${t.filtroConfig.hdopMax} sat>=${t.filtroConfig.satMin} exac<=${t.filtroConfig.exacMax}m CN0>=${t.filtroConfig.cn0Min}` : null },
+        filtro: t.filtroConfig ? `HDOP<=${t.filtroConfig.hdopMax} sat>=${t.filtroConfig.satMin} exac<=${t.filtroConfig.exacMax}m CN0>=${t.filtroConfig.cn0Min}` : null,
+        fecha: isoFechaCR(t.ini || (t.pts && t.pts[0] && t.pts[0].t)) },
       geometry:{ type:'LineString', coordinates:t.pts.map(q=>[q.lon,q.lat,q.alt||0]) } });
     bajar(S.proy.nom+'.geojson', JSON.stringify(fc,null,1), 'application/geo+json');
   };
