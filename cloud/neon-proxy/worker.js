@@ -233,6 +233,15 @@ export default {
         await sql(`CREATE OR REPLACE FUNCTION _et_al_borrar_vista() RETURNS event_trigger AS $$
           DECLARE r record; fecha_str text; dia date;
           BEGIN
+            -- Si el DROP VIEW proviene del refresco interno de vistas del
+            -- Worker (no de un "Borrar capa" del usuario en QGIS), NO borrar
+            -- datos: crear_vistas_por_dia() marca esta bandera local a la
+            -- transacción antes de soltar sus propias vistas para recrearlas.
+            -- Sin esto, cada subida de un punto borraba todos los puntos del
+            -- día al recrearse la vista de ese día.
+            IF current_setting('app.refreshing_views', true) = 'on' THEN
+              RETURN;
+            END IF;
             FOR r IN SELECT object_name FROM pg_event_trigger_dropped_objects() WHERE object_type = 'view' LOOP
               IF r.object_name ~ '^puntos_[0-9]{4}_[0-9]{2}_[0-9]{2}$' THEN
                 fecha_str := replace(substring(r.object_name from 8), '_', '-');
@@ -264,6 +273,11 @@ export default {
       await sql(`CREATE OR REPLACE FUNCTION crear_vistas_por_dia(prefix text, suffix text) RETURNS void AS $fn$
         DECLARE d date; vname text;
         BEGIN
+          -- Marca (local a esta transacción) para avisar al EVENT TRIGGER
+          -- _et_al_borrar_vista que los DROP VIEW que siguen son un refresco
+          -- interno y NO debe borrar los datos del día. El "Borrar capa" real
+          -- desde QGIS corre en otra transacción, sin esta bandera, y sí borra.
+          PERFORM set_config('app.refreshing_views', 'on', true);
           EXECUTE format('DROP VIEW IF EXISTS puntos_geo CASCADE');
           EXECUTE format(
             'CREATE VIEW puntos_geo AS
