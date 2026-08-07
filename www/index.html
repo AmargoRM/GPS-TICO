@@ -1647,7 +1647,21 @@ async function panelProyectos(){
   });
   document.querySelectorAll('[data-borrar]').forEach(b=> b.onclick = async ()=>{
     const id = b.dataset.borrar;
-    if(!confirm('Se borra el proyecto con todos sus puntos y tracks. Esto no se puede deshacer. ¿Seguir?')) return;
+    const proy = ps.find(x=> x.id===id);
+    const nombre = proy ? (proy.nom||'') : '';
+    // Confirmación por tipeo: la sola pulsación de "Aceptar" en un confirm()
+    // es demasiado fácil de disparar por accidente cuando el proyecto lleva
+    // meses de campo. Exigimos escribir el nombre exacto.
+    const entrada = prompt(
+      'Se borra el proyecto "' + nombre + '" con TODOS sus puntos y tracks.\n' +
+      'Esto NO se puede deshacer.\n\n' +
+      'Para confirmar, escribí exactamente el nombre del proyecto:'
+    );
+    if(entrada == null) return;
+    if(entrada.trim() !== nombre.trim()){
+      toast('El nombre no coincide. Borrado cancelado.');
+      return;
+    }
     for(const p of await porIndice('puntos','proy',id)) await dbDel('puntos', p.id);
     for(const t of await porIndice('tracks','proy',id)) await dbDel('tracks', t.id);
     await dbDel('proyectos', id);
@@ -1745,6 +1759,9 @@ async function panelDatos(){
   const vt=document.getElementById('verTodos'); if(vt) vt.onclick = ()=> setVisTodos(true);
   const ot=document.getElementById('ocuTodos'); if(ot) ot.onclick = ()=> setVisTodos(false);
   document.querySelectorAll('[data-dp]').forEach(b=> b.onclick = async ()=>{
+    const p = S.puntos.find(x=> x.id===b.dataset.dp);
+    const nombre = p ? (p.nom||'este punto') : 'este punto';
+    if(!confirm('¿Borrar el punto "' + nombre + '"?\nNo se puede deshacer.')) return;
     await dbDel('puntos', b.dataset.dp); await cargarProyecto(S.proy.id); panelDatos();
   });
   document.querySelectorAll('[data-dt]').forEach(b=> b.onclick = async ()=>{
