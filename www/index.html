@@ -1558,15 +1558,41 @@ async function iniciarServicioTrack(){
   if(!P){ toast('Grabando.'); return; }
   try{
     await P.requestNotifPermission();
-    // modo:'track' activa la grabación NATIVA con LocationManager. Esto sobrevive
-    // a la pantalla apagada y a que Android pause el WebView. Los puntos se
-    // fusionan al track del JS cuando la app vuelve al frente.
+    // Verificar exención de batería: sin ella, Android estrangula el GPS al
+    // apagar la pantalla y el track sale lineal/cortado. Se pide una vez.
+    await asegurarBateriaLibre();
+    // modo:'track' activa la grabación NATIVA con LocationManager (GPS puro).
+    // Esto sobrevive a la pantalla apagada y a que Android pause el WebView.
+    // Los puntos se fusionan al track del JS cuando la app vuelve al frente.
     await P.startForegroundTracking({ text: 'Grabando… tocá para volver a la app', modo:'track' });
-    toast('Grabando. Podés apagar la pantalla; sigue registrando en background.');
+    toast('Grabando con GPS. Podés apagar la pantalla; sigue registrando.');
   }catch(e){
     console.log('servicio track error', e);
     toast('Grabando.');
   }
+}
+// Comprueba si la app está exenta de optimización de batería; si no, muestra
+// un aviso y abre el diálogo del sistema (una sola vez por el flag guardado).
+async function asegurarBateriaLibre(){
+  const P = pluginGnss();
+  if(!P || !P.bateriaOptimizada) return;
+  let r; try{ r = await P.bateriaOptimizada(); }catch(e){ return; }
+  if(r && r.exenta) return;
+  // Ya se lo pedimos antes y dijo que no; no insistir en cada track.
+  let yaPreguntado = false;
+  try{ yaPreguntado = await dbGet('conf','bateriaPreguntada'); }catch(e){}
+  if(yaPreguntado) return;
+  await dbPut('conf', true, 'bateriaPreguntada');
+  await new Promise(res=>{
+    abrirPanel('Permiso para grabar con pantalla apagada', `
+      <div class="nota" style="border-color:var(--alerta)">Para que el track no se corte ni haga saltos cuando bloqueás el celular, Android necesita que le des permiso de <b>ignorar la optimización de batería</b> a GPS TICO.</div>
+      <div class="nota">En la pantalla que se abre, elegí <b>"Permitir"</b> o <b>"No optimizar"</b>. Es una sola vez.</div>
+      <button class="ancho" id="batOk">Abrir ajuste de batería</button>
+      <button class="ancho borde" id="batNo">Ahora no</button>
+    `);
+    document.getElementById('batOk').onclick = async ()=>{ try{ await P.pedirIgnorarBateria(); }catch(e){} cerrarPanel(); res(); };
+    document.getElementById('batNo').onclick = ()=>{ cerrarPanel(); res(); };
+  });
 }
 async function detenerServicioTrack(){
   const P = pluginGnss();
@@ -1715,13 +1741,37 @@ document.getElementById('btnWp').onclick = ()=>{
     : '<span style="color:var(--alerta)">no disponible</span>';
   const elipTxt = fx.altElip!=null ? fx.altElip.toFixed(1)+' m' : '—';
   abrirPanel('Marcar punto', `
-    <div class="res"><div class="k">${PROY[S.modo].nom}</div><div class="v">${f.a}<br>${f.b}</div></div>
-    <div class="res"><div class="k">Exactitud</div><div class="v">± ${c.accuracy.toFixed(1)} m${vTxt}</div></div>
     <div class="grid2">
-      <div class="res"><div class="k">Altura ortométrica</div><div class="v">${ortoTxt}</div></div>
-      <div class="res"><div class="k">Altura elipsoidal</div><div class="v">${elipTxt}</div></div>
+      <button class="mini verde" id="wpModoGps">📡 Mi GPS</button>
+      <button class="mini" id="wpModoManual">✎ Ingresar coordenadas</button>
     </div>
-    <div class="res"><div class="k">Fuente</div><div class="v">${srcTxt}${fx.mock?'  ·  ⚠ MOCK':''}</div></div>
+    <div id="wpGpsBox">
+      <div class="res"><div class="k">${PROY[S.modo].nom}</div><div class="v">${f.a}<br>${f.b}</div></div>
+      <div class="res"><div class="k">Exactitud</div><div class="v">± ${c.accuracy.toFixed(1)} m${vTxt}</div></div>
+      <div class="grid2">
+        <div class="res"><div class="k">Altura ortométrica</div><div class="v">${ortoTxt}</div></div>
+        <div class="res"><div class="k">Altura elipsoidal</div><div class="v">${elipTxt}</div></div>
+      </div>
+      <div class="res"><div class="k">Fuente</div><div class="v">${srcTxt}${fx.mock?'  ·  ⚠ MOCK':''}</div></div>
+    </div>
+    <div id="wpManualBox" style="display:none">
+      <label>Proyección de entrada</label>
+      <select id="wpProy">
+        <option value="geo">Geográficas (lat, lon)</option>
+        <option value="crtm05">CRTM05 · EPSG:5367 (E, N)</option>
+        <option value="ln">Lambert Norte · EPSG:5456 (E, N)</option>
+        <option value="ls">Lambert Sur · EPSG:5457 (E, N)</option>
+      </select>
+      <div class="grid2" style="margin-top:6px">
+        <div><label id="wpLblA" style="margin-top:0">Latitud</label><input id="wpCoordA" inputmode="decimal" placeholder="10.34567"></div>
+        <div><label id="wpLblB" style="margin-top:0">Longitud</label><input id="wpCoordB" inputmode="decimal" placeholder="-84.43119"></div>
+      </div>
+      <label>Altura ortométrica (m) — opcional</label>
+      <input id="wpAltManual" inputmode="decimal" placeholder="ej. 1150">
+      <button class="ancho borde" id="wpIrPunto">Ir al punto en el mapa</button>
+      <div class="res" id="wpManualPrev" style="display:none"><div class="k">Se marcará en (WGS84)</div><div class="v" id="wpManualPrevV">—</div></div>
+      <div class="nota">Tecleá la coordenada en la proyección elegida y tocá <b>Ir al punto</b> para verla en el mapa. Al Guardar, el punto se crea en esa coordenada (fuente: manual).</div>
+    </div>
     <label>Nombre</label><input id="wpNom" value="P${String(n).padStart(3,'0')}">
     <label>Descripción</label><textarea id="wpDesc" rows="2" placeholder="Naciente, punto de aforo, testigo..."></textarea>
     ${plantillas.length?`<label>Formulario de captura</label>
@@ -1739,12 +1789,65 @@ document.getElementById('btnWp').onclick = ()=>{
     <button class="ancho borde" id="wpProm">Promediar quieto</button>
     <div class="nota">La <b>altura ortométrica</b> (sobre el nivel del mar) es la correcta para dictámenes. <b>Promediar</b>: parate quieto y la app promedia los fixes para reducir ruido; te muestra la desviación estándar en vivo.</div>
   `);
-  const construirPunto = ()=> ({
-    lat:c.latitude, lon:c.longitude, alt:c.altitude, exac:c.accuracy,
-    vexac: fx.vexac!=null?fx.vexac:null, fuente: fx.fuente||'fused',
-    altElip: fx.altElip!=null?fx.altElip:null, altOrto: fx.altOrto!=null?fx.altOrto:null,
-    altOrtoFuente: fx.altOrtoFuente||null, geoide: fx.geoide!=null?fx.geoide:null
-  });
+  // Estado del modo de coordenadas: false = GPS, true = manual (tecleadas).
+  let modoManual = false;
+  let manualLL = null;   // {lat, lon, altOrto} resuelto a WGS84
+  const construirPunto = ()=>{
+    if(modoManual && manualLL){
+      return { lat:manualLL.lat, lon:manualLL.lon, alt:null, exac:null,
+               vexac:null, fuente:'manual',
+               altElip:null, altOrto: manualLL.altOrto!=null?manualLL.altOrto:null,
+               altOrtoFuente: manualLL.altOrto!=null?'manual':null, geoide:null };
+    }
+    return { lat:c.latitude, lon:c.longitude, alt:c.altitude, exac:c.accuracy,
+      vexac: fx.vexac!=null?fx.vexac:null, fuente: fx.fuente||'fused',
+      altElip: fx.altElip!=null?fx.altElip:null, altOrto: fx.altOrto!=null?fx.altOrto:null,
+      altOrtoFuente: fx.altOrtoFuente||null, geoide: fx.geoide!=null?fx.geoide:null };
+  };
+  // --- Modo manual: alternar cajas, etiquetas por proyección, resolver e ir ---
+  const gpsBox = document.getElementById('wpGpsBox');
+  const manBox = document.getElementById('wpManualBox');
+  const btnGps = document.getElementById('wpModoGps');
+  const btnMan = document.getElementById('wpModoManual');
+  const selProy = document.getElementById('wpProy');
+  // Arrancar la proyección de entrada igual a la del proyecto (si aplica).
+  if(['geo','crtm05','ln','ls'].includes(S.modo)) selProy.value = S.modo;
+  const actualizarLabels = ()=>{
+    const geo = selProy.value==='geo';
+    document.getElementById('wpLblA').textContent = geo ? 'Latitud' : 'Este (m)';
+    document.getElementById('wpLblB').textContent = geo ? 'Longitud' : 'Norte (m)';
+    document.getElementById('wpCoordA').placeholder = geo ? '10.34567' : '477250';
+    document.getElementById('wpCoordB').placeholder = geo ? '-84.43119' : '252500';
+  };
+  actualizarLabels();
+  selProy.onchange = actualizarLabels;
+  btnGps.onclick = ()=>{ modoManual=false; gpsBox.style.display=''; manBox.style.display='none'; btnGps.classList.add('verde'); btnMan.classList.remove('verde'); };
+  btnMan.onclick = ()=>{ modoManual=true; gpsBox.style.display='none'; manBox.style.display=''; btnMan.classList.add('verde'); btnGps.classList.remove('verde'); };
+  // Convierte lo tecleado a WGS84. Devuelve {lat,lon} o null si es inválido.
+  const resolverManual = ()=>{
+    const a = parseFloat((document.getElementById('wpCoordA').value||'').replace(',','.'));
+    const b = parseFloat((document.getElementById('wpCoordB').value||'').replace(',','.'));
+    if(!isFinite(a) || !isFinite(b)){ toast('Ingresá las dos coordenadas.'); return null; }
+    let ll;
+    try{ ll = haciaWgs(a, b, selProy.value); }catch(e){ toast('No pude convertir esas coordenadas.'); return null; }
+    if(!ll || !isFinite(ll.lat) || !isFinite(ll.lon) || Math.abs(ll.lat)>90 || Math.abs(ll.lon)>180){
+      toast('Coordenada fuera de rango. Revisá la proyección elegida.'); return null;
+    }
+    const altV = parseFloat((document.getElementById('wpAltManual').value||'').replace(',','.'));
+    return { lat:ll.lat, lon:ll.lon, altOrto: isFinite(altV)?altV:null };
+  };
+  document.getElementById('wpIrPunto').onclick = ()=>{
+    const r = resolverManual(); if(!r) return;
+    manualLL = r;
+    // Mostrar preview en WGS84 y volar el mapa al punto con una chincheta.
+    document.getElementById('wpManualPrev').style.display = '';
+    document.getElementById('wpManualPrevV').textContent = r.lat.toFixed(6) + ', ' + r.lon.toFixed(6);
+    chincheta = { lat:r.lat, lon:r.lon };
+    S.centro.lat = r.lat; S.centro.lon = r.lon; S.seguir = false;
+    if(S.zoom < 17) S.zoom = 18;
+    dibujar();
+    toast('Mapa centrado en el punto. Tocá Guardar para marcarlo.');
+  };
   // Formulario de captura: renderiza los campos de la plantilla elegida y se
   // actualiza al cambiar la selección. Guarda la elección como predeterminada.
   const selPl = document.getElementById('wpPlantilla');
@@ -1766,15 +1869,20 @@ document.getElementById('btnWp').onclick = ()=>{
     document.querySelectorAll('[data-rmf]').forEach(im=> im.onclick = ()=>{ fotosPunto.splice(parseInt(im.dataset.rmf,10),1); inpF.onchange(); });
   };
   document.getElementById('wpOk').onclick = async ()=>{
+    // En modo manual: resolver las coordenadas tecleadas si aún no se hizo.
+    if(modoManual){
+      const r = resolverManual(); if(!r) return;
+      manualLL = r;
+    }
     const dp = await recolectarDatosPlantilla();
     if(dp===null) return;   // faltó un campo obligatorio
     const nombreFinal = document.getElementById('wpNom').value.trim() || `P${n}`;
     const descFinal = document.getElementById('wpDesc').value.trim();
     const fotosOriginales = fotosPunto.concat(dp.fotos);
-    // Aplicar watermark con nombre + WGS84 + CRTM05 + fecha/hora a cada foto
-    // ahora que el nombre está definitivo.
-    const cr = tmFwd(c.latitude, c.longitude, CRTM05);
-    const info = { nombre: nombreFinal, lat: c.latitude, lon: c.longitude,
+    // Coordenada real del punto (GPS o manual) para el watermark de las fotos.
+    const puntoBase = construirPunto();
+    const cr = tmFwd(puntoBase.lat, puntoBase.lon, CRTM05);
+    const info = { nombre: nombreFinal, lat: puntoBase.lat, lon: puntoBase.lon,
                    crtmE: cr.x, crtmN: cr.y,
                    fecha: new Date().toLocaleString('es-CR') };
     const fotos = [];
@@ -1793,6 +1901,7 @@ document.getElementById('btnWp').onclick = ()=>{
     disparoAutoSync();
   };
   document.getElementById('wpProm').onclick = async ()=>{
+    if(modoManual){ toast('Promediar es solo para el GPS. En modo manual, tocá Guardar.'); return; }
     const dp = await recolectarDatosPlantilla();
     if(dp===null) return;
     ocuDatos = { datos: Object.keys(dp.datos).length?dp.datos:null, fotos: fotosPunto.concat(dp.fotos), tipo: plantillaActiva||null };

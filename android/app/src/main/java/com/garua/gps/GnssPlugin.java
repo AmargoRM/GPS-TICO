@@ -171,6 +171,45 @@ public class GnssPlugin extends Plugin {
             call.reject("No se pudo iniciar el servicio: " + e.getMessage());
         }
     }
+    // ¿Está la app exenta de la optimización de batería? (clave para el track en background)
+    @PluginMethod
+    public void bateriaOptimizada(PluginCall call) {
+        boolean exenta = false;
+        try {
+            android.os.PowerManager pm = (android.os.PowerManager) getContext().getSystemService(android.content.Context.POWER_SERVICE);
+            if (pm != null && Build.VERSION.SDK_INT >= 23) {
+                exenta = pm.isIgnoringBatteryOptimizations(getContext().getPackageName());
+            } else {
+                exenta = true; // versiones viejas: no aplica
+            }
+        } catch (Exception ignored) {}
+        call.resolve(new JSObject().put("exenta", exenta));
+    }
+
+    // Abre el diálogo del sistema para pedir ignorar la optimización de batería.
+    // Sin esto, Android estrangula el GPS en background (track lineal / cortado).
+    @PluginMethod
+    @SuppressLint("BatteryLife")
+    public void pedirIgnorarBateria(PluginCall call) {
+        try {
+            if (Build.VERSION.SDK_INT >= 23) {
+                Intent i = new Intent(android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS);
+                i.setData(android.net.Uri.parse("package:" + getContext().getPackageName()));
+                i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                getContext().startActivity(i);
+            }
+            call.resolve();
+        } catch (Exception e) {
+            // Fallback: abrir la pantalla general de optimización de batería.
+            try {
+                Intent i = new Intent(android.provider.Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS);
+                i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                getContext().startActivity(i);
+                call.resolve();
+            } catch (Exception e2) { call.reject("No se pudo abrir el ajuste: " + e2.getMessage()); }
+        }
+    }
+
     // Para el track nativo (deja de grabar puntos en background pero mantiene la app viva).
     @PluginMethod
     public void stopNativeTrack(PluginCall call) {
