@@ -987,7 +987,7 @@ cv.addEventListener('pointermove', e=>{
       const px = e.clientX - r.left, py = e.clientY - r.top;
       const ll = pantallaALatLon(px, py);
       if(modoMapa==='medir' && ll){ medicion.pts.push(ll); actualizarHerramienta(); pedirDibujo(); }
-      else if(modoMapa==='navegar' && ll){ navDestino = ll; navRuta = null; actualizarHerramienta(); pedirDibujo(); }
+      else if(modoMapa==='navegar' && ll){ navDestino = ll; navRuta = null; navPasos = null; actualizarHerramienta(); pedirDibujo(); }
       else { try{ consultarEnPantalla(px, py); }catch(err){ toast('Error al consultar: '+(err&&err.message?err.message:err)); } }
     }
   }
@@ -2819,19 +2819,52 @@ function parseParDeCoords(q){
   return { lat, lon };
 }
 function abrirPanelBuscarDestino(){
+  const proyIni = ['geo','crtm05','ln','ls'].includes(S.modo) ? S.modo : 'geo';
   abrirPanel('Buscar destino', `
-    <input id="buscaQ" type="text" placeholder="Nombre de lugar o coordenadas…" autocomplete="off" style="width:100%;box-sizing:border-box;">
-    <div class="grid2" style="margin-top:6px">
-      <button class="ancho" id="buscaBtn">Buscar</button>
-      <button class="ancho borde" id="buscaCoord">Usar coordenadas</button>
-    </div>
+    <label>Por nombre de lugar</label>
+    <input id="buscaQ" type="text" placeholder="Ej. Parque Nacional, Quepos…" autocomplete="off" style="width:100%;box-sizing:border-box;">
+    <button class="ancho" id="buscaBtn" style="margin-top:6px">Buscar por nombre</button>
     <div id="buscaResultados" style="margin-top:8px"></div>
+    <hr style="border:none;border-top:1px solid rgba(127,127,127,.3);margin:14px 0">
+    <label>Por coordenadas</label>
+    <select id="buscaProy">
+      <option value="geo">Geográficas · WGS84 (lat, lon)</option>
+      <option value="crtm05">CRTM05 · EPSG:5367 (E, N)</option>
+      <option value="ln">Lambert Norte · EPSG:5456 (E, N)</option>
+      <option value="ls">Lambert Sur · EPSG:5457 (E, N)</option>
+    </select>
+    <div class="grid2" style="margin-top:6px">
+      <div><label id="buscaLblA" style="margin-top:0">Latitud</label><input id="buscaX" inputmode="decimal" placeholder="9.9328"></div>
+      <div><label id="buscaLblB" style="margin-top:0">Longitud</label><input id="buscaY" inputmode="decimal" placeholder="-84.0795"></div>
+    </div>
+    <button class="ancho" id="buscaCoordIr" style="margin-top:8px">Ir a estas coordenadas</button>
   `);
   const inp = document.getElementById('buscaQ');
   inp.focus();
   inp.addEventListener('keydown', e => { if(e.key==='Enter') ejecutarBusqueda(); });
   document.getElementById('buscaBtn').onclick = ejecutarBusqueda;
-  document.getElementById('buscaCoord').onclick = ()=>{ inp.value=''; inp.placeholder='latitud, longitud  (ej. 9.9328, -84.0795)'; inp.focus(); toast('Escribí la coordenada como: latitud, longitud'); };
+  // Selector de proyección: etiquetas y placeholders dinámicos.
+  const selP = document.getElementById('buscaProy');
+  selP.value = proyIni;
+  const actualizarLbls = ()=>{
+    const geo = selP.value==='geo';
+    document.getElementById('buscaLblA').textContent = geo ? 'Latitud' : 'Este (m)';
+    document.getElementById('buscaLblB').textContent = geo ? 'Longitud' : 'Norte (m)';
+    document.getElementById('buscaX').placeholder = geo ? '9.9328' : '477250';
+    document.getElementById('buscaY').placeholder = geo ? '-84.0795' : '252500';
+  };
+  actualizarLbls();
+  selP.onchange = actualizarLbls;
+  document.getElementById('buscaCoordIr').onclick = ()=>{
+    const a = parseFloat((document.getElementById('buscaX').value||'').replace(',','.'));
+    const b = parseFloat((document.getElementById('buscaY').value||'').replace(',','.'));
+    if(!isFinite(a) || !isFinite(b)){ toast('Ingresá las dos coordenadas.'); return; }
+    let ll; try{ ll = haciaWgs(a, b, selP.value); }catch(e){ toast('No pude convertir esas coordenadas.'); return; }
+    if(!ll || !isFinite(ll.lat) || !isFinite(ll.lon) || Math.abs(ll.lat)>90 || Math.abs(ll.lon)>180){
+      toast('Coordenada fuera de rango. Revisá la proyección elegida.'); return;
+    }
+    fijarDestinoYNavegar(ll.lat, ll.lon, PROY[selP.value].epsg);
+  };
   async function ejecutarBusqueda(){
     const q = inp.value.trim();
     if(!q) return;
@@ -2861,6 +2894,7 @@ function abrirPanelBuscarDestino(){
 function fijarDestinoYNavegar(lat, lon, nombre){
   navDestino = { lat, lon, nombre: nombre||null };
   navRuta = null;
+  navPasos = null;
   setModoMapaForzar('navegar');
   cerrarPanel();
   toast('Destino: ' + (nombre || `${lat.toFixed(5)}, ${lon.toFixed(5)}`));
@@ -2895,7 +2929,21 @@ const Voz = (() => {
 })();
 function tickNavegacion(pos){
   if(!navDestino || !pos) return;
-  const dist = distM(pos.coords.latitude, pos.coords.longitude, navDestino.lat, navDestino.lon);
+  const lat = pos.coords.latitude, lon = pos.coords.longitude;
+  // Con ruta por calles: voz guiada por maniobra (giros, inicio, llegada).
+  if(navPasos && navPasos.length){
+    for(const p of navPasos){
+      if(p.anunciado) continue;
+      const d = distM(lat, lon, p.lat, p.lon);
+      // Anunciar la maniobra cuando estás a ~45 m o menos de ella.
+      if(d < 45){ p.anunciado = true; Voz.decir(fraseManiobra(p)); break; }
+      // Solo miramos la próxima maniobra pendiente; si aún está lejos, no seguimos.
+      break;
+    }
+    return;
+  }
+  // En línea recta (sin ruta): avisos por distancia al destino.
+  const dist = distM(lat, lon, navDestino.lat, navDestino.lon);
   if(dist < 20)       Voz.decir('Llegaste al destino.');
   else if(dist < 50)  Voz.decir('Destino a menos de 50 metros.');
   else if(dist < 100) Voz.decir('Destino a 100 metros.');
@@ -3782,6 +3830,19 @@ let chincheta = null;        // {lat,lon} referencia manual
 let chinchetaBuf = 0;        // radio del buffer en metros (0 = sin buffer)
 let navDestino = null;       // {lat,lon}
 let navRuta = null;          // { coords:[[lon,lat]...], dist, dur }
+let navPasos = null;         // [{lat,lon,type,modifier,name,anunciado}] maniobras para voz
+// Convierte una maniobra OSRM en una frase para la voz.
+function fraseManiobra(p){
+  const t = p.type||'', m = p.modifier||'';
+  if(t==='arrive')  return 'Llegaste al destino.';
+  if(t==='depart')  return 'Iniciando ruta.';
+  const calle = p.name ? ' por ' + p.name : '';
+  if(m.includes('uturn')) return 'Hacé un giro en U.';
+  if(m.includes('left'))  return (m.includes('slight')?'Girá levemente a la izquierda':m.includes('sharp')?'Girá cerrado a la izquierda':'Girá a la izquierda') + calle + '.';
+  if(m.includes('right')) return (m.includes('slight')?'Girá levemente a la derecha':m.includes('sharp')?'Girá cerrado a la derecha':'Girá a la derecha') + calle + '.';
+  if(m==='straight' || t==='continue' || t==='new name') return 'Seguí derecho' + calle + '.';
+  return 'Continuá' + calle + '.';
+}
 
 function fmtDist(m, unidad){
   if(unidad==='km' || (unidad==null && m>=1000)) return (m/1000).toFixed(m>=10000?1:2)+' km';
@@ -3844,7 +3905,7 @@ function actualizarHerramienta(){
       btnV.textContent = Voz.activa ? '🔊' : '🔇';
       btnV.onclick = ()=>{ Voz.alternar(); btnV.textContent = Voz.activa ? '🔊' : '🔇'; };
     }
-    document.getElementById('hQuitar').onclick = ()=>{ navDestino=null; navRuta=null; actualizarHerramienta(); pedirDibujo(); };
+    document.getElementById('hQuitar').onclick = ()=>{ navDestino=null; navRuta=null; navPasos=null; actualizarHerramienta(); pedirDibujo(); };
     document.getElementById('hSalir').onclick = ()=> setModoMapa('navegar');
   } else {
     barra.classList.remove('on');
@@ -3861,35 +3922,45 @@ async function calcularRutaCalles(){
          cache.destino.lat === navDestino.lat &&
          cache.destino.lon === navDestino.lon){
         navRuta = cache.ruta;
+        navPasos = (cache.pasos||[]).map(p=>({...p, anunciado:false}));
         actualizarHerramienta(); pedirDibujo();
         toast('Sin conexión — mostrando ruta guardada anteriormente.');
+        Voz.decir('Sin conexión. Uso la ruta guardada. Iniciando ruta.');
         return;
       }
     }catch(_){}
     toast('Sin conexión y sin ruta guardada para este destino. Navegando en línea recta.');
+    Voz.decir('Sin conexión y sin ruta guardada. Navego en línea recta.');
     return;
   }
   const o = S.fix.coords;
   mostrarCargando('Calculando ruta…');
   try{
-    // OSRM público (a pie). Requiere internet.
-    const url = `https://router.project-osrm.org/route/v1/foot/${o.longitude},${o.latitude};${navDestino.lon},${navDestino.lat}?overview=full&geometries=geojson`;
+    // OSRM público (a pie). steps=true para obtener las maniobras (giros) para la voz.
+    const url = `https://router.project-osrm.org/route/v1/foot/${o.longitude},${o.latitude};${navDestino.lon},${navDestino.lat}?overview=full&geometries=geojson&steps=true`;
     const r = await httpGet(url);
     const j = JSON.parse(bytesATexto(r.bytes));
     if(j && j.routes && j.routes.length){
       const rt = j.routes[0];
       navRuta = { coords: rt.geometry.coordinates, dist: rt.distance, dur: rt.duration };
+      // Construir la lista de maniobras para la voz.
+      navPasos = [];
+      (rt.legs||[]).forEach(leg => (leg.steps||[]).forEach(s => {
+        const mv = s.maneuver||{}; const loc = mv.location||[];
+        if(loc.length>=2) navPasos.push({ lat:loc[1], lon:loc[0], type:mv.type||'', modifier:mv.modifier||'', name:s.name||'', anunciado:false });
+      }));
       actualizarHerramienta(); pedirDibujo();
-      // Persistir la ruta para uso offline (mismo destino).
+      Voz.decir('Iniciando ruta.');
+      // Persistir ruta y maniobras para uso offline (mismo destino).
       try{
         await dbPut('conf', {
           origen: { lat: o.latitude, lon: o.longitude },
           destino: { lat: navDestino.lat, lon: navDestino.lon },
-          ruta: navRuta, ts: Date.now()
+          ruta: navRuta, pasos: navPasos.map(p=>({lat:p.lat,lon:p.lon,type:p.type,modifier:p.modifier,name:p.name})), ts: Date.now()
         }, 'rutaCacheada');
       }catch(_){}
-    } else { toast('No se encontró ruta por calles.'); }
-  }catch(e){ toast('No se pudo calcular la ruta (requiere internet).'); }
+    } else { toast('No se encontró ruta por calles.'); Voz.decir('No encontré una ruta por calles.'); }
+  }catch(e){ toast('No se pudo calcular la ruta (requiere internet).'); Voz.decir('Error al calcular la ruta.'); }
   finally{ ocultarCargando(); }
 }
 // Dibuja medición y navegación sobre el mapa.
@@ -4111,7 +4182,7 @@ function panelChincheta(){
   `);
   document.getElementById('chBufOk').onclick = ()=>{ chinchetaBuf = Math.max(0, parseFloat(document.getElementById('chBuf').value)||0); pedirDibujo(); toast(chinchetaBuf?('Buffer de '+fmtDist(chinchetaBuf)):'Sin buffer'); };
   document.getElementById('chBufNo').onclick = ()=>{ chinchetaBuf = 0; document.getElementById('chBuf').value=''; pedirDibujo(); };
-  document.getElementById('chNav').onclick = ()=>{ navDestino = { lat:chincheta.lat, lon:chincheta.lon }; navRuta = null; setModoMapaForzar('navegar'); cerrarPanel(); };
+  document.getElementById('chNav').onclick = ()=>{ navDestino = { lat:chincheta.lat, lon:chincheta.lon }; navRuta = null; navPasos = null; setModoMapaForzar('navegar'); cerrarPanel(); };
   document.getElementById('chBuscarDest').onclick = ()=>{ cerrarPanel(); abrirPanelBuscarDestino(); };
   document.getElementById('chWaze').onclick = ()=> abrirEnWaze(chincheta.lat, chincheta.lon);
   document.getElementById('chMaps').onclick = ()=> abrirEnMaps(chincheta.lat, chincheta.lon);
