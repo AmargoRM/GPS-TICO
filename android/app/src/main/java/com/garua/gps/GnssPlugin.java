@@ -78,7 +78,10 @@ public class GnssPlugin extends Plugin {
                     conn.setRequestProperty("User-Agent", "GPS-TICO/1.0");
                     int code = conn.getResponseCode();
                     if (code < 200 || code >= 400) { call.reject("HTTP " + code); return; }
-                    java.io.File dir = new java.io.File(getContext().getCacheDir(), "updates");
+                    // Guardamos en almacenamiento interno (filesDir), NO en cache:
+                    // MIUI/Xiaomi limpia la caché de forma agresiva y podría borrar
+                    // el APK antes de que el instalador del sistema lo lea.
+                    java.io.File dir = new java.io.File(getContext().getFilesDir(), "updates");
                     dir.mkdirs();
                     java.io.File apk = new java.io.File(dir, "gps-tico-update.apk");
                     java.io.InputStream is = conn.getInputStream();
