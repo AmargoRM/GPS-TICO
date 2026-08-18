@@ -424,12 +424,7 @@ function isoFechaCR(ts){
   if(ts==null) return '';
   const d = new Date(ts);
   if(isNaN(d.getTime())) return '';
-  const OFFSET_MIN = -360; // UTC-06:00
-  const local = new Date(d.getTime() + OFFSET_MIN*60*1000);
-  const p = n => String(n).padStart(2,'0');
-  return local.getUTCFullYear() + '-' + p(local.getUTCMonth()+1) + '-' + p(local.getUTCDate())
-       + 'T' + p(local.getUTCHours()) + ':' + p(local.getUTCMinutes()) + ':' + p(local.getUTCSeconds())
-       + '-06:00';
+  return d.toISOString();
 }
 
 // Conversión a GeoJSON
@@ -1061,14 +1056,14 @@ async function importarGPX(nombre, xml){
     const ele=parseFloat(txt(w,'ele'));
     const n=S.puntos.length+1;
     const p={ id:nid(), proy:S.proy.id, nom:(txt(w,'name')||('P'+String(n).padStart(3,'0'))), desc:txt(w,'desc'),
-              lat, lon, alt:(isNaN(ele)?null:ele), altElip:(isNaN(ele)?null:ele), altOrto:null, exac:null, fuente:'importado', promediado:false, t:Date.now() };
+              lat, lon, alt:(isNaN(ele)?null:ele), altElip:(isNaN(ele)?null:ele), altOrto:null, exac:null, fuente:'importado', promediado:false, t:(()=>{const tel=w.getElementsByTagName('time')[0]; if(tel&&tel.textContent){const dd=new Date(tel.textContent);if(!isNaN(dd.getTime()))return dd.getTime();} return Date.now();})() };
     await dbPut('puntos', p); S.puntos.push(p); nP++;
   }
   // tracks
   const trks = doc.getElementsByTagName('trk');
   for(let i=0;i<trks.length;i++){
     const tk=trks[i]; const segs=tk.getElementsByTagName('trkpt'); const pts=[];
-    for(let j=0;j<segs.length;j++){ const s=segs[j]; const lat=num(s,'lat'), lon=num(s,'lon'); if(isNaN(lat)||isNaN(lon)) continue; const ele=parseFloat(txt(s,'ele')); pts.push({lat,lon,alt:(isNaN(ele)?null:ele),t:Date.now()}); }
+    for(let j=0;j<segs.length;j++){ const s=segs[j]; const lat=num(s,'lat'), lon=num(s,'lon'); if(isNaN(lat)||isNaN(lon)) continue; const ele=parseFloat(txt(s,'ele')); pts.push({lat,lon,alt:(isNaN(ele)?null:ele),t:(()=>{const tel=s.getElementsByTagName('time')[0]; if(tel&&tel.textContent){const dd=new Date(tel.textContent);if(!isNaN(dd.getTime()))return dd.getTime();} return Date.now();})()}); }
     if(pts.length<2) continue;
     let dist=0; for(let j=1;j<pts.length;j++) dist+=distM(pts[j-1].lat,pts[j-1].lon,pts[j].lat,pts[j].lon);
     const tr={ id:nid(), proy:S.proy.id, nom:(txt(tk,'name')||('Track '+(nT+1))), pts, dist, ini:Date.now(),
@@ -2078,14 +2073,14 @@ function panelExport(){
     const esc = s => String(s||'').replace(/[<>&]/g, c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]));
     let g = `<?xml version="1.0" encoding="UTF-8"?>\n<gpx version="1.1" creator="Garua Campo" xmlns="http://www.topografix.com/GPX/1/1">\n<metadata><name>${esc(S.proy.nom)}</name></metadata>\n`;
     // GPX <ele> es altura sobre el nivel del mar: usamos la ortométrica si está.
-    const ele = o => (o.altOrto!=null ? o.altOrto : (o.altElip!=null ? o.altElip : o.alt));
+    const ele = o => { const v = o.altOrto ?? o.altElip ?? o.alt; return (v != null && !isNaN(v)) ? v : null; };
     for(const p of S.puntos){
       const e = ele(p);
-      g += `<wpt lat="${p.lat}" lon="${p.lon}">${e!=null?`<ele>${e.toFixed(1)}</ele>`:''}<time>${isoFechaCR(p.t)}</time><name>${esc(p.nom)}</name><desc>${esc(p.desc)}</desc></wpt>\n`;
+      g += `<wpt lat="${p.lat}" lon="${p.lon}">${e!=null?`<ele>${e.toFixed(1)}</ele>`:''}${(()=>{const _t=isoFechaCR(p.t);return _t?`<time>${_t}</time>`:''})()}<name>${esc(p.nom)}</name>${esc(p.desc)?`<desc>${esc(p.desc)}</desc>`:''}</wpt>\n`;
     }
     for(const t of S.tracks){
       g += `<trk><name>${esc(t.nom)}</name><trkseg>\n`;
-      for(const q of t.pts){ const e = ele(q); g += `<trkpt lat="${q.lat}" lon="${q.lon}">${e!=null?`<ele>${e.toFixed(1)}</ele>`:''}<time>${isoFechaCR(q.t)}</time></trkpt>\n`; }
+      for(const q of t.pts){ const e = ele(q); g += `<trkpt lat="${q.lat}" lon="${q.lon}">${e!=null?`<ele>${e.toFixed(1)}</ele>`:''}${(()=>{const _t=isoFechaCR(q.t);return _t?`<time>${_t}</time>`:''})()}</trkpt>\n`; }
       g += `</trkseg></trk>\n`;
     }
     bajar(S.proy.nom+'.gpx', g+'</gpx>', 'application/gpx+xml');
@@ -2116,7 +2111,7 @@ function panelExport(){
   };
 }
 async function bajar(nom, txt, tipo){
-  const safe = nom.replace(/[^\w\-. áéíóúñÁÉÍÓÚÑ]/g,'_');
+  const safe = (nom||'export').normalize('NFC').replace(/[^\w\-. áéíóúñÁÉÍÓÚÑüÜçÇ]/g,'_');
   const P = window.Capacitor && window.Capacitor.Plugins;
   // En el APK, <a download> con blob NO funciona en el WebView de Android.
   // Escribimos el archivo con Filesystem y abrimos el menú Compartir.
@@ -2125,7 +2120,7 @@ async function bajar(nom, txt, tipo){
       const res = await P.Filesystem.writeFile({
         path: safe,
         data: txt,
-        directory: 'CACHE',
+        directory: 'DATA',
         encoding: 'utf8'
       });
       if(P.Share){
