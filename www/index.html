@@ -169,7 +169,7 @@ label{display:block;font-size:9px;letter-spacing:.14em;text-transform:uppercase;
     <button class="flot" id="btnCapa">SATÉLITE</button>
     <button class="flot" id="btnCentrar">◎</button>
     <button class="flot" id="btnMedir" title="Medir">📏</button>
-    <button class="flot" id="btnNav" title="Navegar">🧭</button>
+    <button class="flot" id="btnNav" title="Buscar destino">🔍</button>
     <button class="flot" id="btnFuente" title="Fuente de posición" data-src="fused">📡 FUSED</button>
   </div>
   <div id="herramienta">
@@ -1196,6 +1196,10 @@ async function abrirArchivoImportado(f){
   if(!chequearTamano(f.text.length)) return;   // evita OOM con archivos enormes
   const nombre = (f.name||'archivo').replace(/\.(geojson|json|gpx|kml|dxf)$/i,'');
   const t = f.text;
+  // Copia de seguridad de GPS TICO: restaurar en vez de importar como capa.
+  if(/"_tipo"\s*:\s*"gpstico-backup"/.test(t)){
+    try{ const bk = JSON.parse(t); if(bk._tipo==='gpstico-backup'){ await restaurarBackup(bk); return; } }catch(e){}
+  }
   const esGpx = f.kind==='gpx' || /<gpx[\s>]/i.test(t);
   const esKml = f.kind==='kml' || /<kml[\s>]|<Placemark[\s>]/i.test(t);
   const esDxf = f.kind==='dxf' || /\bENTITIES\b|AutoCAD|LWPOLYLINE/.test(t.slice(0,4000));
@@ -1219,14 +1223,14 @@ async function importarGPX(nombre, xml){
     const ele=parseFloat(txt(w,'ele'));
     const n=S.puntos.length+1;
     const p={ id:nid(), proy:S.proy.id, nom:(txt(w,'name')||('P'+String(n).padStart(3,'0'))), desc:txt(w,'desc'),
-              lat, lon, alt:(isNaN(ele)?null:ele), altElip:(isNaN(ele)?null:ele), altOrto:null, exac:null, fuente:'importado', promediado:false, t:Date.now() };
+              lat, lon, alt:(isNaN(ele)?null:ele), altElip:(isNaN(ele)?null:ele), altOrto:null, exac:null, fuente:'importado', promediado:false, t:(()=>{const tel=w.getElementsByTagName('time')[0]; if(tel&&tel.textContent){const dd=new Date(tel.textContent);if(!isNaN(dd.getTime()))return dd.getTime();} return Date.now();})() };
     await dbPut('puntos', p); S.puntos.push(p); nP++;
   }
   // tracks
   const trks = doc.getElementsByTagName('trk');
   for(let i=0;i<trks.length;i++){
     const tk=trks[i]; const segs=tk.getElementsByTagName('trkpt'); const pts=[];
-    for(let j=0;j<segs.length;j++){ const s=segs[j]; const lat=num(s,'lat'), lon=num(s,'lon'); if(isNaN(lat)||isNaN(lon)) continue; const ele=parseFloat(txt(s,'ele')); pts.push({lat,lon,alt:(isNaN(ele)?null:ele),t:Date.now()}); }
+    for(let j=0;j<segs.length;j++){ const s=segs[j]; const lat=num(s,'lat'), lon=num(s,'lon'); if(isNaN(lat)||isNaN(lon)) continue; const ele=parseFloat(txt(s,'ele')); pts.push({lat,lon,alt:(isNaN(ele)?null:ele),t:(()=>{const tel=s.getElementsByTagName('time')[0]; if(tel&&tel.textContent){const dd=new Date(tel.textContent);if(!isNaN(dd.getTime()))return dd.getTime();} return Date.now();})()}); }
     if(pts.length<2) continue;
     let dist=0; for(let j=1;j<pts.length;j++) dist+=distM(pts[j-1].lat,pts[j-1].lon,pts[j].lat,pts[j].lon);
     const tr={ id:nid(), proy:S.proy.id, nom:(txt(tk,'name')||('Track '+(nT+1))), pts, dist, ini:Date.now(),
@@ -1328,7 +1332,7 @@ function alFix(pos){
     geoide:pos.geoide, hdop:ultimoHdop, cn0:ultimoCn0Mean
   });
   if(S.seguir){ S.centro.lat = c.latitude; S.centro.lon = c.longitude; }
-  if(modoMapa==='navegar' && navDestino) actualizarHerramienta();
+  if(modoMapa==='navegar' && navDestino){ actualizarHerramienta(); tickNavegacion(pos); }
   pedirDibujo();
 }
 function alErrorGPS(e){
@@ -1723,7 +1727,7 @@ document.getElementById('btnCentrar').onclick = ()=>{
   dibujar();
 };
 document.getElementById('btnMedir').onclick = ()=> setModoMapa('medir');
-document.getElementById('btnNav').onclick   = ()=> setModoMapa('navegar');
+document.getElementById('btnNav').onclick   = ()=> abrirPanelBuscarDestino();
 document.getElementById('btnFuente').onclick = panelFuente;
 
 /* --- marcar punto --- */
@@ -1931,6 +1935,7 @@ document.getElementById('btnMenu').onclick = ()=>{
     <div class="fila"><div class="cuerpo"><div class="t">Mapa sin conexión</div><div class="s">Zonas y parches descargables</div></div><button class="mini" id="mOff">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Exportar proyecto</div><div class="s">GPX · CSV · GeoJSON</div></div><button class="mini" id="mExp">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Exportar mapa</div><div class="s">PDF georreferenciado · PNG · grilla CRTM05</div></div><button class="mini" id="mExpMapa">Abrir</button></div>
+    <div class="fila"><div class="cuerpo"><div class="t">Copia de seguridad</div><div class="s">Respaldar / restaurar TODO en un archivo</div></div><button class="mini verde" id="mBackup">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">☁ Sincronizar a la nube</div><div class="s">${pend?(pendP+' punto(s) · '+pendT+' track(s) pendientes'):'todo sincronizado'} · Neon</div></div><button class="mini" id="mSync">Abrir</button></div>
     <div class="fila" style="${hayActualizacion?'background:rgba(199,81,70,.12);border-left:3px solid var(--sangre);padding-left:8px;margin-left:-8px':''}"><div class="cuerpo"><div class="t" style="${hayActualizacion?'color:var(--sangre)':''}">${hayActualizacion?'🔴 Actualización disponible':'Actualizar app'}</div><div class="s">${hayActualizacion?'Build '+APP_BUILD+' → '+(infoActualizacion?infoActualizacion.build:'?'):'Build actual: '+(APP_BUILD||'dev')+' · buscar versión nueva'}</div></div><button class="mini ${hayActualizacion?'rojo':''}" id="mUpd">${hayActualizacion?'Instalar':'Buscar'}</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">⚙ Configuración y términos de uso</div><div class="s">Fuente, diagnóstico, filtros, alertas, precisión</div></div><button class="mini" id="mConfig">Abrir</button></div>
@@ -1943,8 +1948,68 @@ document.getElementById('btnMenu').onclick = ()=>{
   document.getElementById('mExp').onclick   = panelExport;
   document.getElementById('mExpMapa').onclick = panelExportMapa;
   document.getElementById('mSync').onclick  = panelSync;
+  document.getElementById('mBackup').onclick = panelBackup;
   document.getElementById('mConfig').onclick = panelConfig;
 };
+/* --- copia de seguridad completa (proyectos/puntos/tracks/capas/ajustes) --- */
+function volcarConf(){
+  return new Promise(ok=>{
+    const out = {}; const req = tx('conf').openCursor();
+    req.onsuccess = e=>{ const c = e.target.result; if(c){ out[c.key] = c.value; c.continue(); } else ok(out); };
+    req.onerror = ()=> ok(out);
+  });
+}
+async function exportarBackup(){
+  mostrarCargando('Preparando copia…');
+  try{
+    const data = {
+      _tipo:'gpstico-backup', _v:1, fecha:new Date().toISOString(),
+      proyectos: await dbAll('proyectos'),
+      puntos: await dbAll('puntos'),
+      tracks: await dbAll('tracks'),
+      capas: await dbAll('capas'),
+      conf: await volcarConf()
+    };
+    const n = 'gpstico-backup-'+new Date().toISOString().slice(0,19).replace(/[:T]/g,'-')+'.json';
+    await bajar(n, JSON.stringify(data), 'application/json');
+    toast(`Copia lista: ${data.proyectos.length} proyectos · ${data.puntos.length} puntos · ${data.tracks.length} tracks.`);
+  }catch(e){ toast('No se pudo crear la copia.'); }
+  finally{ ocultarCargando(); }
+}
+async function restaurarBackup(d){
+  if(!d || d._tipo!=='gpstico-backup'){ toast('No es una copia de GPS TICO.'); return false; }
+  mostrarCargando('Restaurando…');
+  try{
+    for(const p of (d.proyectos||[])) await dbPut('proyectos', p);
+    for(const p of (d.puntos||[]))   await dbPut('puntos', p);
+    for(const t of (d.tracks||[]))   await dbPut('tracks', t);
+    for(const c of (d.capas||[]))    await dbPut('capas', c);
+    if(d.conf) for(const k of Object.keys(d.conf)) await dbPut('conf', d.conf[k], k);
+    ocultarCargando();
+    toast('Copia restaurada. Reiniciando…');
+    setTimeout(()=> location.reload(), 900);
+    return true;
+  }catch(e){ ocultarCargando(); toast('No se pudo restaurar.'); return false; }
+}
+function importarBackupArchivo(file){
+  const reader = new FileReader();
+  reader.onload = ()=>{ try{ restaurarBackup(JSON.parse(reader.result)); }catch(e){ toast('Archivo de copia inválido.'); } };
+  reader.onerror = ()=> toast('No se pudo leer el archivo.');
+  reader.readAsText(file);
+}
+function panelBackup(){
+  abrirPanel('Copia de seguridad', `
+    <div class="nota">Guardá una copia de <b>TODO</b> (proyectos, puntos, tracks, capas y ajustes) en un archivo. Si cambiás de teléfono o una actualización borra datos, restaurás desde acá. Hacelo seguido y guardá el archivo en Drive o tu PC.</div>
+    <div class="res"><div class="k">Contenido actual</div><div class="v">${S.puntos.length} puntos · ${S.tracks.length} tracks · ${S.capas.length} capas</div></div>
+    <button class="ancho" id="bkExp">Exportar copia (todo)</button>
+    <label>Restaurar desde un archivo de copia</label>
+    <input type="file" id="bkFile" accept="application/json,.json">
+    <button class="ancho borde" id="bkImp">Restaurar copia</button>
+    <div class="nota">Restaurar <b>agrega/actualiza</b> sin borrar lo que ya tengas. La app se reinicia al terminar.</div>
+  `);
+  document.getElementById('bkExp').onclick = exportarBackup;
+  document.getElementById('bkImp').onclick = ()=>{ const f=document.getElementById('bkFile').files[0]; if(!f){ toast('Elegí el archivo de copia.'); return; } importarBackupArchivo(f); };
+}
 // Panel agrupado: Configuración y términos de uso.
 function panelConfig(){
   abrirPanel('Configuración y términos de uso', `
@@ -2319,14 +2384,14 @@ function panelExport(){
     const esc = s => String(s||'').replace(/[<>&]/g, c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]));
     let g = `<?xml version="1.0" encoding="UTF-8"?>\n<gpx version="1.1" creator="Garua Campo" xmlns="http://www.topografix.com/GPX/1/1">\n<metadata><name>${esc(S.proy.nom)}</name></metadata>\n`;
     // GPX <ele> es altura sobre el nivel del mar: usamos la ortométrica si está.
-    const ele = o => (o.altOrto!=null ? o.altOrto : (o.altElip!=null ? o.altElip : o.alt));
+    const ele = o => { const v = o.altOrto ?? o.altElip ?? o.alt; return (v != null && !isNaN(v)) ? v : null; };
     for(const p of S.puntos){
       const e = ele(p);
-      g += `<wpt lat="${p.lat}" lon="${p.lon}">${e!=null?`<ele>${e.toFixed(1)}</ele>`:''}<time>${new Date(p.t).toISOString()}</time><name>${esc(p.nom)}</name><desc>${esc(p.desc)}</desc></wpt>\n`;
+      g += `<wpt lat="${p.lat}" lon="${p.lon}">${e!=null?`<ele>${e.toFixed(1)}</ele>`:''}${(()=>{const _t=isoTS(p.t);return _t?`<time>${_t}</time>`:''})()}<name>${esc(p.nom)}</name>${esc(p.desc)?`<desc>${esc(p.desc)}</desc>`:''}</wpt>\n`;
     }
     for(const t of S.tracks){
       g += `<trk><name>${esc(t.nom)}</name><trkseg>\n`;
-      for(const q of t.pts){ const e = ele(q); g += `<trkpt lat="${q.lat}" lon="${q.lon}">${e!=null?`<ele>${e.toFixed(1)}</ele>`:''}<time>${new Date(q.t).toISOString()}</time></trkpt>\n`; }
+      for(const q of t.pts){ const e = ele(q); g += `<trkpt lat="${q.lat}" lon="${q.lon}">${e!=null?`<ele>${e.toFixed(1)}</ele>`:''}${(()=>{const _t=isoTS(q.t);return _t?`<time>${_t}</time>`:''})()}</trkpt>\n`; }
       g += `</trkseg></trk>\n`;
     }
     bajar(S.proy.nom+'.gpx', g+'</gpx>', 'application/gpx+xml');
@@ -2344,7 +2409,7 @@ function panelExport(){
           tipo:(p.promediado?'promediado':'instantaneo'), muestras:(p.muestras!=null?p.muestras:null),
           desv_std_m:(p.desvStd!=null?p.desvStd:null), hdop_medio:(p.hdopMedio!=null?p.hdopMedio:null),
           cn0_medio:(p.cn0Medio!=null?p.cn0Medio:null), duracion_s:(p.duracion!=null?p.duracion:null),
-          fecha:new Date(p.t).toISOString() },
+          fecha:isoTS(p.t) },
         geometry:{ type:'Point', coordinates:[p.lon, p.lat, (zOrto!=null?zOrto:(zElip!=null?zElip:0))] } });
     }
     for(const t of S.tracks) fc.features.push({ type:'Feature',
@@ -2359,8 +2424,11 @@ function panelExport(){
     exportarDXF(document.getElementById('exDxfSys').value);
   };
 }
+// Timestamp ISO seguro: UTC (Z) o '' si es nulo/inválido (evita que
+// new Date(null).toISOString() lance y rompa toda la exportación GPX).
+function isoTS(ts){ const d = new Date(ts==null?NaN:ts); return isNaN(d.getTime()) ? '' : d.toISOString(); }
 async function bajar(nom, txt, tipo){
-  const safe = nom.replace(/[^\w\-. áéíóúñÁÉÍÓÚÑ]/g,'_');
+  const safe = (nom||'export').normalize('NFC').replace(/[^\w\-. áéíóúñÁÉÍÓÚÑüÜçÇ]/g,'_');
   const P = window.Capacitor && window.Capacitor.Plugins;
   // En el APK, <a download> con blob NO funciona en el WebView de Android.
   // Escribimos el archivo con Filesystem y abrimos el menú Compartir.
@@ -2369,7 +2437,7 @@ async function bajar(nom, txt, tipo){
       const res = await P.Filesystem.writeFile({
         path: safe,
         data: txt,
-        directory: 'CACHE',
+        directory: 'DATA',
         encoding: 'utf8'
       });
       if(P.Share){
@@ -2735,6 +2803,106 @@ async function httpGet(url){
   return { status:resp.status, contentType: resp.headers.get('content-type')||'', bytes };
 }
 function bytesATexto(bytes){ return new TextDecoder('utf-8').decode(bytes); }
+
+// ─── BÚSQUEDA DE DESTINO ──────────────────────────────────────
+async function geocodificarNominatim(q){
+  const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(q)}&format=json&limit=6&countrycodes=cr&accept-language=es`;
+  try{ const r = await httpGet(url); return JSON.parse(bytesATexto(r.bytes)); }
+  catch(e){ return []; }
+}
+// Detecta un par "lat, lon" (decimales en punto). Devuelve {lat,lon} o null.
+function parseParDeCoords(q){
+  const m = String(q).trim().match(/^\s*(-?\d{1,3}(?:\.\d+)?)\s*[,;\s]\s*(-?\d{1,3}(?:\.\d+)?)\s*$/);
+  if(!m) return null;
+  const lat = parseFloat(m[1]), lon = parseFloat(m[2]);
+  if(isNaN(lat) || isNaN(lon) || Math.abs(lat)>90 || Math.abs(lon)>180) return null;
+  return { lat, lon };
+}
+function abrirPanelBuscarDestino(){
+  abrirPanel('Buscar destino', `
+    <input id="buscaQ" type="text" placeholder="Nombre de lugar o coordenadas…" autocomplete="off" style="width:100%;box-sizing:border-box;">
+    <div class="grid2" style="margin-top:6px">
+      <button class="ancho" id="buscaBtn">Buscar</button>
+      <button class="ancho borde" id="buscaCoord">Usar coordenadas</button>
+    </div>
+    <div id="buscaResultados" style="margin-top:8px"></div>
+  `);
+  const inp = document.getElementById('buscaQ');
+  inp.focus();
+  inp.addEventListener('keydown', e => { if(e.key==='Enter') ejecutarBusqueda(); });
+  document.getElementById('buscaBtn').onclick = ejecutarBusqueda;
+  document.getElementById('buscaCoord').onclick = ()=>{ inp.value=''; inp.placeholder='latitud, longitud  (ej. 9.9328, -84.0795)'; inp.focus(); toast('Escribí la coordenada como: latitud, longitud'); };
+  async function ejecutarBusqueda(){
+    const q = inp.value.trim();
+    if(!q) return;
+    const coord = parseParDeCoords(q);
+    if(coord){ fijarDestinoYNavegar(coord.lat, coord.lon, q); return; }
+    const res = document.getElementById('buscaResultados');
+    res.textContent = 'Buscando…';
+    const resultados = await geocodificarNominatim(q);
+    if(!resultados.length){
+      res.innerHTML = '<p style="color:#E08A58;font-size:.85em">Sin resultados. Verificá la conexión o usá coordenadas.</p>';
+      return;
+    }
+    res.innerHTML = resultados.map((r,i)=>`
+      <button class="ancho borde" data-i="${i}" style="text-align:left;margin-top:4px;white-space:normal">
+        <strong>${escHtml((r.display_name||'').split(',')[0])}</strong><br>
+        <span style="font-size:.8em;opacity:.7">${escHtml((r.display_name||'').split(',').slice(1,3).join(','))}</span>
+      </button>
+    `).join('');
+    res.querySelectorAll('button[data-i]').forEach(btn=>{
+      btn.onclick = ()=>{
+        const r = resultados[+btn.dataset.i];
+        fijarDestinoYNavegar(parseFloat(r.lat), parseFloat(r.lon), (r.display_name||'').split(',')[0]);
+      };
+    });
+  }
+}
+function fijarDestinoYNavegar(lat, lon, nombre){
+  navDestino = { lat, lon, nombre: nombre||null };
+  navRuta = null;
+  setModoMapaForzar('navegar');
+  cerrarPanel();
+  toast('Destino: ' + (nombre || `${lat.toFixed(5)}, ${lon.toFixed(5)}`));
+}
+
+// ─── MÓDULO DE VOZ (Nivel 1: Web Speech API) ──────────────────
+// Punto de extensión para Nivel 3 (TTS offline): reemplazar _ttsBackend.
+const Voz = (() => {
+  let _habilitada = false, _ultimoDicho = '', _ultimoTs = 0;
+  function _ttsBackend(texto, lang){
+    if(!('speechSynthesis' in window)) return;
+    speechSynthesis.cancel();
+    const u = new SpeechSynthesisUtterance(texto);
+    u.lang = lang || 'es-CR'; u.rate = 1.0; u.pitch = 1.0;
+    speechSynthesis.speak(u);
+  }
+  function decir(texto, opciones={}){
+    if(!_habilitada) return;
+    const ahora = Date.now();
+    if(texto === _ultimoDicho && ahora - _ultimoTs < 8000) return;
+    _ultimoDicho = texto; _ultimoTs = ahora;
+    _ttsBackend(texto, opciones.lang || 'es-CR');
+  }
+  function alternar(){
+    _habilitada = !_habilitada;
+    toast(_habilitada ? 'Voz activada' : 'Voz desactivada');
+    try{ localStorage.setItem('vozActiva', _habilitada ? '1' : '0'); }catch(_){}
+    return _habilitada;
+  }
+  function init(){ try{ _habilitada = localStorage.getItem('vozActiva') === '1'; }catch(_){} }
+  return { decir, alternar, get activa(){ return _habilitada; }, init };
+})();
+function tickNavegacion(pos){
+  if(!navDestino || !pos) return;
+  const dist = distM(pos.coords.latitude, pos.coords.longitude, navDestino.lat, navDestino.lon);
+  if(dist < 20)       Voz.decir('Llegaste al destino.');
+  else if(dist < 50)  Voz.decir('Destino a menos de 50 metros.');
+  else if(dist < 100) Voz.decir('Destino a 100 metros.');
+  else if(dist < 200) Voz.decir('Destino a 200 metros.');
+  else if(dist < 500) Voz.decir(`Destino a ${Math.round(dist/100)*100} metros.`);
+  else                Voz.decir(`Destino a ${(dist/1000).toFixed(1)} kilómetros.`);
+}
 function sinQuery(u){ return (u||'').split('?')[0]; }
 
 // Lee GetCapabilities y lista capas/feature types (maneja espacios de nombres por localName).
@@ -3669,8 +3837,13 @@ function actualizarHerramienta(){
       if(navRuta) info += `<br>Por calles: <b>${fmtDist(navRuta.dist)}</b> · ${Math.round(navRuta.dur/60)} min`;
     }
     txt.innerHTML = info;
-    btns.innerHTML = `<button class="pri" id="hRuta">Ruta por calles</button><button id="hQuitar">Quitar destino</button><button id="hSalir">Salir</button>`;
+    btns.innerHTML = `<button class="pri" id="hRuta">Ruta por calles</button><button id="btnVoz" title="Activar/desactivar voz">🔇</button><button id="hQuitar">Quitar destino</button><button id="hSalir">Salir</button>`;
     document.getElementById('hRuta').onclick = calcularRutaCalles;
+    if(document.getElementById('btnVoz')){
+      const btnV = document.getElementById('btnVoz');
+      btnV.textContent = Voz.activa ? '🔊' : '🔇';
+      btnV.onclick = ()=>{ Voz.alternar(); btnV.textContent = Voz.activa ? '🔊' : '🔇'; };
+    }
     document.getElementById('hQuitar').onclick = ()=>{ navDestino=null; navRuta=null; actualizarHerramienta(); pedirDibujo(); };
     document.getElementById('hSalir').onclick = ()=> setModoMapa('navegar');
   } else {
@@ -3680,6 +3853,22 @@ function actualizarHerramienta(){
 async function calcularRutaCalles(){
   if(!navDestino){ toast('Tocá un destino primero.'); return; }
   if(!S.fix){ toast('Sin posición GPS todavía.'); return; }
+  // Sin conexión: intentar la ruta guardada para este mismo destino.
+  if(!navigator.onLine){
+    try{
+      const cache = await dbGet('conf','rutaCacheada');
+      if(cache && cache.ruta && cache.destino &&
+         cache.destino.lat === navDestino.lat &&
+         cache.destino.lon === navDestino.lon){
+        navRuta = cache.ruta;
+        actualizarHerramienta(); pedirDibujo();
+        toast('Sin conexión — mostrando ruta guardada anteriormente.');
+        return;
+      }
+    }catch(_){}
+    toast('Sin conexión y sin ruta guardada para este destino. Navegando en línea recta.');
+    return;
+  }
   const o = S.fix.coords;
   mostrarCargando('Calculando ruta…');
   try{
@@ -3691,6 +3880,14 @@ async function calcularRutaCalles(){
       const rt = j.routes[0];
       navRuta = { coords: rt.geometry.coordinates, dist: rt.distance, dur: rt.duration };
       actualizarHerramienta(); pedirDibujo();
+      // Persistir la ruta para uso offline (mismo destino).
+      try{
+        await dbPut('conf', {
+          origen: { lat: o.latitude, lon: o.longitude },
+          destino: { lat: navDestino.lat, lon: navDestino.lon },
+          ruta: navRuta, ts: Date.now()
+        }, 'rutaCacheada');
+      }catch(_){}
     } else { toast('No se encontró ruta por calles.'); }
   }catch(e){ toast('No se pudo calcular la ruta (requiere internet).'); }
   finally{ ocultarCargando(); }
@@ -3902,6 +4099,7 @@ function panelChincheta(){
       <button class="ancho borde" id="chBufNo">Quitar buffer</button>
     </div>
     <button class="ancho" id="chNav">Navegar aquí (en la app)</button>
+    <button class="ancho borde" id="chBuscarDest">Buscar otro destino por nombre</button>
     <div class="grid2">
       <button class="ancho borde" id="chWaze">Abrir en Waze</button>
       <button class="ancho borde" id="chMaps">Abrir en Maps</button>
@@ -3914,6 +4112,7 @@ function panelChincheta(){
   document.getElementById('chBufOk').onclick = ()=>{ chinchetaBuf = Math.max(0, parseFloat(document.getElementById('chBuf').value)||0); pedirDibujo(); toast(chinchetaBuf?('Buffer de '+fmtDist(chinchetaBuf)):'Sin buffer'); };
   document.getElementById('chBufNo').onclick = ()=>{ chinchetaBuf = 0; document.getElementById('chBuf').value=''; pedirDibujo(); };
   document.getElementById('chNav').onclick = ()=>{ navDestino = { lat:chincheta.lat, lon:chincheta.lon }; navRuta = null; setModoMapaForzar('navegar'); cerrarPanel(); };
+  document.getElementById('chBuscarDest').onclick = ()=>{ cerrarPanel(); abrirPanelBuscarDestino(); };
   document.getElementById('chWaze').onclick = ()=> abrirEnWaze(chincheta.lat, chincheta.lon);
   document.getElementById('chMaps').onclick = ()=> abrirEnMaps(chincheta.lat, chincheta.lon);
   document.getElementById('chGuardar').onclick = async ()=>{ await guardarChinchetaComoPunto(); cerrarPanel(); };
@@ -5267,6 +5466,7 @@ function exportarDiagCSV(){
    ======================================================================= */
 (async ()=>{
   await abrirDB();
+  Voz.init();
   await migrarAGeoJSON();
   S.modo = await dbGet('conf','modo') || 'geo';
   S.capa = await dbGet('conf','capa') || 'sat';
