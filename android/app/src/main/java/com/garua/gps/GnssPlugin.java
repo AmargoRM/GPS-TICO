@@ -59,6 +59,49 @@ public class GnssPlugin extends Plugin {
         call.resolve(o);
     }
 
+    // Descarga un APK (misma firma) a la caché y lanza el instalador del sistema.
+    // Permite que la app se actualice sola desde GitHub Releases sin pasar por
+    // Play. Requiere el permiso REQUEST_INSTALL_PACKAGES y usa el FileProvider ya
+    // configurado (cache-path "." cubre getCacheDir()).
+    @PluginMethod
+    public void instalarApkDesde(final PluginCall call) {
+        final String url = call.getString("url");
+        if (url == null || url.isEmpty()) { call.reject("URL vacía"); return; }
+        new Thread(new Runnable() {
+            @Override public void run() {
+                java.net.HttpURLConnection conn = null;
+                try {
+                    conn = (java.net.HttpURLConnection) new java.net.URL(url).openConnection();
+                    conn.setConnectTimeout(15000);
+                    conn.setReadTimeout(120000);
+                    conn.setInstanceFollowRedirects(true);
+                    conn.setRequestProperty("User-Agent", "GPS-TICO/1.0");
+                    int code = conn.getResponseCode();
+                    if (code < 200 || code >= 400) { call.reject("HTTP " + code); return; }
+                    java.io.File dir = new java.io.File(getContext().getCacheDir(), "updates");
+                    dir.mkdirs();
+                    java.io.File apk = new java.io.File(dir, "gps-tico-update.apk");
+                    java.io.InputStream is = conn.getInputStream();
+                    java.io.FileOutputStream fos = new java.io.FileOutputStream(apk);
+                    byte[] buf = new byte[8192]; int n;
+                    while ((n = is.read(buf)) > 0) fos.write(buf, 0, n);
+                    fos.close(); is.close();
+                    android.net.Uri uri = androidx.core.content.FileProvider.getUriForFile(
+                        getContext(), getContext().getPackageName() + ".fileprovider", apk);
+                    Intent i = new Intent(Intent.ACTION_VIEW);
+                    i.setDataAndType(uri, "application/vnd.android.package-archive");
+                    i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                    getContext().startActivity(i);
+                    call.resolve(new JSObject().put("ok", true));
+                } catch (Exception e) {
+                    call.reject("No se pudo instalar: " + e.getMessage());
+                } finally {
+                    if (conn != null) conn.disconnect();
+                }
+            }
+        }).start();
+    }
+
     // Abre una app externa (Waze, Maps, navegador) con una URL/intent.
     @PluginMethod
     public void abrirExterno(PluginCall call) {
@@ -108,8 +151,15 @@ public class GnssPlugin extends Plugin {
     public void startForegroundTracking(PluginCall call) {
         try {
             String text = call.getString("text", "Grabando track…");
+            // 'track' = graba puntos por sí solo con LocationManager (sobrevive
+            // a la pantalla apagada). 'keepalive' = solo mantiene el proceso vivo.
+            String modo = call.getString("modo", "keepalive");
             Intent i = new Intent(getContext(), TrackForegroundService.class);
-            i.setAction(TrackForegroundService.ACTION_KEEPALIVE);
+            if ("track".equals(modo)) {
+                i.setAction(TrackForegroundService.ACTION_TRACK_START);
+            } else {
+                i.setAction(TrackForegroundService.ACTION_KEEPALIVE);
+            }
             i.putExtra(TrackForegroundService.EXTRA_TEXT, text);
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 getContext().startForegroundService(i);
@@ -120,6 +170,59 @@ public class GnssPlugin extends Plugin {
         } catch (Exception e) {
             call.reject("No se pudo iniciar el servicio: " + e.getMessage());
         }
+    }
+    // ¿Está la app exenta de la optimización de batería? (clave para el track en background)
+    @PluginMethod
+    public void bateriaOptimizada(PluginCall call) {
+        boolean exenta = false;
+        try {
+            android.os.PowerManager pm = (android.os.PowerManager) getContext().getSystemService(android.content.Context.POWER_SERVICE);
+            if (pm != null && Build.VERSION.SDK_INT >= 23) {
+                exenta = pm.isIgnoringBatteryOptimizations(getContext().getPackageName());
+            } else {
+                exenta = true; // versiones viejas: no aplica
+            }
+        } catch (Exception ignored) {}
+        call.resolve(new JSObject().put("exenta", exenta));
+    }
+
+    // Abre el diálogo del sistema para pedir ignorar la optimización de batería.
+    // Sin esto, Android estrangula el GPS en background (track lineal / cortado).
+    @PluginMethod
+    @SuppressLint("BatteryLife")
+    public void pedirIgnorarBateria(PluginCall call) {
+        try {
+            if (Build.VERSION.SDK_INT >= 23) {
+                Intent i = new Intent(android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS);
+                i.setData(android.net.Uri.parse("package:" + getContext().getPackageName()));
+                i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                getContext().startActivity(i);
+            }
+            call.resolve();
+        } catch (Exception e) {
+            // Fallback: abrir la pantalla general de optimización de batería.
+            try {
+                Intent i = new Intent(android.provider.Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS);
+                i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                getContext().startActivity(i);
+                call.resolve();
+            } catch (Exception e2) { call.reject("No se pudo abrir el ajuste: " + e2.getMessage()); }
+        }
+    }
+
+    // Para el track nativo (deja de grabar puntos en background pero mantiene la app viva).
+    @PluginMethod
+    public void stopNativeTrack(PluginCall call) {
+        try {
+            Intent i = new Intent(getContext(), TrackForegroundService.class);
+            i.setAction(TrackForegroundService.ACTION_TRACK_STOP);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                getContext().startForegroundService(i);
+            } else {
+                getContext().startService(i);
+            }
+            call.resolve();
+        } catch (Exception e) { call.reject(e.getMessage()); }
     }
 
     // Guarda la fuente (fused/gps) para que el servicio nativo del widget la use.

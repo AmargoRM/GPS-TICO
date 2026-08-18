@@ -56,6 +56,10 @@ public class TrackForegroundService extends Service {
     private LocationListener listener;
     private long trackIni = 0;
     private double[] ultimoPt = null;   // [lat,lon] del último punto grabado (filtro de distancia)
+    private long ultimoT = 0;           // timestamp del último punto grabado (filtro anti-salto)
+    private android.os.HandlerThread hilo;   // hilo dedicado para los callbacks de ubicación
+    private static final float EXAC_MAX = 35f;   // rechazar fixes con exactitud peor a 35 m
+    private static final double VEL_MAX = 55.0;  // m/s (~200 km/h): salto físicamente imposible
 
     @Override
     public void onCreate() {
@@ -107,16 +111,16 @@ public class TrackForegroundService extends Service {
 
     // ---------------- Grabación nativa ----------------
 
+    // El track SIEMPRE usa GPS puro (satélites). El proveedor fusionado, con la
+    // pantalla apagada, cae a ubicación por celda/WiFi (cientos de metros de
+    // error) y produce saltos extremos. Solo si el equipo no tiene GPS se cae a
+    // red como último recurso.
     private String proveedor() {
-        SharedPreferences sp = getSharedPreferences("gps_tico_prefs", MODE_PRIVATE);
-        String fuente = sp.getString("fuente", "fused");
         try {
-            if ("gps".equals(fuente) && lm.getAllProviders().contains(LocationManager.GPS_PROVIDER))
-                return LocationManager.GPS_PROVIDER;
-            if (Build.VERSION.SDK_INT >= 31 && lm.getAllProviders().contains(LocationManager.FUSED_PROVIDER))
-                return LocationManager.FUSED_PROVIDER;
             if (lm.getAllProviders().contains(LocationManager.GPS_PROVIDER))
                 return LocationManager.GPS_PROVIDER;
+            if (lm.getAllProviders().contains(LocationManager.NETWORK_PROVIDER))
+                return LocationManager.NETWORK_PROVIDER;
         } catch (Exception ignored) {}
         return LocationManager.GPS_PROVIDER;
     }
@@ -127,13 +131,20 @@ public class TrackForegroundService extends Service {
         // Nuevo track: reiniciar archivo.
         trackIni = System.currentTimeMillis();
         ultimoPt = null;
+        ultimoT = 0;
         puntosNativos = 0;
         grabandoNativo = true;
         JSONObject t = new JSONObject();
-        try { t.put("ini", trackIni); t.put("pts", new JSONArray()); t.put("fuente", getSharedPreferences("gps_tico_prefs", MODE_PRIVATE).getString("fuente","fused")); } catch (Exception ignored) {}
+        try { t.put("ini", trackIni); t.put("pts", new JSONArray()); t.put("fuente", "gps"); } catch (Exception ignored) {}
         escribir(archTrack(), t.toString());
 
         if (listener != null) { try { lm.removeUpdates(listener); } catch (Exception ignored) {} }
+        // Hilo dedicado: los callbacks NO dependen del hilo principal de la app
+        // (que se pausa/mata cuando la pantalla se apaga o la app se cierra).
+        if (hilo == null || !hilo.isAlive()) {
+            hilo = new android.os.HandlerThread("GpsTicoTrack");
+            hilo.start();
+        }
         listener = new LocationListener() {
             @Override public void onLocationChanged(Location loc) { onFixTrack(loc); }
             @Override public void onProviderEnabled(String p) {}
@@ -141,19 +152,31 @@ public class TrackForegroundService extends Service {
             @Override public void onStatusChanged(String p, int s, Bundle b) {}
         };
         try {
-            lm.requestLocationUpdates(proveedor(), 1000L, 0f, listener, Looper.getMainLooper());
+            // 1 Hz, sin filtro de distancia nativo (lo hacemos nosotros con calidad).
+            lm.requestLocationUpdates(proveedor(), 1000L, 0f, listener, hilo.getLooper());
         } catch (Exception e) { /* sin permiso o proveedor */ }
-        updateNotification(this, "Grabando… 0 pts");
+        updateNotification(this, "Grabando… 0 pts (GPS)");
     }
 
     private void onFixTrack(Location loc) {
         if (!grabandoNativo || loc == null) return;
         double lat = loc.getLatitude(), lon = loc.getLongitude();
-        if (ultimoPt != null) {
+        long tNow = loc.getTime() > 0 ? loc.getTime() : System.currentTimeMillis();
+        // --- Filtros de calidad (evitan saltos extremos) ---
+        // 1) Rechazar fixes con exactitud peor a EXAC_MAX (típico de celda/WiFi).
+        if (loc.hasAccuracy() && loc.getAccuracy() > EXAC_MAX) {
+            updateNotification(this, "Grabando… " + puntosNativos + " pts (buscando señal)");
+            return;
+        }
+        // 2) Rechazar saltos físicamente imposibles (velocidad implícita irreal).
+        if (ultimoPt != null && ultimoT > 0) {
             double d = distanciaM(ultimoPt[0], ultimoPt[1], lat, lon);
-            if (d < 3.0) return; // filtro de distancia mínima
+            double dt = Math.max(0.001, (tNow - ultimoT) / 1000.0);
+            if (d / dt > VEL_MAX) return;   // salto imposible → descartar
+            if (d < 1.5) return;            // filtro de distancia mínima
         }
         ultimoPt = new double[]{lat, lon};
+        ultimoT = tNow;
         try {
             String s = leer(archTrack());
             JSONObject t = (s != null) ? new JSONObject(s) : new JSONObject();
@@ -164,7 +187,8 @@ public class TrackForegroundService extends Service {
             escribir(archTrack(), t.toString());
             puntosNativos = pts.length();
         } catch (Exception ignored) {}
-        updateNotification(this, "Grabando… " + puntosNativos + " pts");
+        String exacTxt = loc.hasAccuracy() ? (" ±" + Math.round(loc.getAccuracy()) + "m") : "";
+        updateNotification(this, "Grabando… " + puntosNativos + " pts" + exacTxt);
     }
 
     @SuppressLint("MissingPermission")
@@ -236,6 +260,7 @@ public class TrackForegroundService extends Service {
     private void detenerTrackNativo() {
         grabandoNativo = false;
         if (listener != null) { try { lm.removeUpdates(listener); } catch (Exception ignored) {} listener = null; }
+        if (hilo != null) { try { hilo.quitSafely(); } catch (Exception ignored) {} hilo = null; }
     }
 
     private JSONArray fixToArray(Location loc) {
