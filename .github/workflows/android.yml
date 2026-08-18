@@ -50,6 +50,11 @@ jobs:
           echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.keystore"
           echo "Keystore escrita: $(wc -c < "$RUNNER_TEMP/release.keystore") bytes"
 
+      - name: Estampar número de build en la app (para auto-actualización)
+        run: |
+          sed -i "s/__BUILD__/${{ github.run_number }}/g" www/index.html
+          echo "Build estampado: ${{ github.run_number }}"
+
       - name: Sincronizar web con el proyecto Android
         run: npx cap sync android
 
@@ -74,6 +79,11 @@ jobs:
       - name: Preparar el APK con nombre estable
         run: cp android/app/build/outputs/apk/release/app-release.apk gps-tico.apk
 
+      - name: Generar version.json (para auto-actualización)
+        run: |
+          echo "{\"build\": ${{ github.run_number }}, \"apk\": \"gps-tico.apk\", \"fecha\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}" > version.json
+          cat version.json
+
       - name: Limpiar el Release debug viejo (evita instalar por error un APK con otra firma)
         env:
           GH_TOKEN: ${{ github.token }}
@@ -84,7 +94,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release delete apk-release --yes --cleanup-tag || true
-          gh release create apk-release gps-tico.apk \
+          gh release create apk-release gps-tico.apk version.json \
             --title "GPS TICO - APK (release firmado)" \
             --target "$GITHUB_SHA" \
             --notes "APK de release firmado con la llave de produccion. Se instala/actualiza directamente encima de una version anterior firmada con la misma llave (no hace falta desinstalar). Descarga el archivo gps-tico.apk y abrilo en el telefono."

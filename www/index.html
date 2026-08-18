@@ -184,6 +184,10 @@ label{display:block;font-size:9px;letter-spacing:.14em;text-transform:uppercase;
 <script>
 "use strict";
 
+// Número de build (lo estampa el CI al compilar). En desarrollo local queda 0.
+const APP_BUILD = parseInt("__BUILD__", 10) || 0;
+const UPDATE_BASE = "https://github.com/AmargoRM/GPS-TICO/releases/download/apk-release";
+
 /* =======================================================================
    1. GEODESIA
    Implementado a mano, sin librerías externas, para que funcione
@@ -1284,6 +1288,7 @@ async function finalizarOcupacion(){
   ocupacion = null;
   cerrarPanel(); dibujar();
   toast(`Punto promediado: ${nMuestras} muestras · ±${r.stdM.toFixed(2)} m`);
+  disparoAutoSync();
 }
 function cancelarOcupacion(){
   if(ocupacion && ocupacion.timer) clearInterval(ocupacion.timer);
@@ -1351,6 +1356,7 @@ async function alternarTrack(){
     if(fuentePrevTrack && fuentePrevTrack !== S.fuente){ S.fuente = fuentePrevTrack; await aplicarFuente(); }
     fuentePrevTrack = null;
     if(S.proy) await cargarProyecto(S.proy.id);
+    disparoAutoSync();
   } else {
     if(!S.proy){
       const proy = { id:nid(), nom:'Temporal ' + new Date().toLocaleDateString('es-CR'), pts:[], tracks:[] };
@@ -1414,6 +1420,7 @@ async function marcarPuntoRapido(){
   await dbPut('puntos', p); S.puntos.push(p); dibujar();
   if(navigator.vibrate){ try{ navigator.vibrate(40); }catch(e){} }
   toast('Punto rápido guardado: ' + p.nom);
+  disparoAutoSync();
 }
 async function manejarAccionWidget(action, desdeFrio){
   if(!action) return;
@@ -1552,6 +1559,8 @@ document.getElementById('btnMenu').onclick = ()=>{
     <div class="fila"><div class="cuerpo"><div class="t">Mapa sin conexión</div><div class="s">Zonas y parches descargables</div></div><button class="mini" id="mOff">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Exportar proyecto</div><div class="s">GPX · CSV · GeoJSON</div></div><button class="mini" id="mExp">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Copia de seguridad</div><div class="s">Respaldar / restaurar TODO en un archivo</div></div><button class="mini verde" id="mBackup">Abrir</button></div>
+    <div class="fila"><div class="cuerpo"><div class="t">☁ Sincronizar a la nube</div><div class="s">${(S.puntos.filter(p=>p.sincronizado!==true).length + (S.tracks||[]).filter(t=>t.sincronizado!==true).length) ? (S.puntos.filter(p=>p.sincronizado!==true).length+' punto(s) · '+(S.tracks||[]).filter(t=>t.sincronizado!==true).length+' track(s) pendientes') : 'todo sincronizado'} · Neon</div></div><button class="mini" id="mSync">Abrir</button></div>
+    <div class="fila" style="${hayActualizacion?'background:rgba(199,81,70,.12);border-left:3px solid var(--sangre);padding-left:8px;margin-left:-8px':''}"><div class="cuerpo"><div class="t" style="${hayActualizacion?'color:var(--sangre)':''}">${hayActualizacion?'🔴 Actualización disponible':'Actualizar app'}</div><div class="s">${hayActualizacion?('Build '+APP_BUILD+' → '+(infoActualizacion?infoActualizacion.build:'?')):('Build actual: '+(APP_BUILD||'dev')+' · buscar versión nueva')}</div></div><button class="mini ${hayActualizacion?'rojo':''}" id="mUpd">${hayActualizacion?'Instalar':'Buscar'}</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Precisión y advertencias</div><div class="s">Leer antes de usar en expedientes</div></div><button class="mini" id="mInfo">Abrir</button></div>
   `);
   document.getElementById('mFuente').onclick = panelFuente;
@@ -1564,6 +1573,8 @@ document.getElementById('btnMenu').onclick = ()=>{
   document.getElementById('mOff').onclick   = panelOffline;
   document.getElementById('mExp').onclick   = panelExport;
   document.getElementById('mBackup').onclick = panelBackup;
+  document.getElementById('mSync').onclick  = panelSync;
+  document.getElementById('mUpd').onclick   = ()=> buscarActualizacion(true);
   document.getElementById('mInfo').onclick  = panelInfo;
 };
 
@@ -2933,6 +2944,7 @@ async function guardarChinchetaComoPunto(){
   const p = { id:nid(), proy:S.proy.id, nom:'REF'+String(n).padStart(3,'0'), desc:'(chincheta)', lat:chincheta.lat, lon:chincheta.lon, alt:null, altElip:null, altOrto:null, exac:null, fuente:'manual', promediado:false, t:Date.now() };
   await dbPut('puntos', p); S.puntos.push(p); dibujar();
   toast('Punto de referencia guardado: '+p.nom);
+  disparoAutoSync();
 }
 function abrirEnWaze(lat, lon){
   const url = `https://waze.com/ul?ll=${lat},${lon}&navigate=yes`;
@@ -3411,11 +3423,303 @@ function exportarDiagCSV(){
 }
 
 /* =======================================================================
+   AUTO-ACTUALIZACIÓN desde GitHub Releases (APK sideloaded)
+   ======================================================================= */
+let hayActualizacion = false;   // se marca al detectar build nuevo; pinta un badge rojo
+let infoActualizacion = null;
+function pintarBadgeActualizacion(){
+  const b = document.getElementById('btnMenu');
+  if(!b) return;
+  if(hayActualizacion){
+    b.dataset.upd = '1';
+    if(!b.querySelector('.badgeUpd')){
+      const d = document.createElement('span');
+      d.className = 'badgeUpd';
+      d.style.cssText = 'position:absolute;top:-4px;right:-4px;background:var(--sangre);color:#fff;border-radius:50%;width:12px;height:12px;font-size:9px;line-height:12px;text-align:center;font-weight:800;box-shadow:0 0 0 2px var(--lecho)';
+      d.textContent = '!';
+      b.style.position = 'relative';
+      b.appendChild(d);
+    }
+  } else {
+    b.dataset.upd = '';
+    const d = b.querySelector('.badgeUpd'); if(d) d.remove();
+  }
+}
+async function buscarActualizacion(manual){
+  const P = pluginGnss();
+  try{
+    // version.json trae {build:N}. Se compara con APP_BUILD horneado al compilar.
+    const r = await httpGet(UPDATE_BASE + '/version.json?ts=' + Date.now());
+    if(!r || r.status<200 || r.status>=400){ if(manual) toast('No pude consultar actualizaciones.'); return; }
+    const info = JSON.parse(bytesATexto(r.bytes));
+    const remoto = parseInt(info.build,10) || 0;
+    if(APP_BUILD===0){ if(manual) toast('Versión de desarrollo (sin número de build).'); return; }
+    if(remoto <= APP_BUILD){
+      hayActualizacion = false; infoActualizacion = null; pintarBadgeActualizacion();
+      if(manual) toast('Ya tenés la última versión (build '+APP_BUILD+').'); return;
+    }
+    // ¡Hay versión nueva!
+    hayActualizacion = true;
+    infoActualizacion = { build: remoto, fecha: info.fecha, apk: info.apk || 'gps-tico.apk' };
+    pintarBadgeActualizacion();
+    abrirPanel('Actualización disponible', `
+      <div class="res"><div class="k">Instalada</div><div class="v">build ${APP_BUILD}</div></div>
+      <div class="res"><div class="k">Nueva</div><div class="v">build ${remoto}${info.fecha?' · '+escHtml(info.fecha.slice(0,10)):''}</div></div>
+      <div class="nota">Se descarga el APK firmado con la misma llave y se instala encima. <b>No se pierden proyectos.</b></div>
+      <button class="ancho" id="upOk">Descargar e instalar</button>
+      <button class="ancho borde" id="upNo">Ahora no</button>`);
+    document.getElementById('upNo').onclick = cerrarPanel;
+    document.getElementById('upOk').onclick = async ()=>{
+      const apkUrl = UPDATE_BASE + '/' + (info.apk || 'gps-tico.apk');
+      if(P && P.instalarApkDesde){
+        mostrarCargando('Descargando actualización…');
+        try{ await P.instalarApkDesde({ url: apkUrl }); toast('Seguí las instrucciones para instalar.'); }
+        catch(e){ toast('No se pudo instalar: '+(e.message||e)); }
+        finally{ ocultarCargando(); }
+      } else if(P && P.abrirExterno){
+        // Respaldo: abrir la descarga en el navegador.
+        await P.abrirExterno({ url: apkUrl });
+      } else {
+        window.open(apkUrl, '_system');
+      }
+    };
+  }catch(e){ if(manual) toast('Error buscando actualización.'); }
+}
+
+/* =======================================================================
+   SINCRONIZACIÓN A LA NUBE (Neon vía proxy propio)
+   El proxy (Cloudflare Worker) guarda el secreto de Neon; la app solo conoce
+   la URL del proxy y un token. Cola offline: sube lo que tenga sincronizado:false.
+   ======================================================================= */
+let syncCfg = { url:'', token:'', auto:true };
+async function cargarSyncCfg(){ try{ const c = await dbGet('conf','syncCfg'); if(c) syncCfg = Object.assign(syncCfg, c); }catch(e){} }
+async function guardarSyncCfg(){ await dbPut('conf', syncCfg, 'syncCfg'); }
+function puntoParaNube(p){
+  return { id:p.id, proy:p.proy||null,
+           nombre: p.nom || '',
+           detalle: p.desc || '',
+           fecha: new Date(p.t || Date.now()).toISOString(),
+           lat: p.lat, lon: p.lon,
+           alt_orto: p.altOrto!=null ? p.altOrto : null,
+           exac: p.exac!=null ? p.exac : null };
+}
+function trackParaNube(t){
+  return { id:t.id, proy:t.proy||null,
+           nombre: t.nom || '',
+           detalle: t.desc || '',
+           fecha: new Date(t.ini || t.t || Date.now()).toISOString(),
+           distancia_m: t.dist!=null ? t.dist : null,
+           n_puntos: (t.pts && t.pts.length) || 0,
+           geojson: t.geojson || (t.pts ? { type:'Feature', geometry:{ type:'LineString', coordinates: t.pts.map(pt=>[pt.lon, pt.lat]) }, properties:{ nom:t.nom, dist:t.dist } } : null) };
+}
+// POST al proxy con validación ESTRICTA: solo éxito si HTTP 2xx y JSON ok:true.
+async function postNube(ruta, body){
+  if(!syncCfg.url) throw new Error('Falta la URL del proxy');
+  const base = syncCfg.url.replace(/\/+$/,'');
+  const r = await fetch(base + ruta, {
+    method:'POST',
+    headers:{ 'Content-Type':'application/json', 'Authorization':'Bearer '+(syncCfg.token||'') },
+    body: JSON.stringify(body)
+  });
+  const txt = await r.text();
+  let data = {}; try{ data = JSON.parse(txt); }catch(e){}
+  if(!r.ok){
+    let hint = '';
+    if(r.status===401) hint = ' — token incorrecto';
+    else if(r.status===404) hint = ' — ¿hiciste Deploy del Worker nuevo?';
+    else if(r.status>=500) hint = ' — error en Neon (revisá tabla)';
+    throw new Error('HTTP '+r.status+hint+': '+(data.error||txt.slice(0,120)));
+  }
+  if(data.ok !== true){
+    throw new Error('El proxy no confirmó éxito. Respuesta: '+txt.slice(0,180));
+  }
+  return data;
+}
+async function getNube(ruta){
+  if(!syncCfg.url) throw new Error('Falta la URL del proxy');
+  const base = syncCfg.url.replace(/\/+$/,'');
+  const r = await fetch(base + ruta, {
+    headers:{ 'Authorization':'Bearer '+(syncCfg.token||'') }
+  });
+  const txt = await r.text();
+  let data = {}; try{ data = JSON.parse(txt); }catch(e){}
+  if(!r.ok) throw new Error('HTTP '+r.status);
+  if(data.ok !== true) throw new Error('El proxy no confirmó éxito');
+  return data;
+}
+// Consulta la papelera del servidor y borra localmente lo ya eliminado en Neon.
+async function purgarBorradosDesdeNube(){
+  try{
+    const data = await getNube('/borrados');
+    const setP = new Set(data.puntos||[]);
+    const setT = new Set(data.tracks||[]);
+    let np = 0, nt = 0;
+    for(const p of S.puntos.slice()){
+      if(setP.has(p.id)){
+        S.puntos = S.puntos.filter(x=> x.id !== p.id);
+        try{ await dbDel('puntos', p.id); }catch(e){}
+        np++;
+      }
+    }
+    for(const t of (S.tracks||[]).slice()){
+      if(setT.has(t.id)){
+        S.tracks = S.tracks.filter(x=> x.id !== t.id);
+        try{ await dbDel('tracks', t.id); }catch(e){}
+        nt++;
+      }
+    }
+    if(np || nt) dibujar();
+    return { np, nt };
+  }catch(e){ return { np:0, nt:0, error:e.message||String(e) }; }
+}
+let syncEnCurso = false;   // evita reentradas del auto-sync
+async function sincronizarNube(manual){
+  if(syncEnCurso){ if(manual) toast('Ya hay una sincronización en curso.'); return; }
+  if(!syncCfg.url){ if(manual) toast('Configurá la URL del proxy primero.'); return; }
+  if(!navigator.onLine){ if(manual) toast('Sin conexión; se subirá cuando haya internet.'); return; }
+  syncEnCurso = true;
+  if(manual) mostrarCargando('Preparando…');
+  try{
+    // 1) Purga: si algo se borró en Neon, sacarlo local primero.
+    if(manual) mostrarCargando('Consultando borrados…');
+    const purga = await purgarBorradosDesdeNube();
+    const puntosPend = S.puntos.filter(p=> p.sincronizado!==true);
+    const tracksPend = (S.tracks||[]).filter(t=> t.sincronizado!==true);
+    const puntosConFotosPend = S.puntos.filter(p=> p.fotos && p.fotos.length && p.fotosSincronizadas!==true);
+    if(!puntosPend.length && !tracksPend.length && !puntosConFotosPend.length){
+      if(manual){ ocultarCargando(); toast(purga.np||purga.nt ? 'Nada pendiente. Purgados '+purga.np+' punto(s) y '+purga.nt+' track(s).' : 'No hay nada pendiente de subir.'); }
+      syncEnCurso = false; return;
+    }
+    let nP=0, nT=0, nF=0;
+    if(puntosPend.length){
+      if(manual) mostrarCargando('Subiendo '+puntosPend.length+' punto(s)…');
+      const rr = await postNube('/puntos', { puntos: puntosPend.map(puntoParaNube) });
+      for(const p of puntosPend){ p.sincronizado = true; await dbPut('puntos', p); }
+      nP = rr.recibidos || puntosPend.length;
+    }
+    if(tracksPend.length){
+      if(manual) mostrarCargando('Subiendo '+tracksPend.length+' track(s)…');
+      const rr = await postNube('/tracks', { tracks: tracksPend.map(trackParaNube) });
+      for(const t of tracksPend){ t.sincronizado = true; await dbPut('tracks', t); }
+      nT = rr.recibidos || tracksPend.length;
+    }
+    if(puntosConFotosPend.length){
+      const LOTE = 5;
+      for(const p of puntosConFotosPend){
+        const paquete = [];
+        for(let i=0;i<p.fotos.length;i++){
+          const raw = String(p.fotos[i]||'');
+          const b64 = raw.includes(',') ? raw.slice(raw.indexOf(',')+1) : raw;
+          paquete.push({
+            id: p.id+'_'+i, punto_id: p.id, ord: i, data_base64: b64,
+            lat: p.lat, lon: p.lon, nombre_punto: p.nom,
+            tomada_en: new Date(p.t || Date.now()).toISOString()
+          });
+        }
+        for(let i=0;i<paquete.length;i+=LOTE){
+          if(manual) mostrarCargando('Subiendo fotos…');
+          const rr = await postNube('/fotos', { fotos: paquete.slice(i, i+LOTE) });
+          nF += rr.recibidas || 0;
+        }
+        p.fotosSincronizadas = true;
+        await dbPut('puntos', p);
+      }
+    }
+    if(manual) toast('Subidos '+nP+' punto(s), '+nT+' track(s) y '+nF+' foto(s).');
+  }catch(e){
+    if(manual) toast('No se pudo subir: '+(e.message||e));
+  }finally{
+    if(manual) ocultarCargando();
+    syncEnCurso = false;
+  }
+}
+// Auto-sync cada 60 s si está activo y hay internet; también al volver a la app.
+function programarAutoSync(){
+  setInterval(()=>{
+    if(syncCfg && syncCfg.auto && syncCfg.url && navigator.onLine && !syncEnCurso){
+      const pend = S.puntos.filter(p=>p.sincronizado!==true).length
+                 + (S.tracks||[]).filter(t=>t.sincronizado!==true).length;
+      if(pend > 0) sincronizarNube(false);
+    }
+  }, 60000);
+  document.addEventListener('visibilitychange', ()=>{
+    if(!document.hidden && syncCfg && syncCfg.auto && syncCfg.url && navigator.onLine){
+      setTimeout(()=> sincronizarNube(false), 2000);
+    }
+  });
+}
+// Intento inmediato tras guardar un punto/track (silencioso).
+function disparoAutoSync(){
+  if(syncCfg && syncCfg.auto && syncCfg.url && navigator.onLine && !syncEnCurso){
+    setTimeout(()=> sincronizarNube(false), 500);
+  }
+}
+function panelSync(){
+  const puntosPend = S.puntos.filter(p=> p.sincronizado!==true).length;
+  const tracksPend = (S.tracks||[]).filter(t=> t.sincronizado!==true).length;
+  abrirPanel('Sincronizar a la nube (Neon)', `
+    <div class="nota">Sube <b>puntos</b> y <b>tracks</b> a tu base Neon a través de un proxy propio (Cloudflare Worker). Funciona offline: lo pendiente se sube cuando hay internet.</div>
+    <label>Dirección del proxy (URL)</label>
+    <input id="syUrl" value="${escHtml(syncCfg.url)}" placeholder="https://nube.tucuenta.workers.dev">
+    <label>Token de acceso</label>
+    <input id="syTok" value="${escHtml(syncCfg.token)}" placeholder="el mismo API_TOKEN que pusiste en el Worker">
+    <label style="display:flex;align-items:center;gap:8px;text-transform:none;letter-spacing:0;font-size:13px;margin-top:12px">
+      <input type="checkbox" id="syAuto" ${syncCfg.auto?'checked':''} style="width:auto;margin:0"> Subir automáticamente cuando haya internet</label>
+    <div class="grid2" style="margin-top:12px">
+      <button class="mini" id="syProbar">Probar conexión</button>
+      <button class="mini" id="syGuardar">Guardar ajustes</button>
+    </div>
+    <div class="res" style="margin-top:12px"><div class="k">Pendientes de subir</div><div class="v">${puntosPend} punto(s) · ${tracksPend} track(s)</div></div>
+    <button class="ancho" id="sySubir">Subir ahora</button>
+    <button class="ancho borde" id="syReset">Volver a marcar todo como pendiente</button>
+  `);
+  document.getElementById('syGuardar').onclick = async ()=>{
+    syncCfg.url = document.getElementById('syUrl').value.trim();
+    syncCfg.token = document.getElementById('syTok').value.trim();
+    syncCfg.auto = document.getElementById('syAuto').checked;
+    await guardarSyncCfg(); toast('Ajustes guardados.');
+  };
+  document.getElementById('syProbar').onclick = async ()=>{
+    const url = document.getElementById('syUrl').value.trim();
+    if(!url){ toast('Poné la URL primero.'); return; }
+    mostrarCargando('Probando…');
+    let txt = '', st = '?', ok = false, diag = '';
+    try{
+      const r = await fetch(url.replace(/\/+$/,'')+'/ping');
+      st = r.status;
+      txt = await r.text();
+      let j = {}; try{ j = JSON.parse(txt); }catch(e){}
+      ok = r.ok && j.ok === true;
+      if(ok) diag = '✅ Conexión OK con el Worker';
+      else if(r.status===401) diag = '⚠ 401 en /ping — el Worker todavía tiene el código viejo o el token no coincide.';
+      else if(r.status===404) diag = '⚠ 404 — la URL está mal o el Worker no está publicado.';
+      else diag = 'Respondió HTTP '+r.status;
+    }
+    catch(e){ diag = '❌ No respondió: '+(e.message||e); }
+    finally{ ocultarCargando(); }
+    abrirPanel('Prueba de conexión', `
+      <div class="res"><div class="k">Resultado</div><div class="v">${escHtml(diag)}</div></div>
+      <div class="res"><div class="k">HTTP status</div><div class="v">${escHtml(String(st))}</div></div>
+      <div class="res"><div class="k">Respuesta cruda</div><div class="v" style="font-size:11px;white-space:pre-wrap;word-break:break-word">${escHtml(txt.slice(0,600) || '(vacío)')}</div></div>
+      <button class="ancho" id="pcVolver">Volver</button>`);
+    document.getElementById('pcVolver').onclick = panelSync;
+  };
+  document.getElementById('sySubir').onclick = async ()=>{ await sincronizarNube(true); panelSync(); };
+  document.getElementById('syReset').onclick = async ()=>{
+    if(!confirm('¿Marcar TODOS los puntos y tracks como pendientes de subir?')) return;
+    for(const p of S.puntos){ p.sincronizado = false; await dbPut('puntos', p); }
+    for(const t of (S.tracks||[])){ t.sincronizado = false; await dbPut('tracks', t); }
+    toast('Todo marcado como pendiente.'); panelSync();
+  };
+}
+
+/* =======================================================================
    9. ARRANQUE
    ======================================================================= */
 (async ()=>{
   await abrirDB();
   Voz.init();
+  await cargarSyncCfg();
   await migrarAGeoJSON();
   S.modo = await dbGet('conf','modo') || 'geo';
   S.capa = await dbGet('conf','capa') || 'sat';
@@ -3445,6 +3749,11 @@ function exportarDiagCSV(){
     if(Geo) await Geo.requestPermissions();
   }catch(e){}
   await arrancarGPS();
+  // Sincronización a la nube: cargar config y programar auto-subida.
+  programarAutoSync();
+  // Auto-actualización: chequeo silencioso al arrancar para pintar el badge.
+  pintarBadgeActualizacion();
+  if(navigator.onLine) buscarActualizacion(false);
 })();
 </script>
 </body>
