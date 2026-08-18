@@ -141,7 +141,7 @@ label{display:block;font-size:9px;letter-spacing:.14em;text-transform:uppercase;
     <button class="flot" id="btnCapa">SATÉLITE</button>
     <button class="flot" id="btnCentrar">◎</button>
     <button class="flot" id="btnMedir" title="Medir">📏</button>
-    <button class="flot" id="btnNav" title="Navegar">🧭</button>
+    <button class="flot" id="btnNav" title="Buscar destino">🔍</button>
   </div>
   <div id="herramienta">
     <div id="herrTexto">—</div>
@@ -1164,7 +1164,7 @@ function alFix(pos){
     geoide:pos.geoide, hdop:ultimoHdop, cn0:ultimoCn0Mean
   });
   if(S.seguir){ S.centro.lat = c.latitude; S.centro.lon = c.longitude; }
-  if(modoMapa==='navegar' && navDestino) actualizarHerramienta();
+  if(modoMapa==='navegar' && navDestino){ actualizarHerramienta(); tickNavegacion(pos); }
   pedirDibujo();
 }
 function alErrorGPS(e){
@@ -1478,7 +1478,7 @@ document.getElementById('btnCentrar').onclick = ()=>{
   dibujar();
 };
 document.getElementById('btnMedir').onclick = ()=> setModoMapa('medir');
-document.getElementById('btnNav').onclick   = ()=> setModoMapa('navegar');
+document.getElementById('btnNav').onclick   = ()=> abrirPanelBuscarDestino();
 
 /* --- marcar punto --- */
 document.getElementById('btnWp').onclick = ()=>{
@@ -2258,6 +2258,126 @@ async function httpGet(url){
 function bytesATexto(bytes){ return new TextDecoder('utf-8').decode(bytes); }
 function sinQuery(u){ return (u||'').split('?')[0]; }
 
+// ─── BÚSQUEDA DE DESTINO ──────────────────────────────────────
+// Geocodificación por nombre con Nominatim (OpenStreetMap), limitada a CR.
+async function geocodificarNominatim(q){
+  const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(q)}&format=json&limit=6&countrycodes=cr&accept-language=es`;
+  try{
+    const r = await httpGet(url);
+    return JSON.parse(bytesATexto(r.bytes));
+  }catch(e){
+    return [];
+  }
+}
+// Detecta un par "lat, lon" (o "lat lon") con decimales en punto. Devuelve {lat,lon} o null.
+function parseParDeCoords(q){
+  const m = String(q).trim().match(/^\s*(-?\d{1,3}(?:\.\d+)?)\s*[,;\s]\s*(-?\d{1,3}(?:\.\d+)?)\s*$/);
+  if(!m) return null;
+  const lat = parseFloat(m[1]), lon = parseFloat(m[2]);
+  if(isNaN(lat) || isNaN(lon) || Math.abs(lat)>90 || Math.abs(lon)>180) return null;
+  return { lat, lon };
+}
+function abrirPanelBuscarDestino(){
+  abrirPanel('Buscar destino', `
+    <input id="buscaQ" type="text" placeholder="Nombre de lugar o coordenadas…" autocomplete="off" style="width:100%;box-sizing:border-box;">
+    <div class="grid2" style="margin-top:6px">
+      <button class="ancho" id="buscaBtn">Buscar</button>
+      <button class="ancho borde" id="buscaCoord">Usar coordenadas</button>
+    </div>
+    <div id="buscaResultados" style="margin-top:8px"></div>
+  `);
+  const inp = document.getElementById('buscaQ');
+  inp.focus();
+  inp.addEventListener('keydown', e => { if(e.key==='Enter') ejecutarBusqueda(); });
+  document.getElementById('buscaBtn').onclick = ejecutarBusqueda;
+  // Fallback: abrir el panel de coordenadas manuales existente (soporta DMS).
+  document.getElementById('buscaCoord').onclick = ()=>{ cerrarPanel(); panelIrPunto(); };
+  async function ejecutarBusqueda(){
+    const q = inp.value.trim();
+    if(!q) return;
+    // Coordenada numérica: se resuelve local, sin internet.
+    const coord = parseParDeCoords(q);
+    if(coord){ fijarDestinoYNavegar(coord.lat, coord.lon, q); return; }
+    const res = document.getElementById('buscaResultados');
+    res.textContent = 'Buscando…';
+    const resultados = await geocodificarNominatim(q);
+    if(!resultados.length){
+      res.innerHTML = '<p style="color:#E08A58;font-size:.85em">Sin resultados. Verificá la conexión o usá coordenadas.</p>';
+      return;
+    }
+    res.innerHTML = resultados.map((r,i)=>`
+      <button class="ancho borde" data-i="${i}" style="text-align:left;margin-top:4px;white-space:normal">
+        <strong>${(r.display_name||'').split(',')[0]}</strong><br>
+        <span style="font-size:.8em;opacity:.7">${(r.display_name||'').split(',').slice(1,3).join(',')}</span>
+      </button>
+    `).join('');
+    res.querySelectorAll('button[data-i]').forEach(btn=>{
+      btn.onclick = ()=>{
+        const r = resultados[+btn.dataset.i];
+        fijarDestinoYNavegar(parseFloat(r.lat), parseFloat(r.lon), (r.display_name||'').split(',')[0]);
+      };
+    });
+  }
+}
+function fijarDestinoYNavegar(lat, lon, nombre){
+  navDestino = { lat, lon, nombre: nombre||null };
+  navRuta = null;
+  setModoMapaForzar('navegar');
+  cerrarPanel();
+  toast('Destino: ' + (nombre || `${lat.toFixed(5)}, ${lon.toFixed(5)}`));
+}
+
+// ─── MÓDULO DE VOZ ────────────────────────────────────────────
+// Nivel 1: Web Speech API (voz del sistema, sin dependencias).
+// Para Nivel 3 (voz personalizada offline): reemplazar únicamente
+// la función _ttsBackend con la implementación del modelo TTS
+// elegido (ej. Kokoro-82M via WASM). El resto del módulo no cambia.
+const Voz = (() => {
+  let _habilitada = false;
+  let _ultimoDicho = '';
+  let _ultimoTs = 0;
+  // PUNTO DE EXTENSIÓN — reemplazar esta función para Nivel 3.
+  function _ttsBackend(texto, lang){
+    if(!('speechSynthesis' in window)) return;
+    speechSynthesis.cancel();
+    const u = new SpeechSynthesisUtterance(texto);
+    u.lang = lang || 'es-CR';
+    u.rate = 1.0;
+    u.pitch = 1.0;
+    speechSynthesis.speak(u);
+  }
+  function decir(texto, opciones={}){
+    if(!_habilitada) return;
+    const ahora = Date.now();
+    // No repetir el mismo mensaje en menos de 8 segundos.
+    if(texto === _ultimoDicho && ahora - _ultimoTs < 8000) return;
+    _ultimoDicho = texto;
+    _ultimoTs = ahora;
+    _ttsBackend(texto, opciones.lang || 'es-CR');
+  }
+  function alternar(){
+    _habilitada = !_habilitada;
+    toast(_habilitada ? 'Voz activada' : 'Voz desactivada');
+    try{ localStorage.setItem('vozActiva', _habilitada ? '1' : '0'); }catch(_){}
+    return _habilitada;
+  }
+  function init(){
+    try{ _habilitada = localStorage.getItem('vozActiva') === '1'; }catch(_){}
+  }
+  return { decir, alternar, get activa(){ return _habilitada; }, init };
+})();
+// Aviso de voz por proximidad al destino durante la navegación.
+function tickNavegacion(pos){
+  if(!navDestino || !pos) return;
+  const dist = distM(pos.coords.latitude, pos.coords.longitude, navDestino.lat, navDestino.lon);
+  if(dist < 20)       Voz.decir('Llegaste al destino.');
+  else if(dist < 50)  Voz.decir('Destino a menos de 50 metros.');
+  else if(dist < 100) Voz.decir('Destino a 100 metros.');
+  else if(dist < 200) Voz.decir('Destino a 200 metros.');
+  else if(dist < 500) Voz.decir(`Destino a ${Math.round(dist/100)*100} metros.`);
+  else                Voz.decir(`Destino a ${(dist/1000).toFixed(1)} kilómetros.`);
+}
+
 // Lee GetCapabilities y lista capas/feature types (maneja espacios de nombres por localName).
 function parseCapabilities(xmlText, tag){
   const doc = new DOMParser().parseFromString(xmlText, 'text/xml');
@@ -2651,8 +2771,13 @@ function actualizarHerramienta(){
       if(navRuta) info += `<br>Por calles: <b>${fmtDist(navRuta.dist)}</b> · ${Math.round(navRuta.dur/60)} min`;
     }
     txt.innerHTML = info;
-    btns.innerHTML = `<button class="pri" id="hRuta">Ruta por calles</button><button id="hQuitar">Quitar destino</button><button id="hSalir">Salir</button>`;
+    btns.innerHTML = `<button class="pri" id="hRuta">Ruta por calles</button><button id="btnVoz" title="Activar/desactivar voz">🔇</button><button id="hQuitar">Quitar destino</button><button id="hSalir">Salir</button>`;
     document.getElementById('hRuta').onclick = calcularRutaCalles;
+    if(document.getElementById('btnVoz')){
+      const btnV = document.getElementById('btnVoz');
+      btnV.textContent = Voz.activa ? '🔊' : '🔇';
+      btnV.onclick = ()=>{ Voz.alternar(); btnV.textContent = Voz.activa ? '🔊' : '🔇'; };
+    }
     document.getElementById('hQuitar').onclick = ()=>{ navDestino=null; navRuta=null; actualizarHerramienta(); pedirDibujo(); };
     document.getElementById('hSalir').onclick = ()=> setModoMapa('navegar');
   } else {
@@ -2662,6 +2787,23 @@ function actualizarHerramienta(){
 async function calcularRutaCalles(){
   if(!navDestino){ toast('Tocá un destino primero.'); return; }
   if(!S.fix){ toast('Sin posición GPS todavía.'); return; }
+  // Sin conexión: intentar la ruta guardada para este mismo destino.
+  if(!navigator.onLine){
+    try{
+      const cache = await dbGet('conf','rutaCacheada');
+      if(cache && cache.ruta && cache.destino &&
+         cache.destino.lat === navDestino.lat &&
+         cache.destino.lon === navDestino.lon){
+        navRuta = cache.ruta;
+        actualizarHerramienta(); pedirDibujo();
+        toast('Sin conexión — mostrando ruta guardada anteriormente.');
+        return;
+      }
+    }catch(_){}
+    toast('Sin conexión y sin ruta guardada para este destino. Navegando en línea recta.');
+    // Línea recta: navRuta queda null; el panel ya muestra la distancia Haversine.
+    return;
+  }
   const o = S.fix.coords;
   mostrarCargando('Calculando ruta…');
   try{
@@ -2673,6 +2815,15 @@ async function calcularRutaCalles(){
       const rt = j.routes[0];
       navRuta = { coords: rt.geometry.coordinates, dist: rt.distance, dur: rt.duration };
       actualizarHerramienta(); pedirDibujo();
+      // Persistir la ruta para uso offline (mismo destino).
+      try{
+        await dbPut('conf', {
+          origen: { lat: o.latitude, lon: o.longitude },
+          destino: { lat: navDestino.lat, lon: navDestino.lon },
+          ruta: navRuta,
+          ts: Date.now()
+        }, 'rutaCacheada');
+      }catch(_){}
     } else { toast('No se encontró ruta por calles.'); }
   }catch(e){ toast('No se pudo calcular la ruta (requiere internet).'); }
   finally{ ocultarCargando(); }
@@ -2756,6 +2907,7 @@ function panelChincheta(){
       <button class="ancho borde" id="chBufNo">Quitar buffer</button>
     </div>
     <button class="ancho" id="chNav">Navegar aquí (en la app)</button>
+    <button class="ancho borde" id="chBuscarDest">Buscar otro destino por nombre</button>
     <div class="grid2">
       <button class="ancho borde" id="chWaze">Abrir en Waze</button>
       <button class="ancho borde" id="chMaps">Abrir en Maps</button>
@@ -2768,6 +2920,7 @@ function panelChincheta(){
   document.getElementById('chBufOk').onclick = ()=>{ chinchetaBuf = Math.max(0, parseFloat(document.getElementById('chBuf').value)||0); pedirDibujo(); toast(chinchetaBuf?('Buffer de '+fmtDist(chinchetaBuf)):'Sin buffer'); };
   document.getElementById('chBufNo').onclick = ()=>{ chinchetaBuf = 0; document.getElementById('chBuf').value=''; pedirDibujo(); };
   document.getElementById('chNav').onclick = ()=>{ navDestino = { lat:chincheta.lat, lon:chincheta.lon }; navRuta = null; setModoMapaForzar('navegar'); cerrarPanel(); };
+  document.getElementById('chBuscarDest').onclick = ()=>{ cerrarPanel(); abrirPanelBuscarDestino(); };
   document.getElementById('chWaze').onclick = ()=> abrirEnWaze(chincheta.lat, chincheta.lon);
   document.getElementById('chMaps').onclick = ()=> abrirEnMaps(chincheta.lat, chincheta.lon);
   document.getElementById('chGuardar').onclick = async ()=>{ await guardarChinchetaComoPunto(); cerrarPanel(); };
@@ -3262,6 +3415,7 @@ function exportarDiagCSV(){
    ======================================================================= */
 (async ()=>{
   await abrirDB();
+  Voz.init();
   await migrarAGeoJSON();
   S.modo = await dbGet('conf','modo') || 'geo';
   S.capa = await dbGet('conf','capa') || 'sat';
