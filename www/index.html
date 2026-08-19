@@ -2967,28 +2967,33 @@ async function tickNavegacion(pos){
   const lat = pos.coords.latitude, lon = pos.coords.longitude;
   const distDestino = distM(lat, lon, navDestino.lat, navDestino.lon);
 
-  // Llegada.
+  // Llegada: anunciar UNA sola vez y terminar la navegación (limpia ruta/voz).
   if(distDestino < 20){
-    Voz.decir('¡Llegaste al destino!', { forzar:true });
+    Voz.decir('¡Llegaste al destino!');   // dedup de 8 s evita repetir en cada fix
     toast('Llegaste al destino.');
+    navRuta = null; _navStepIdx = 0; _navFueraRuta = false;
+    actualizarHerramienta();
     return;
   }
 
   // Detección de desvío y recálculo automático (solo si hay ruta por calles).
+  // Silencioso y sin overlay bloqueante; con enfriamiento para no entrar en bucle.
   if(navRuta){
     const distRuta = _distPuntoARuta(lat, lon);
     if(distRuta > NAV_FUERA_UMBRAL_M){
-      if(!_navFueraRuta){
+      const ahora = Date.now();
+      if(!_navRecalculando && ahora - _navUltimoRecalc > NAV_RECALC_COOLDOWN_MS){
+        _navRecalculando = true;
+        _navUltimoRecalc = ahora;
         _navFueraRuta = true;
-        Voz.decir('Fuera de ruta. Recalculando…', { forzar:true });
-        toast('Fuera de ruta — recalculando…');
-        await calcularRutaCalles();   // recalcula desde la posición actual
-        _navFueraRuta = false;
+        Voz.decir('Fuera de ruta. Recalculando.', { forzar:true });
+        try{ await calcularRutaCalles({ auto:true }); }catch(_){}
         _navStepIdx = 0;
+        _navRecalculando = false;
       }
-      return;
+      return;   // mientras estás fuera de ruta, no anunciamos giros ni proximidad
     } else {
-      _navFueraRuta = false;
+      _navFueraRuta = false;   // volviste a la ruta
     }
   }
 
@@ -3895,7 +3900,10 @@ let navDestino = null;       // {lat,lon,nombre?}
 let navRuta = null;          // { coords:[[lon,lat]...], dist, dur, steps:[{loc,instruccion,dist}] }
 let _navStepIdx = 0;         // índice de la próxima maniobra a anunciar
 let _navFueraRuta = false;   // estado de desvío (evita recalcular en bucle)
-const NAV_FUERA_UMBRAL_M = 40;   // metros de desvío que disparan el recálculo
+let _navUltimoRecalc = 0;    // timestamp del último recálculo automático
+let _navRecalculando = false;// recálculo en curso (evita reentradas del tick)
+const NAV_FUERA_UMBRAL_M = 55;        // metros de desvío que disparan el recálculo
+const NAV_RECALC_COOLDOWN_MS = 20000; // no recalcular más de una vez cada 20 s
 
 // Distancia (m) de un punto a un segmento, en un plano local en metros.
 function _distPuntoASegmento(px, py, ax, ay, bx, by){
@@ -4011,9 +4019,11 @@ function actualizarHerramienta(){
     barra.classList.remove('on');
   }
 }
-async function calcularRutaCalles(){
-  if(!navDestino){ toast('Tocá un destino primero.'); return; }
-  if(!S.fix){ toast('Sin posición GPS todavía.'); return; }
+async function calcularRutaCalles(opts={}){
+  // auto=true: recálculo automático por desvío → sin overlay bloqueante ni voz/toasts repetidos.
+  const auto = !!opts.auto;
+  if(!navDestino){ if(!auto) toast('Tocá un destino primero.'); return; }
+  if(!S.fix){ if(!auto) toast('Sin posición GPS todavía.'); return; }
   const o = S.fix.coords;
 
   // Offline: recuperar ruta cacheada para este mismo destino.
@@ -4026,17 +4036,15 @@ async function calcularRutaCalles(){
         navRuta = cache.ruta;
         _navStepIdx = 0; _navFueraRuta = false;
         actualizarHerramienta(); pedirDibujo();
-        toast('Sin conexión — ruta guardada cargada.');
-        Voz.decir('Sin conexión. Usando ruta guardada.');
+        if(!auto){ toast('Sin conexión — ruta guardada cargada.'); Voz.decir('Sin conexión. Usando ruta guardada.'); }
         return;
       }
     }catch(_){}
-    toast('Sin conexión y sin ruta guardada. Navegando en línea recta.');
-    Voz.decir('Sin conexión. Navegando en línea recta.');
+    if(!auto){ toast('Sin conexión y sin ruta guardada. Navegando en línea recta.'); Voz.decir('Sin conexión. Navegando en línea recta.'); }
     return;
   }
 
-  mostrarCargando('Calculando ruta…');
+  if(!auto) mostrarCargando('Calculando ruta…');
   try{
     // OSRM público (a pie). steps=true para obtener las maniobras (giros) para la voz.
     const url = `https://router.project-osrm.org/route/v1/foot/${o.longitude},${o.latitude};${navDestino.lon},${navDestino.lat}?overview=full&geometries=geojson&steps=true`;
@@ -4088,16 +4096,15 @@ async function calcularRutaCalles(){
       }catch(_){}
 
       actualizarHerramienta(); pedirDibujo();
-      Voz.decir('Ruta calculada. Iniciando navegación.');
+      if(!auto) Voz.decir('Ruta calculada. Iniciando navegación.');
     } else {
-      toast('No se encontró ruta por calles.');
-      Voz.decir('No encontré una ruta por calles.');
+      // Sin ruta: en modo automático se mantiene la ruta anterior en silencio.
+      if(!auto){ toast('No se encontró ruta por calles.'); Voz.decir('No encontré una ruta por calles.'); }
     }
   }catch(e){
-    toast('No se pudo calcular la ruta (requiere internet).');
-    Voz.decir('Error al calcular la ruta.');
+    if(!auto){ toast('No se pudo calcular la ruta (requiere internet).'); Voz.decir('Error al calcular la ruta.'); }
   }finally{
-    ocultarCargando();
+    if(!auto) ocultarCargando();
   }
 }
 // Dibuja medición y navegación sobre el mapa.
