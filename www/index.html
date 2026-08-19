@@ -2396,20 +2396,36 @@ function panelExport(){
     }
     bajar(S.proy.nom+'.gpx', g+'</gpx>', 'application/gpx+xml');
   };
-  document.getElementById('exGeo').onclick = ()=>{
+  document.getElementById('exGeo').onclick = async ()=>{
     const fc = { type:'FeatureCollection', name:S.proy.nom, crs:{type:'name',properties:{name:'urn:ogc:def:crs:OGC:1.3:CRS84'}}, features:[] };
+    const fotoFiles = [];   // { nombre, datos } para la carpeta fotos/ del ZIP
+    let idx = 0;
     for(const p of S.puntos){
+      idx++;
       const zOrto = p.altOrto!=null ? p.altOrto : null;
       const zElip = p.altElip!=null ? p.altElip : (p.alt!=null?p.alt:null);
-      fc.features.push({ type:'Feature',
-        properties:{ nombre:p.nom, desc:p.desc,
+      const props = { nombre:p.nom, desc:p.desc,
           altura_orto_m:zOrto, altura_elip_m:zElip, geoide_m:(p.geoide!=null?p.geoide:null),
           altura_fuente:(p.altOrtoFuente||null), exactitud_m:p.exac, exac_vert_m:(p.vexac!=null?p.vexac:null),
           fuente:(p.fuente||'fused'),
           tipo:(p.promediado?'promediado':'instantaneo'), muestras:(p.muestras!=null?p.muestras:null),
           desv_std_m:(p.desvStd!=null?p.desvStd:null), hdop_medio:(p.hdopMedio!=null?p.hdopMedio:null),
           cn0_medio:(p.cn0Medio!=null?p.cn0Medio:null), duracion_s:(p.duracion!=null?p.duracion:null),
-          fecha:isoTS(p.t) },
+          fecha:isoTS(p.t) };
+      // Fotos del punto → carpeta fotos/ y referencia por nombre de archivo.
+      if(p.fotos && p.fotos.length){
+        const base = String(p.nom||('P'+idx)).normalize('NFC').replace(/[^\w\-]+/g,'_').slice(0,40) || ('P'+idx);
+        const nombresFoto = [];
+        p.fotos.forEach((url, j)=>{
+          const f = _dataUrlABytes(url);
+          if(!f) return;
+          const nombre = `fotos/${String(idx).padStart(3,'0')}_${base}_${j+1}.${f.ext}`;
+          fotoFiles.push({ nombre, datos: f.bytes });
+          nombresFoto.push(nombre);
+        });
+        if(nombresFoto.length){ props.foto = nombresFoto[0]; props.fotos = nombresFoto; }
+      }
+      fc.features.push({ type:'Feature', properties: props,
         geometry:{ type:'Point', coordinates:[p.lon, p.lat, (zOrto!=null?zOrto:(zElip!=null?zElip:0))] } });
     }
     for(const t of S.tracks) fc.features.push({ type:'Feature',
@@ -2417,7 +2433,23 @@ function panelExport(){
         puntos_aceptados:(t.aceptados!=null?t.aceptados:null), puntos_filtrados:(t.rechazados!=null?t.rechazados:null),
         filtro: t.filtroConfig ? `HDOP<=${t.filtroConfig.hdopMax} sat>=${t.filtroConfig.satMin} exac<=${t.filtroConfig.exacMax}m CN0>=${t.filtroConfig.cn0Min}` : null },
       geometry:{ type:'LineString', coordinates:t.pts.map(q=>[q.lon,q.lat,q.alt||0]) } });
-    bajar(S.proy.nom+'.geojson', JSON.stringify(fc,null,1), 'application/geo+json');
+    const json = JSON.stringify(fc,null,1);
+    // Si hay fotos, exportar un ZIP con el .geojson + carpeta fotos/. Si no, .geojson plano.
+    if(fotoFiles.length){
+      const baseNom = (S.proy.nom||'proyecto').normalize('NFC').replace(/[^\w\-]+/g,'_') || 'proyecto';
+      const archivos = [{ nombre: baseNom+'.geojson', datos: new TextEncoder().encode(json) }, ...fotoFiles];
+      try{
+        const zipBytes = construirZip(archivos);
+        await bajarBlob(S.proy.nom+'.zip', new Blob([zipBytes], {type:'application/zip'}));
+        toast(`GeoJSON + ${fotoFiles.length} foto(s) exportado en ZIP.`);
+      }catch(e){
+        // Si algo falla al armar el ZIP, exportar al menos el GeoJSON.
+        bajar(S.proy.nom+'.geojson', json, 'application/geo+json');
+        toast('Exporté el GeoJSON (no pude armar el ZIP de fotos).');
+      }
+    } else {
+      bajar(S.proy.nom+'.geojson', json, 'application/geo+json');
+    }
   };
   document.getElementById('exDxf').onclick = ()=>{
     if(!S.puntos.length && !S.tracks.length){ toast('No hay puntos ni tracks para exportar.'); return; }
@@ -2482,6 +2514,63 @@ async function bajarBlob(nom, blob){
   }
   const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=safe; a.click();
   setTimeout(()=>URL.revokeObjectURL(a.href),4000); toast('Archivo descargado.');
+}
+// ── Constructor de ZIP mínimo (método "store", sin compresión) ──
+// Sin dependencias externas → funciona 100% sin internet. Suficiente porque las
+// fotos ya vienen comprimidas (JPEG). Se usa para exportar GeoJSON + carpeta fotos/.
+function _crc32(bytes){
+  let t = _crc32._t;
+  if(!t){
+    t = new Uint32Array(256);
+    for(let n=0;n<256;n++){ let c=n; for(let k=0;k<8;k++) c = (c&1)?(0xEDB88320^(c>>>1)):(c>>>1); t[n]=c>>>0; }
+    _crc32._t = t;
+  }
+  let crc = 0xFFFFFFFF;
+  for(let i=0;i<bytes.length;i++) crc = (crc>>>8) ^ t[(crc ^ bytes[i]) & 0xFF];
+  return (crc ^ 0xFFFFFFFF) >>> 0;
+}
+function construirZip(archivos){
+  // archivos: [{ nombre:String, datos:Uint8Array }]
+  const enc = new TextEncoder();
+  const u16 = n => [n&0xFF, (n>>>8)&0xFF];
+  const u32 = n => [n&0xFF, (n>>>8)&0xFF, (n>>>16)&0xFF, (n>>>24)&0xFF];
+  const locales = [], central = [];
+  let offset = 0;
+  for(const f of archivos){
+    const nombre = enc.encode(f.nombre);
+    const datos = f.datos;
+    const crc = _crc32(datos);
+    const lh = new Uint8Array([].concat(
+      u32(0x04034b50), u16(20), u16(0), u16(0), u16(0), u16(0),
+      u32(crc), u32(datos.length), u32(datos.length), u16(nombre.length), u16(0)
+    ));
+    locales.push(lh, nombre, datos);
+    const ch = new Uint8Array([].concat(
+      u32(0x02014b50), u16(20), u16(20), u16(0), u16(0), u16(0), u16(0),
+      u32(crc), u32(datos.length), u32(datos.length),
+      u16(nombre.length), u16(0), u16(0), u16(0), u16(0), u32(0), u32(offset)
+    ));
+    central.push(ch, nombre);
+    offset += lh.length + nombre.length + datos.length;
+  }
+  const centralSize = central.reduce((s,a)=>s+a.length,0);
+  const eocd = new Uint8Array([].concat(
+    u32(0x06054b50), u16(0), u16(0), u16(archivos.length), u16(archivos.length),
+    u32(centralSize), u32(offset), u16(0)
+  ));
+  const partes = [...locales, ...central, eocd];
+  const total = partes.reduce((s,a)=>s+a.length,0);
+  const out = new Uint8Array(total);
+  let p=0; for(const a of partes){ out.set(a, p); p+=a.length; }
+  return out;
+}
+// Convierte un data URL (data:image/...;base64,XXXX) a {ext, bytes} o null.
+function _dataUrlABytes(url){
+  const m = /^data:(image\/[\w.+-]+);base64,(.*)$/s.exec(String(url||''));
+  if(!m) return null;
+  const ext = (m[1].split('/')[1]||'jpg').toLowerCase().replace('jpeg','jpg');
+  try{ return { ext, bytes: Uint8Array.from(atob(m[2]), c=>c.charCodeAt(0)) }; }
+  catch(e){ return null; }
 }
 // Paso de grilla "redondo" adaptado al rango, para no saturar (5–8 líneas).
 function pasoGrilla(rango){
