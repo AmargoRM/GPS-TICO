@@ -987,7 +987,7 @@ cv.addEventListener('pointermove', e=>{
       const px = e.clientX - r.left, py = e.clientY - r.top;
       const ll = pantallaALatLon(px, py);
       if(modoMapa==='medir' && ll){ medicion.pts.push(ll); actualizarHerramienta(); pedirDibujo(); }
-      else if(modoMapa==='navegar' && ll){ navDestino = ll; navRuta = null; navPasos = null; actualizarHerramienta(); pedirDibujo(); }
+      else if(modoMapa==='navegar' && ll){ navDestino = ll; navRuta = null; _navStepIdx = 0; _navFueraRuta = false; actualizarHerramienta(); pedirDibujo(); }
       else { try{ consultarEnPantalla(px, py); }catch(err){ toast('Error al consultar: '+(err&&err.message?err.message:err)); } }
     }
   }
@@ -2894,62 +2894,125 @@ function abrirPanelBuscarDestino(){
 function fijarDestinoYNavegar(lat, lon, nombre){
   navDestino = { lat, lon, nombre: nombre||null };
   navRuta = null;
-  navPasos = null;
+  _navStepIdx = 0; _navFueraRuta = false;
   setModoMapaForzar('navegar');
   cerrarPanel();
   toast('Destino: ' + (nombre || `${lat.toFixed(5)}, ${lon.toFixed(5)}`));
 }
 
-// ─── MÓDULO DE VOZ (Nivel 1: Web Speech API) ──────────────────
-// Punto de extensión para Nivel 3 (TTS offline): reemplazar _ttsBackend.
+// ─── MÓDULO DE VOZ ────────────────────────────────────────────
+// Cadena de backends: 1) TTS nativo de Android (fiable, offline, español);
+// 2) clips MP3 bundled (www/audio/voz/…); 3) speechSynthesis del WebView.
+// PUNTO DE EXTENSIÓN NIVEL 3: para voz personalizada offline, reemplazar
+// únicamente _backend con el motor TTS elegido.
 const Voz = (() => {
-  let _habilitada = false, _ultimoDicho = '', _ultimoTs = 0;
-  function _ttsBackend(texto, lang){
-    if(!('speechSynthesis' in window)) return;
-    speechSynthesis.cancel();
-    const u = new SpeechSynthesisUtterance(texto);
-    u.lang = lang || 'es-CR'; u.rate = 1.0; u.pitch = 1.0;
-    speechSynthesis.speak(u);
+  let _on = false, _ultimoTxt = '', _ultimoTs = 0;
+
+  function _backend(txt){
+    // 1) TTS nativo (Android). El WebView suele NO reproducir speechSynthesis,
+    //    por eso este es el camino principal en el APK.
+    const P = (typeof pluginGnss === 'function') ? pluginGnss() : null;
+    if(P && P.hablar){ P.hablar({ texto: txt }).catch(()=> _clipsOWeb(txt)); return; }
+    _clipsOWeb(txt);
   }
-  function decir(texto, opciones={}){
-    if(!_habilitada) return;
+  function _clipsOWeb(txt){
+    const CLIPS = {
+      'llegaste':                 'audio/voz/llegaste.mp3',
+      'menos de 50 metros':       'audio/voz/50m.mp3',
+      '100 metros':               'audio/voz/100m.mp3',
+      '200 metros':               'audio/voz/200m.mp3',
+      '500 metros':               'audio/voz/500m.mp3',
+      'kilómetro':                'audio/voz/1km.mp3',
+      'levemente a la derecha':   'audio/voz/leve_derecha.mp3',
+      'levemente a la izquierda': 'audio/voz/leve_izquierda.mp3',
+      'derecha':                  'audio/voz/derecha.mp3',
+      'izquierda':                'audio/voz/izquierda.mp3',
+      'seguí recto':              'audio/voz/recto.mp3',
+      'fuera de ruta':            'audio/voz/fuera_ruta.mp3',
+      'recalculando':             'audio/voz/recalculando.mp3'
+    };
+    const clave = Object.keys(CLIPS).find(k => txt.toLowerCase().includes(k));
+    if(clave){ const a = new Audio(CLIPS[clave]); a.play().catch(()=> _webSpeech(txt)); return; }
+    _webSpeech(txt);
+  }
+  function _webSpeech(txt){
+    if(!('speechSynthesis' in window)) return;
+    try{
+      speechSynthesis.cancel();
+      const u = new SpeechSynthesisUtterance(txt);
+      u.lang = 'es-CR'; u.rate = 1.0; u.pitch = 1.0;
+      speechSynthesis.speak(u);
+    }catch(_){}
+  }
+  function decir(txt, opts={}){
+    if(!_on) return;
     const ahora = Date.now();
-    if(texto === _ultimoDicho && ahora - _ultimoTs < 8000) return;
-    _ultimoDicho = texto; _ultimoTs = ahora;
-    _ttsBackend(texto, opciones.lang || 'es-CR');
+    if(txt === _ultimoTxt && ahora - _ultimoTs < 8000 && !opts.forzar) return;
+    _ultimoTxt = txt; _ultimoTs = ahora;
+    _backend(txt);
   }
   function alternar(){
-    _habilitada = !_habilitada;
-    toast(_habilitada ? 'Voz activada' : 'Voz desactivada');
-    try{ localStorage.setItem('vozActiva', _habilitada ? '1' : '0'); }catch(_){}
-    return _habilitada;
+    _on = !_on;
+    toast(_on ? 'Voz activada' : 'Voz desactivada');
+    try{ localStorage.setItem('vozActiva', _on ? '1' : '0'); }catch(_){}
+    // Al activar, decir una frase de prueba (dentro del gesto del usuario).
+    if(_on) _backend('Voz activada.');
+    return _on;
   }
-  function init(){ try{ _habilitada = localStorage.getItem('vozActiva') === '1'; }catch(_){} }
-  return { decir, alternar, get activa(){ return _habilitada; }, init };
+  function init(){ try{ _on = localStorage.getItem('vozActiva') === '1'; }catch(_){} }
+  return { decir, alternar, get activa(){ return _on; }, init };
 })();
-function tickNavegacion(pos){
+async function tickNavegacion(pos){
   if(!navDestino || !pos) return;
   const lat = pos.coords.latitude, lon = pos.coords.longitude;
-  // Con ruta por calles: voz guiada por maniobra (giros, inicio, llegada).
-  if(navPasos && navPasos.length){
-    for(const p of navPasos){
-      if(p.anunciado) continue;
-      const d = distM(lat, lon, p.lat, p.lon);
-      // Anunciar la maniobra cuando estás a ~45 m o menos de ella.
-      if(d < 45){ p.anunciado = true; Voz.decir(fraseManiobra(p)); break; }
-      // Solo miramos la próxima maniobra pendiente; si aún está lejos, no seguimos.
-      break;
-    }
+  const distDestino = distM(lat, lon, navDestino.lat, navDestino.lon);
+
+  // Llegada.
+  if(distDestino < 20){
+    Voz.decir('¡Llegaste al destino!', { forzar:true });
+    toast('Llegaste al destino.');
     return;
   }
-  // En línea recta (sin ruta): avisos por distancia al destino.
-  const dist = distM(lat, lon, navDestino.lat, navDestino.lon);
-  if(dist < 20)       Voz.decir('Llegaste al destino.');
-  else if(dist < 50)  Voz.decir('Destino a menos de 50 metros.');
-  else if(dist < 100) Voz.decir('Destino a 100 metros.');
-  else if(dist < 200) Voz.decir('Destino a 200 metros.');
-  else if(dist < 500) Voz.decir(`Destino a ${Math.round(dist/100)*100} metros.`);
-  else                Voz.decir(`Destino a ${(dist/1000).toFixed(1)} kilómetros.`);
+
+  // Detección de desvío y recálculo automático (solo si hay ruta por calles).
+  if(navRuta){
+    const distRuta = _distPuntoARuta(lat, lon);
+    if(distRuta > NAV_FUERA_UMBRAL_M){
+      if(!_navFueraRuta){
+        _navFueraRuta = true;
+        Voz.decir('Fuera de ruta. Recalculando…', { forzar:true });
+        toast('Fuera de ruta — recalculando…');
+        await calcularRutaCalles();   // recalcula desde la posición actual
+        _navFueraRuta = false;
+        _navStepIdx = 0;
+      }
+      return;
+    } else {
+      _navFueraRuta = false;
+    }
+  }
+
+  // Instrucciones de giro (turn-by-turn).
+  if(navRuta && navRuta.steps && navRuta.steps.length){
+    const step = navRuta.steps[_navStepIdx];
+    if(step){
+      const [sLon, sLat] = step.loc;
+      const distStep = distM(lat, lon, sLat, sLon);
+      if(distStep < 25){
+        Voz.decir(step.instruccion, { forzar:true });
+        _navStepIdx = Math.min(_navStepIdx + 1, navRuta.steps.length - 1);
+      } else if(distStep < 80){
+        Voz.decir('En 80 metros, ' + step.instruccion);
+      }
+    }
+  }
+
+  // Avisos de proximidad al destino.
+  if      (distDestino < 50)  Voz.decir('Destino a menos de 50 metros.');
+  else if (distDestino < 100) Voz.decir('Destino a 100 metros.');
+  else if (distDestino < 200) Voz.decir('Destino a 200 metros.');
+  else if (distDestino < 500) Voz.decir('Destino a 500 metros.');
+  else Voz.decir(`Destino a ${(distDestino/1000).toFixed(1)} kilómetros.`);
 }
 function sinQuery(u){ return (u||'').split('?')[0]; }
 
@@ -3828,20 +3891,34 @@ let modoMapa = 'consulta';   // 'consulta' | 'medir' | 'navegar'
 let medicion = { pts:[], unidad:'m' };
 let chincheta = null;        // {lat,lon} referencia manual
 let chinchetaBuf = 0;        // radio del buffer en metros (0 = sin buffer)
-let navDestino = null;       // {lat,lon}
-let navRuta = null;          // { coords:[[lon,lat]...], dist, dur }
-let navPasos = null;         // [{lat,lon,type,modifier,name,anunciado}] maniobras para voz
-// Convierte una maniobra OSRM en una frase para la voz.
-function fraseManiobra(p){
-  const t = p.type||'', m = p.modifier||'';
-  if(t==='arrive')  return 'Llegaste al destino.';
-  if(t==='depart')  return 'Iniciando ruta.';
-  const calle = p.name ? ' por ' + p.name : '';
-  if(m.includes('uturn')) return 'Hacé un giro en U.';
-  if(m.includes('left'))  return (m.includes('slight')?'Girá levemente a la izquierda':m.includes('sharp')?'Girá cerrado a la izquierda':'Girá a la izquierda') + calle + '.';
-  if(m.includes('right')) return (m.includes('slight')?'Girá levemente a la derecha':m.includes('sharp')?'Girá cerrado a la derecha':'Girá a la derecha') + calle + '.';
-  if(m==='straight' || t==='continue' || t==='new name') return 'Seguí derecho' + calle + '.';
-  return 'Continuá' + calle + '.';
+let navDestino = null;       // {lat,lon,nombre?}
+let navRuta = null;          // { coords:[[lon,lat]...], dist, dur, steps:[{loc,instruccion,dist}] }
+let _navStepIdx = 0;         // índice de la próxima maniobra a anunciar
+let _navFueraRuta = false;   // estado de desvío (evita recalcular en bucle)
+const NAV_FUERA_UMBRAL_M = 40;   // metros de desvío que disparan el recálculo
+
+// Distancia (m) de un punto a un segmento, en un plano local en metros.
+function _distPuntoASegmento(px, py, ax, ay, bx, by){
+  const dx = bx - ax, dy = by - ay;
+  if(dx === 0 && dy === 0) return Math.hypot(px - ax, py - ay);
+  const t = Math.max(0, Math.min(1, ((px-ax)*dx + (py-ay)*dy) / (dx*dx + dy*dy)));
+  return Math.hypot(px - (ax + t*dx), py - (ay + t*dy));
+}
+// Distancia (m) de la posición actual a la polilínea de la ruta.
+function _distPuntoARuta(lat, lon){
+  if(!navRuta || !navRuta.coords || navRuta.coords.length < 2) return Infinity;
+  const R = 6371000, toRad = d => d * Math.PI / 180;
+  let minDist = Infinity;
+  for(let i = 0; i < navRuta.coords.length - 1; i++){
+    const [aLon, aLat] = navRuta.coords[i];
+    const [bLon, bLat] = navRuta.coords[i + 1];
+    const px = (lon  - aLon) * R * Math.cos(toRad(lat));
+    const py = (lat  - aLat) * R;
+    const bx = (bLon - aLon) * R * Math.cos(toRad(aLat));
+    const by = (bLat - aLat) * R;
+    minDist = Math.min(minDist, _distPuntoASegmento(px, py, 0, 0, bx, by));
+  }
+  return minDist;
 }
 
 function fmtDist(m, unidad){
@@ -3890,23 +3967,46 @@ function actualizarHerramienta(){
     document.getElementById('hSalir').onclick = ()=> setModoMapa('medir');
   } else if(modoMapa==='navegar'){
     barra.classList.add('on');
-    let info = 'Tocá un punto de destino.';
+    let info = 'Tocá un punto de destino en el mapa.';
     if(navDestino){
-      let recta = S.fix ? distM(S.fix.coords.latitude, S.fix.coords.longitude, navDestino.lat, navDestino.lon) : null;
-      info = `<b>Destino</b> ${navDestino.lat.toFixed(5)}, ${navDestino.lon.toFixed(5)}<br>` +
-             (recta!=null ? `En línea recta: <b>${fmtDist(recta)}</b>` : 'Esperando posición GPS…');
-      if(navRuta) info += `<br>Por calles: <b>${fmtDist(navRuta.dist)}</b> · ${Math.round(navRuta.dur/60)} min`;
+      const recta = S.fix
+        ? distM(S.fix.coords.latitude, S.fix.coords.longitude, navDestino.lat, navDestino.lon)
+        : null;
+      const nomDest = navDestino.nombre
+        || `${navDestino.lat.toFixed(5)}, ${navDestino.lon.toFixed(5)}`;
+      info = `<b>Destino:</b> ${nomDest}<br>` +
+             (recta != null ? `Línea recta: <b>${fmtDist(recta)}</b>` : 'Esperando GPS…');
+      if(navRuta){
+        info += `<br>Por calles: <b>${fmtDist(navRuta.dist)}</b> · ${Math.round(navRuta.dur/60)} min`;
+      }
     }
     txt.innerHTML = info;
-    btns.innerHTML = `<button class="pri" id="hRuta">Ruta por calles</button><button id="btnVoz" title="Activar/desactivar voz">🔇</button><button id="hQuitar">Quitar destino</button><button id="hSalir">Salir</button>`;
+
+    const tieneRuta = !!navRuta;
+    btns.innerHTML = `
+      <button class="pri" id="hRuta">Ruta por calles</button>
+      ${tieneRuta ? '<button id="hRecalc">Recalcular</button>' : ''}
+      <button id="hVoz">${Voz.activa ? '🔊' : '🔇'}</button>
+      <button id="hCancelar">Cancelar</button>
+    `;
     document.getElementById('hRuta').onclick = calcularRutaCalles;
-    if(document.getElementById('btnVoz')){
-      const btnV = document.getElementById('btnVoz');
-      btnV.textContent = Voz.activa ? '🔊' : '🔇';
-      btnV.onclick = ()=>{ Voz.alternar(); btnV.textContent = Voz.activa ? '🔊' : '🔇'; };
+    if(tieneRuta){
+      document.getElementById('hRecalc').onclick = calcularRutaCalles;
     }
-    document.getElementById('hQuitar').onclick = ()=>{ navDestino=null; navRuta=null; navPasos=null; actualizarHerramienta(); pedirDibujo(); };
-    document.getElementById('hSalir').onclick = ()=> setModoMapa('navegar');
+    document.getElementById('hVoz').onclick = () => {
+      Voz.alternar();
+      document.getElementById('hVoz').textContent = Voz.activa ? '🔊' : '🔇';
+    };
+    document.getElementById('hCancelar').onclick = () => {
+      navDestino    = null;
+      navRuta       = null;
+      _navStepIdx   = 0;
+      _navFueraRuta = false;
+      if('speechSynthesis' in window) speechSynthesis.cancel();
+      const P = (typeof pluginGnss === 'function') ? pluginGnss() : null;
+      if(P && P.detenerVoz) P.detenerVoz().catch(()=>{});
+      setModoMapa('navegar');
+    };
   } else {
     barra.classList.remove('on');
   }
@@ -3914,7 +4014,9 @@ function actualizarHerramienta(){
 async function calcularRutaCalles(){
   if(!navDestino){ toast('Tocá un destino primero.'); return; }
   if(!S.fix){ toast('Sin posición GPS todavía.'); return; }
-  // Sin conexión: intentar la ruta guardada para este mismo destino.
+  const o = S.fix.coords;
+
+  // Offline: recuperar ruta cacheada para este mismo destino.
   if(!navigator.onLine){
     try{
       const cache = await dbGet('conf','rutaCacheada');
@@ -3922,18 +4024,18 @@ async function calcularRutaCalles(){
          cache.destino.lat === navDestino.lat &&
          cache.destino.lon === navDestino.lon){
         navRuta = cache.ruta;
-        navPasos = (cache.pasos||[]).map(p=>({...p, anunciado:false}));
+        _navStepIdx = 0; _navFueraRuta = false;
         actualizarHerramienta(); pedirDibujo();
-        toast('Sin conexión — mostrando ruta guardada anteriormente.');
-        Voz.decir('Sin conexión. Uso la ruta guardada. Iniciando ruta.');
+        toast('Sin conexión — ruta guardada cargada.');
+        Voz.decir('Sin conexión. Usando ruta guardada.');
         return;
       }
     }catch(_){}
-    toast('Sin conexión y sin ruta guardada para este destino. Navegando en línea recta.');
-    Voz.decir('Sin conexión y sin ruta guardada. Navego en línea recta.');
+    toast('Sin conexión y sin ruta guardada. Navegando en línea recta.');
+    Voz.decir('Sin conexión. Navegando en línea recta.');
     return;
   }
-  const o = S.fix.coords;
+
   mostrarCargando('Calculando ruta…');
   try{
     // OSRM público (a pie). steps=true para obtener las maniobras (giros) para la voz.
@@ -3941,27 +4043,62 @@ async function calcularRutaCalles(){
     const r = await httpGet(url);
     const j = JSON.parse(bytesATexto(r.bytes));
     if(j && j.routes && j.routes.length){
-      const rt = j.routes[0];
-      navRuta = { coords: rt.geometry.coordinates, dist: rt.distance, dur: rt.duration };
-      // Construir la lista de maniobras para la voz.
-      navPasos = [];
-      (rt.legs||[]).forEach(leg => (leg.steps||[]).forEach(s => {
-        const mv = s.maneuver||{}; const loc = mv.location||[];
-        if(loc.length>=2) navPasos.push({ lat:loc[1], lon:loc[0], type:mv.type||'', modifier:mv.modifier||'', name:s.name||'', anunciado:false });
-      }));
-      actualizarHerramienta(); pedirDibujo();
-      Voz.decir('Iniciando ruta.');
-      // Persistir ruta y maniobras para uso offline (mismo destino).
+      const rt  = j.routes[0];
+      const leg = rt.legs && rt.legs[0];
+
+      const MANIOBRAS = {
+        'turn right':        'Girá a la derecha.',
+        'turn left':         'Girá a la izquierda.',
+        'turn slight right': 'Levemente a la derecha.',
+        'turn slight left':  'Levemente a la izquierda.',
+        'turn sharp right':  'Girá fuerte a la derecha.',
+        'turn sharp left':   'Girá fuerte a la izquierda.',
+        'continue':          'Seguí recto.',
+        'new name':          'Seguí recto.',
+        'depart':            null,
+        'arrive':            '¡Llegaste al destino!',
+        'merge':             'Incorpórate a la vía.',
+        'roundabout':        'Entrá a la rotonda.',
+        'exit roundabout':   'Salí de la rotonda.',
+        'fork right':        'En el cruce, tomá la derecha.',
+        'fork left':         'En el cruce, tomá la izquierda.',
+        'end of road right': 'Al final girá a la derecha.',
+        'end of road left':  'Al final girá a la izquierda.'
+      };
+
+      const steps = (leg ? leg.steps || [] : [])
+        .map(st => {
+          const tipo  = st.maneuver.type;
+          const mod   = st.maneuver.modifier || '';
+          const clave = (mod ? `${tipo} ${mod}` : tipo).toLowerCase();
+          const instr = MANIOBRAS[clave] || null;
+          return instr ? { loc: st.maneuver.location, instruccion: instr, dist: st.distance } : null;
+        })
+        .filter(Boolean);
+
+      navRuta = { coords: rt.geometry.coordinates, dist: rt.distance, dur: rt.duration, steps };
+      _navStepIdx = 0; _navFueraRuta = false;
+
+      // Cachear para uso offline (mismo destino).
       try{
         await dbPut('conf', {
           origen: { lat: o.latitude, lon: o.longitude },
-          destino: { lat: navDestino.lat, lon: navDestino.lon },
-          ruta: navRuta, pasos: navPasos.map(p=>({lat:p.lat,lon:p.lon,type:p.type,modifier:p.modifier,name:p.name})), ts: Date.now()
+          destino: navDestino, ruta: navRuta, ts: Date.now()
         }, 'rutaCacheada');
       }catch(_){}
-    } else { toast('No se encontró ruta por calles.'); Voz.decir('No encontré una ruta por calles.'); }
-  }catch(e){ toast('No se pudo calcular la ruta (requiere internet).'); Voz.decir('Error al calcular la ruta.'); }
-  finally{ ocultarCargando(); }
+
+      actualizarHerramienta(); pedirDibujo();
+      Voz.decir('Ruta calculada. Iniciando navegación.');
+    } else {
+      toast('No se encontró ruta por calles.');
+      Voz.decir('No encontré una ruta por calles.');
+    }
+  }catch(e){
+    toast('No se pudo calcular la ruta (requiere internet).');
+    Voz.decir('Error al calcular la ruta.');
+  }finally{
+    ocultarCargando();
+  }
 }
 // Dibuja medición y navegación sobre el mapa.
 function dibujarHerramientas(aPant){
@@ -4182,7 +4319,7 @@ function panelChincheta(){
   `);
   document.getElementById('chBufOk').onclick = ()=>{ chinchetaBuf = Math.max(0, parseFloat(document.getElementById('chBuf').value)||0); pedirDibujo(); toast(chinchetaBuf?('Buffer de '+fmtDist(chinchetaBuf)):'Sin buffer'); };
   document.getElementById('chBufNo').onclick = ()=>{ chinchetaBuf = 0; document.getElementById('chBuf').value=''; pedirDibujo(); };
-  document.getElementById('chNav').onclick = ()=>{ navDestino = { lat:chincheta.lat, lon:chincheta.lon }; navRuta = null; navPasos = null; setModoMapaForzar('navegar'); cerrarPanel(); };
+  document.getElementById('chNav').onclick = ()=>{ navDestino = { lat:chincheta.lat, lon:chincheta.lon }; navRuta = null; _navStepIdx = 0; _navFueraRuta = false; setModoMapaForzar('navegar'); cerrarPanel(); };
   document.getElementById('chBuscarDest').onclick = ()=>{ cerrarPanel(); abrirPanelBuscarDestino(); };
   document.getElementById('chWaze').onclick = ()=> abrirEnWaze(chincheta.lat, chincheta.lon);
   document.getElementById('chMaps').onclick = ()=> abrirEnMaps(chincheta.lat, chincheta.lon);

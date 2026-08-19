@@ -28,12 +28,28 @@ public class GnssPlugin extends Plugin {
     private OnNmeaMessageListener nmeaListener;
     private boolean isListening = false;
 
+    // Motor de voz nativo (android.speech.tts). Es fiable y funciona sin internet,
+    // a diferencia de speechSynthesis del WebView (que en muchos Android no suena).
+    private android.speech.tts.TextToSpeech tts;
+    private boolean ttsReady = false;
+
     @Override
     public void load() {
         locationManager = (LocationManager) getContext().getSystemService(android.content.Context.LOCATION_SERVICE);
         TrackServiceBridge.register(this);
         WidgetActionBridge.register(this);
         FileOpenBridge.register(this);
+        try {
+            tts = new android.speech.tts.TextToSpeech(getContext(), new android.speech.tts.TextToSpeech.OnInitListener() {
+                @Override public void onInit(int status) {
+                    if (status == android.speech.tts.TextToSpeech.SUCCESS) {
+                        try { tts.setLanguage(new java.util.Locale("es", "CR")); }
+                        catch (Exception e) { try { tts.setLanguage(new java.util.Locale("es")); } catch (Exception e2) {} }
+                        ttsReady = true;
+                    }
+                }
+            });
+        } catch (Exception e) { tts = null; }
     }
 
     @Override
@@ -41,7 +57,27 @@ public class GnssPlugin extends Plugin {
         TrackServiceBridge.unregister(this);
         WidgetActionBridge.unregister(this);
         FileOpenBridge.unregister(this);
+        try { if (tts != null) { tts.stop(); tts.shutdown(); } } catch (Exception e) {}
         super.handleOnDestroy();
+    }
+
+    // Habla un texto con el motor TTS nativo (español). Lo usa el módulo Voz de la web.
+    @PluginMethod
+    public void hablar(PluginCall call) {
+        String texto = call.getString("texto");
+        if (texto == null || texto.isEmpty()) { call.reject("texto vacío"); return; }
+        if (tts == null || !ttsReady) { call.reject("TTS no disponible"); return; }
+        try {
+            tts.speak(texto, android.speech.tts.TextToSpeech.QUEUE_FLUSH, null, "gpstico-voz");
+            call.resolve();
+        } catch (Exception e) { call.reject("No se pudo hablar: " + e.getMessage()); }
+    }
+
+    // Corta cualquier locución en curso.
+    @PluginMethod
+    public void detenerVoz(PluginCall call) {
+        try { if (tts != null) tts.stop(); } catch (Exception e) {}
+        call.resolve();
     }
 
     // ---- Abrir archivos GeoJSON/GPX asociados a la app ----
