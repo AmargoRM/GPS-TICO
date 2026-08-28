@@ -68,9 +68,11 @@ button.flot:active{background:var(--cauce)}
 #velo.on{opacity:1;pointer-events:auto}
 #panel{position:fixed;left:0;right:0;bottom:0;max-height:88vh;background:var(--lecho);border-top:1px solid var(--fix);border-radius:16px 16px 0 0;transform:translateY(100%);transition:transform .26s cubic-bezier(.2,.8,.3,1);z-index:11;display:flex;flex-direction:column;padding-bottom:env(safe-area-inset-bottom)}
 #panel.on{transform:translateY(0)}
-#panelHead{display:flex;align-items:center;justify-content:space-between;padding:14px 16px 10px;flex:none}
-#panelTitulo{font-size:15px;font-weight:700}
-#panelCerrar{background:none;border:none;color:var(--musgo);font-size:22px;padding:0 6px}
+#panelHead{display:flex;align-items:center;justify-content:space-between;padding:14px 16px 10px;flex:none;gap:6px}
+#panelTitulo{font-size:15px;font-weight:700;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#panelAtras{background:none;border:none;color:var(--niebla);font-size:26px;line-height:1;padding:0 4px 2px;display:none;flex:none}
+#panelAtras.on{display:block}
+#panelCerrar{background:none;border:none;color:var(--musgo);font-size:22px;padding:0 6px;flex:none}
 #panelCuerpo{overflow-y:auto;padding:0 16px 20px;-webkit-overflow-scrolling:touch}
 
 .fila{display:flex;align-items:center;gap:10px;padding:11px 0;border-bottom:1px solid var(--cauce)}
@@ -205,7 +207,7 @@ label{display:block;font-size:9px;letter-spacing:.14em;text-transform:uppercase;
 
 <div id="velo"></div>
 <div id="panel">
-  <div id="panelHead"><div id="panelTitulo"></div><button id="panelCerrar">×</button></div>
+  <div id="panelHead"><button id="panelAtras" title="Atrás">‹</button><div id="panelTitulo"></div><button id="panelCerrar">×</button></div>
   <div id="panelCuerpo"></div>
 </div>
 <div id="menuAccionBloq"></div>
@@ -1577,16 +1579,17 @@ async function iniciarServicioTrack(){
 }
 // Comprueba si la app está exenta de optimización de batería; si no, muestra
 // un aviso y abre el diálogo del sistema (una sola vez por el flag guardado).
+let _bateriaPreguntadaSesion = false;   // solo evita repreguntar dentro de la MISMA sesión
 async function asegurarBateriaLibre(){
   const P = pluginGnss();
   if(!P || !P.bateriaOptimizada) return;
   let r; try{ r = await P.bateriaOptimizada(); }catch(e){ return; }
-  if(r && r.exenta) return;
-  // Ya se lo pedimos antes y dijo que no; no insistir en cada track.
-  let yaPreguntado = false;
-  try{ yaPreguntado = await dbGet('conf','bateriaPreguntada'); }catch(e){}
-  if(yaPreguntado) return;
-  await dbPut('conf', true, 'bateriaPreguntada');
+  if(r && r.exenta) return;               // ya está exenta: nada que pedir
+  // No insistir en cada track DENTRO de una misma sesión, pero SÍ volver a
+  // pedirlo la próxima vez que se abra la app si aún no se concedió (antes se
+  // guardaba un flag permanente que dejaba móviles ya instalados sin permiso).
+  if(_bateriaPreguntadaSesion) return;
+  _bateriaPreguntadaSesion = true;
   await new Promise(res=>{
     abrirPanel('Permiso para grabar con pantalla apagada', `
       <div class="nota" style="border-color:var(--alerta)">Para que el track no se corte ni haga saltos cuando bloqueás el celular, Android necesita que le des permiso de <b>ignorar la optimización de batería</b> a GPS TICO.</div>
@@ -1597,6 +1600,45 @@ async function asegurarBateriaLibre(){
     document.getElementById('batOk').onclick = async ()=>{ try{ await P.pedirIgnorarBateria(); }catch(e){} cerrarPanel(); res(); };
     document.getElementById('batNo').onclick = ()=>{ cerrarPanel(); res(); };
   });
+}
+// Panel de permisos para que el track siga grabando con la pantalla bloqueada.
+// Muestra el estado de la exención de batería (la causa nº1 de que el track se
+// corte en móviles ya instalados) y da botones para concederla y para abrir los
+// ajustes del sistema (donde algunos fabricantes esconden "autoarranque").
+function panelPermisosBackground(){
+  const P = pluginGnss();
+  abrirPanel('Grabación con pantalla bloqueada', `
+    <div class="nota" style="border-color:var(--alerta)">Para que el track <b>no se corte</b> al bloquear el celular, Android necesita que GPS TICO tenga permiso para trabajar en segundo plano. Revisá que los tres estén en verde.</div>
+    <div class="res" style="margin-top:6px"><div class="k">Optimización de batería</div><div class="v" id="pbBat">Consultando…</div></div>
+    <button class="ancho" id="pbBatFix">Permitir trabajar sin límite de batería</button>
+    <div class="res" style="margin-top:14px"><div class="k">Ubicación</div><div class="v" id="pbLoc">Necesaria (permitir "mientras se usa" o "siempre")</div></div>
+    <button class="ancho borde" id="pbLocFix">Pedir permiso de ubicación</button>
+    <div class="res" style="margin-top:14px"><div class="k">Notificaciones</div><div class="v" id="pbNot">Necesaria para el aviso de grabación</div></div>
+    <button class="ancho borde" id="pbNotFix">Pedir permiso de notificaciones</button>
+    <div style="margin-top:18px" class="nota">Algunos fabricantes (Xiaomi/Redmi, Huawei, Oppo, Samsung) además tienen un ajuste de <b>"Autoarranque"</b> o <b>"Sin restricciones"</b> por app. Si el track se sigue cortando, abrí los ajustes de la app y activá esas opciones.</div>
+    <button class="ancho borde" id="pbAjustes">Abrir ajustes de la app</button>
+    <button class="ancho borde" id="pbReVerificar" style="margin-top:8px">Volver a verificar</button>
+  `);
+  const pintarBat = async ()=>{
+    const el = document.getElementById('pbBat'); if(!el) return;
+    if(!P || !P.bateriaOptimizada){ el.textContent = 'No disponible (abrí desde el APK)'; return; }
+    try{ const r = await P.bateriaOptimizada();
+      if(r && r.exenta){ el.innerHTML = '<span style="color:var(--fix)">✓ Permitido</span>'; }
+      else { el.innerHTML = '<span style="color:var(--sangre)">✗ Falta permitir — tocá el botón de abajo</span>'; }
+    }catch(e){ el.textContent = '—'; }
+  };
+  pintarBat();
+  document.getElementById('pbBatFix').onclick = async ()=>{ try{ await P.pedirIgnorarBateria(); }catch(e){} setTimeout(pintarBat, 800); };
+  document.getElementById('pbLocFix').onclick = async ()=>{
+    try{ const Geo = window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.Geolocation; if(Geo) await Geo.requestPermissions(); }catch(e){}
+    toast('Si no apareció el diálogo, concedé la ubicación desde "Abrir ajustes de la app".');
+  };
+  document.getElementById('pbNotFix').onclick = async ()=>{ try{ if(P && P.requestNotifPermission) await P.requestNotifPermission(); }catch(e){} };
+  document.getElementById('pbAjustes').onclick = async ()=>{
+    if(P && P.abrirAjustesApp){ try{ await P.abrirAjustesApp(); }catch(e){ toast('No pude abrir los ajustes.'); } }
+    else toast('Actualizá la app para usar esta opción.');
+  };
+  document.getElementById('pbReVerificar').onclick = ()=> pintarBat();
 }
 async function detenerServicioTrack(){
   const P = pluginGnss();
@@ -1695,6 +1737,8 @@ function abrirPanel(titulo, html){
 function cerrarPanel(){
   document.getElementById('panel').classList.remove('on');
   document.getElementById('velo').classList.remove('on');
+  _pilaPanel = [];                       // reiniciar la navegación
+  const ba = document.getElementById('panelAtras'); if(ba) ba.classList.remove('on');
   if(diagCleanup){ const c = diagCleanup; diagCleanup = null; c(); }
   // Si se cierra el panel con una ocupación en curso (X o velo), cancelarla.
   if(ocupacion && ocupacion.activa){
@@ -1702,8 +1746,29 @@ function cerrarPanel(){
     ocupacion = null;
   }
 }
+// --- Navegación entre paneles con botón "Atrás" (pila de render) ---
+// Cada sección abierta desde el menú se apila; el botón ‹ vuelve a la anterior
+// sin tener que cerrar el panel por completo.
+let _pilaPanel = [];
+function navegarPanel(fn){
+  if(typeof fn !== 'function') return;
+  _pilaPanel.push(fn);
+  fn();
+  _sincronizarAtras();
+}
+function volverPanel(){
+  _pilaPanel.pop();                       // sacar el panel actual
+  const prev = _pilaPanel[_pilaPanel.length - 1];
+  if(prev){ prev(); _sincronizarAtras(); }
+  else cerrarPanel();
+}
+function _sincronizarAtras(){
+  const b = document.getElementById('panelAtras');
+  if(b) b.classList.toggle('on', _pilaPanel.length > 1);
+}
 document.getElementById('panelCerrar').onclick = cerrarPanel;
 document.getElementById('velo').onclick = cerrarPanel;
+document.getElementById('panelAtras').onclick = volverPanel;
 
 document.querySelectorAll('#modo button').forEach(b=>{
   b.onclick = ()=>{
@@ -1867,48 +1932,68 @@ document.getElementById('btnWp').onclick = ()=>{
   const fotosPunto = [];
   const inpF = document.getElementById('wpFotos');
   if(inpF) inpF.onchange = async ()=>{
-    for(const file of inpF.files){ try{ fotosPunto.push(await comprimirImagen(file)); }catch(e){} }
+    for(const file of inpF.files){ try{ const c = await comprimirImagen(file); if(c) fotosPunto.push(c); }catch(e){} }
     inpF.value = '';
     document.getElementById('wpFotosPrev').innerHTML = fotosPunto.map((s,i)=>`<img src="${s}" data-rmf="${i}" style="width:64px;height:64px;object-fit:cover;border-radius:6px;border:1px solid var(--cauce)">`).join('');
     document.querySelectorAll('[data-rmf]').forEach(im=> im.onclick = ()=>{ fotosPunto.splice(parseInt(im.dataset.rmf,10),1); inpF.onchange(); });
   };
   document.getElementById('wpOk').onclick = async ()=>{
-    // En modo manual: resolver las coordenadas tecleadas si aún no se hizo.
-    if(modoManual){
-      const r = resolverManual(); if(!r) return;
-      manualLL = r;
+    const btn = document.getElementById('wpOk');
+    if(btn.dataset.guardando==='1') return;   // anti doble-tap en equipos lentos
+    btn.dataset.guardando = '1';
+    try{
+      // En modo manual: resolver las coordenadas tecleadas si aún no se hizo.
+      if(modoManual){
+        const r = resolverManual(); if(!r){ btn.dataset.guardando='0'; return; }
+        manualLL = r;
+      }
+      const dp = await recolectarDatosPlantilla();
+      if(dp===null){ btn.dataset.guardando='0'; return; }   // faltó un campo obligatorio
+      if(!S.proy){ toast('Sin proyecto activo.'); btn.dataset.guardando='0'; return; }
+      const nombreFinal = document.getElementById('wpNom').value.trim() || `P${n}`;
+      const descFinal = document.getElementById('wpDesc').value.trim();
+      const fotosOriginales = fotosPunto.concat(dp.fotos).filter(Boolean);
+      // === PASO 1: guardar el punto YA en IndexedDB, con las fotos tal cual.
+      // Esto garantiza que el dato NO se pierde aunque después falle el
+      // watermark, la memoria, o la app se cierre. La persistencia local es
+      // 100% offline; no depende de internet.
+      const p = Object.assign({ id:nid(), proy:S.proy.id,
+        nom: nombreFinal,
+        desc: descFinal,
+        tipo: plantillaActiva || null,
+        datos: Object.keys(dp.datos).length ? dp.datos : null,
+        fotos: fotosOriginales.length ? fotosOriginales.slice() : null,
+        sincronizado: false,
+        promediado:false, t:Date.now() }, construirPunto());
+      await dbPut('puntos', p);
+      S.puntos.push(p); cerrarPanel(); dibujar();
+      toast('Punto guardado' + (fotosOriginales.length?' · '+fotosOriginales.length+' foto(s)':'') + '.');
+      // === PASO 2: estampar el watermark (con nombre/coords) y actualizar el
+      // registro ya guardado. Best-effort: si falla, el punto conserva las
+      // fotos sin sello (mejor eso que perder el dato).
+      if(fotosOriginales.length){
+        const cr = tmFwd(p.lat, p.lon, CRTM05);
+        const info = { nombre: nombreFinal, lat: p.lat, lon: p.lon,
+                       crtmE: cr.x, crtmN: cr.y,
+                       fecha: new Date().toLocaleString('es-CR') };
+        const fotos = [];
+        for(const f of fotosOriginales){ try{ fotos.push(await aplicarWatermarkAFoto(f, info)); }catch(e){ fotos.push(f); } }
+        p.fotos = fotos.length ? fotos : p.fotos;
+        p.fotosSincronizadas = false;
+        try{ await dbPut('puntos', p); }catch(e){}
+        dibujar();
+      }
+      disparoAutoSync();
+    }catch(err){
+      toast('Error al guardar: ' + ((err&&err.message)||err));
+      const b = document.getElementById('wpOk'); if(b) b.dataset.guardando='0';
     }
-    const dp = await recolectarDatosPlantilla();
-    if(dp===null) return;   // faltó un campo obligatorio
-    const nombreFinal = document.getElementById('wpNom').value.trim() || `P${n}`;
-    const descFinal = document.getElementById('wpDesc').value.trim();
-    const fotosOriginales = fotosPunto.concat(dp.fotos);
-    // Coordenada real del punto (GPS o manual) para el watermark de las fotos.
-    const puntoBase = construirPunto();
-    const cr = tmFwd(puntoBase.lat, puntoBase.lon, CRTM05);
-    const info = { nombre: nombreFinal, lat: puntoBase.lat, lon: puntoBase.lon,
-                   crtmE: cr.x, crtmN: cr.y,
-                   fecha: new Date().toLocaleString('es-CR') };
-    const fotos = [];
-    for(const f of fotosOriginales){ try{ fotos.push(await aplicarWatermarkAFoto(f, info)); }catch(e){ fotos.push(f); } }
-    const p = Object.assign({ id:nid(), proy:S.proy.id,
-      nom: nombreFinal,
-      desc: descFinal,
-      tipo: plantillaActiva || null,
-      datos: Object.keys(dp.datos).length ? dp.datos : null,
-      fotos: fotos.length ? fotos : null,
-      sincronizado: false,
-      promediado:false, t:Date.now() }, construirPunto());
-    await dbPut('puntos', p);
-    S.puntos.push(p); cerrarPanel(); dibujar();
-    toast('Punto guardado' + (fotos.length?' · '+fotos.length+' foto(s)':'') + '.');
-    disparoAutoSync();
   };
   document.getElementById('wpProm').onclick = async ()=>{
     if(modoManual){ toast('Promediar es solo para el GPS. En modo manual, tocá Guardar.'); return; }
     const dp = await recolectarDatosPlantilla();
     if(dp===null) return;
-    ocuDatos = { datos: Object.keys(dp.datos).length?dp.datos:null, fotos: fotosPunto.concat(dp.fotos), tipo: plantillaActiva||null };
+    ocuDatos = { datos: Object.keys(dp.datos).length?dp.datos:null, fotos: fotosPunto.concat(dp.fotos).filter(Boolean), tipo: plantillaActiva||null };
     const nom = document.getElementById('wpNom').value.trim() || `P${n}`;
     const desc = document.getElementById('wpDesc').value.trim();
     const dur = parseInt(document.getElementById('wpDur').value, 10) || 60;
@@ -1924,7 +2009,8 @@ let ocuDatos = null;   // datos/fotos de plantilla a adjuntar al punto promediad
 document.getElementById('btnTrack').onclick = alternarTrack;
 
 /* --- menú --- */
-document.getElementById('btnMenu').onclick = ()=>{
+document.getElementById('btnMenu').onclick = ()=>{ _pilaPanel = []; navegarPanel(abrirMenu); };
+function abrirMenu(){
   const pendP = S.puntos.filter(p=> p.sincronizado!==true).length;
   const pendT = (S.tracks||[]).filter(t=> t.sincronizado!==true).length;
   const pend = pendP + pendT;
@@ -1941,16 +2027,16 @@ document.getElementById('btnMenu').onclick = ()=>{
     <div class="fila"><div class="cuerpo"><div class="t">⚙ Configuración y términos de uso</div><div class="s">Fuente, diagnóstico, filtros, alertas, precisión</div></div><button class="mini" id="mConfig">Abrir</button></div>
   `);
   document.getElementById('mUpd').onclick = ()=> buscarActualizacion(true);
-  document.getElementById('mCapas').onclick = panelCapas;
-  document.getElementById('mDatos').onclick = panelDatos;
-  document.getElementById('mConv').onclick  = panelConv;
-  document.getElementById('mOff').onclick   = panelOffline;
-  document.getElementById('mExp').onclick   = panelExport;
-  document.getElementById('mExpMapa').onclick = panelExportMapa;
-  document.getElementById('mSync').onclick  = panelSync;
-  document.getElementById('mBackup').onclick = panelBackup;
-  document.getElementById('mConfig').onclick = panelConfig;
-};
+  document.getElementById('mCapas').onclick = ()=> navegarPanel(panelCapas);
+  document.getElementById('mDatos').onclick = ()=> navegarPanel(panelDatos);
+  document.getElementById('mConv').onclick  = ()=> navegarPanel(panelConv);
+  document.getElementById('mOff').onclick   = ()=> navegarPanel(panelOffline);
+  document.getElementById('mExp').onclick   = ()=> navegarPanel(panelExport);
+  document.getElementById('mExpMapa').onclick = ()=> navegarPanel(panelExportMapa);
+  document.getElementById('mSync').onclick  = ()=> navegarPanel(panelSync);
+  document.getElementById('mBackup').onclick = ()=> navegarPanel(panelBackup);
+  document.getElementById('mConfig').onclick = ()=> navegarPanel(panelConfig);
+}
 /* --- copia de seguridad completa (proyectos/puntos/tracks/capas/ajustes) --- */
 function volcarConf(){
   return new Promise(ok=>{
@@ -2018,14 +2104,16 @@ function panelConfig(){
     <div class="fila"><div class="cuerpo"><div class="t">Filtros de calidad</div><div class="s">${S.filtros.activo?'Activo · '+S.filtros.preset:'Apagado'}</div></div><button class="mini" id="cFilt">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Alertas de proximidad</div><div class="s">${alertas.filter(a=>a.activa).length} activa(s) de ${alertas.length}</div></div><button class="mini" id="cAlert">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Fuente de posición</div><div class="s">${S.fuente==='gps'?'GPS puro (nativo)':'Fusionada (GPS+WiFi+celda)'}</div></div><button class="mini" id="cFuente">Cambiar</button></div>
+    <div class="fila"><div class="cuerpo"><div class="t">Grabación con pantalla bloqueada</div><div class="s">Permisos para que el track no se corte al bloquear el celular</div></div><button class="mini" id="cBg">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Precisión y advertencias</div><div class="s">Términos de uso · leer antes de usar en expedientes</div></div><button class="mini" id="cInfo">Abrir</button></div>
   `);
-  document.getElementById('cPlant').onclick = panelPlantillas;
-  document.getElementById('cDiag').onclick  = panelDiagnosticos;
-  document.getElementById('cFilt').onclick  = panelFiltros;
-  document.getElementById('cAlert').onclick = panelAlertas;
-  document.getElementById('cFuente').onclick = panelFuente;
-  document.getElementById('cInfo').onclick  = panelInfo;
+  document.getElementById('cPlant').onclick = ()=> navegarPanel(panelPlantillas);
+  document.getElementById('cDiag').onclick  = ()=> navegarPanel(panelDiagnosticos);
+  document.getElementById('cFilt').onclick  = ()=> navegarPanel(panelFiltros);
+  document.getElementById('cAlert').onclick = ()=> navegarPanel(panelAlertas);
+  document.getElementById('cFuente').onclick = ()=> navegarPanel(panelFuente);
+  document.getElementById('cBg').onclick    = ()=> navegarPanel(panelPermisosBackground);
+  document.getElementById('cInfo').onclick  = ()=> navegarPanel(panelInfo);
 }
 
 /* --- proyectos --- */
@@ -5016,36 +5104,60 @@ function htmlCamposPlantilla(id){
 // Reduce una imagen a JPEG ~1024px. Opcionalmente le imprime un watermark
 // con nombre del punto, coord WGS84, coord CRTM05 y fecha/hora (para que
 // la foto sea auto-documentada aunque se saque de la base de datos).
+// Comprime una foto a JPEG ~1024px. BLINDADO: nunca se cuelga ni rechaza.
+// Si algo falla (imagen que no decodifica, poca memoria, formato raro), NO
+// se pierde la foto: se devuelve el dataURL original tal cual, y si ni eso se
+// puede, se devuelve null (el llamador lo omite). Esto evita que el guardado
+// del punto se quede colgado en un `await` que nunca termina.
 function comprimirImagen(file, info){
   return new Promise((resolve)=>{
-    const img = new Image();
+    let resuelto = false;
+    const done = (v)=>{ if(!resuelto){ resuelto = true; clearTimeout(timer); resolve(v); } };
     const rd = new FileReader();
-    rd.onload = ()=>{ img.onload = ()=>{
-      const max = 1024; let w = img.width, hh = img.height;
-      if(w>hh && w>max){ hh = hh*max/w; w = max; } else if(hh>max){ w = w*max/hh; hh = max; }
-      const cv = document.createElement('canvas'); cv.width = w; cv.height = hh;
-      const ctx = cv.getContext('2d');
-      ctx.drawImage(img, 0, 0, w, hh);
-      if(info) pintarWatermark(ctx, w, hh, info);
-      resolve(cv.toDataURL('image/jpeg', 0.72));
-    }; img.src = rd.result; };
-    rd.readAsDataURL(file);
+    // Failsafe: si en 15 s no se pudo procesar, resolver con lo que haya (o null).
+    const timer = setTimeout(()=> done(rd && rd.result ? rd.result : null), 15000);
+    rd.onerror = ()=> done(null);
+    rd.onload = ()=>{
+      const original = rd.result;   // dataURL sin comprimir, por si el canvas falla
+      const img = new Image();
+      img.onload = ()=>{
+        try{
+          const max = 1024; let w = img.width, hh = img.height;
+          if(!w || !hh){ done(original); return; }
+          if(w>hh && w>max){ hh = hh*max/w; w = max; } else if(hh>max){ w = w*max/hh; hh = max; }
+          const cv = document.createElement('canvas'); cv.width = w; cv.height = hh;
+          const ctx = cv.getContext('2d');
+          ctx.drawImage(img, 0, 0, w, hh);
+          if(info) pintarWatermark(ctx, w, hh, info);
+          done(cv.toDataURL('image/jpeg', 0.72));
+        }catch(e){ done(original); }   // guardar el original sin comprimir
+      };
+      img.onerror = ()=> done(original);   // no decodificó: guardar el original
+      img.src = original;
+    };
+    try{ rd.readAsDataURL(file); }catch(e){ done(null); }
   });
 }
 // Re-abre una imagen ya guardada (dataURL) y le imprime un watermark.
 // Se usa al momento de GUARDAR el punto (así el nombre final queda estampado).
 function aplicarWatermarkAFoto(dataUrl, info){
   return new Promise((resolve)=>{
+    let resuelto = false;
+    const done = (v)=>{ if(!resuelto){ resuelto = true; clearTimeout(timer); resolve(v); } };
+    // Failsafe: si en 8 s no se pudo estampar, devolver la foto original.
+    const timer = setTimeout(()=> done(dataUrl), 8000);
     const img = new Image();
     img.onload = ()=>{
-      const cv = document.createElement('canvas');
-      cv.width = img.width; cv.height = img.height;
-      const ctx = cv.getContext('2d');
-      ctx.drawImage(img, 0, 0);
-      pintarWatermark(ctx, img.width, img.height, info);
-      resolve(cv.toDataURL('image/jpeg', 0.72));
+      try{
+        const cv = document.createElement('canvas');
+        cv.width = img.width; cv.height = img.height;
+        const ctx = cv.getContext('2d');
+        ctx.drawImage(img, 0, 0);
+        pintarWatermark(ctx, img.width, img.height, info);
+        done(cv.toDataURL('image/jpeg', 0.72));
+      }catch(e){ done(dataUrl); }
     };
-    img.onerror = ()=> resolve(dataUrl);
+    img.onerror = ()=> done(dataUrl);
     img.src = dataUrl;
   });
 }
@@ -5085,7 +5197,7 @@ async function recolectarDatosPlantilla(id){
     const c = t.campos[i];
     if(c.tipo==='foto'){
       const inp = document.querySelector('[data-pf="'+i+'"]');
-      if(inp && inp.files){ for(const file of inp.files){ try{ fotos.push(await comprimirImagen(file)); }catch(e){} } }
+      if(inp && inp.files){ for(const file of inp.files){ try{ const c = await comprimirImagen(file); if(c) fotos.push(c); }catch(e){} } }
     } else {
       const el = document.querySelector('[data-pd="'+i+'"]');
       const v = el ? el.value.trim() : '';
@@ -5286,6 +5398,9 @@ async function toggleCapa(id){ const c=S.capas.find(x=>x.id===id); if(!c) return
 async function borrarCapa(id){
   // Borra también sus tiles WMS cacheados.
   const c = S.capas.find(x=>x.id===id);
+  // Confirmación: quitar una capa es fácil de tocar por error y no se deshace.
+  const nom = c ? c.nombre : 'esta capa';
+  if(!confirm('¿Quitar la capa "' + nom + '" del proyecto?\n\nEsto la borra de la app (no borra el archivo original de tu teléfono). No se puede deshacer.')) return;
   await dbDel('capas', id); S.capas = S.capas.filter(x=>x.id!==id);
   if(c && c.tipo==='wms'){ for(const k of Array.from(memTiles.keys())) if(k.startsWith('wms_'+id+'/')) memTiles.delete(k); }
   if(c && c.tipo==='big'){ await _borrarBigProps(id); }
@@ -5384,6 +5499,21 @@ function capasPorGrupo(){
 }
 // Estado de colapso de cada grupo en el panel (se conserva mientras el panel viva).
 let grupoColapsado = {};
+// Colapsa o expande TODAS las carpetas de capas de una vez.
+function colapsarTodosGrupos(colapsar){
+  for(const [g] of capasPorGrupo()) grupoColapsado[g] = !!colapsar;
+  panelCapas();
+}
+// Enciende/apaga la visibilidad de TODAS las capas del proyecto.
+async function setVisTodasCapas(vis){
+  for(const c of S.capas){ if(c.visible!==vis){ c.visible = vis; await dbPut('capas', c); } }
+  dibujar(); panelCapas();
+}
+// Enciende/apaga la visibilidad de las capas de UNA carpeta (grupo).
+async function setVisGrupoCapas(grupo, vis){
+  for(const c of S.capas){ if((c.grupo||'Sin grupo')===grupo && c.visible!==vis){ c.visible = vis; await dbPut('capas', c); } }
+  dibujar(); panelCapas();
+}
 // Lista de nombres de grupos existentes (para el selector).
 function gruposExistentes(){
   const set = new Set();
@@ -5498,13 +5628,22 @@ function panelCapas(){
   if(!S.capas.length){
     contenido = '<div class="vacio">Sin capas todavía. Agregá una abajo.<br>Tocá un elemento en el mapa para ver sus atributos.</div>';
   } else {
+    // Barra de acciones por carpetas: comprimir, encender/apagar todo.
+    const algunaExpandida = [...grupos.keys()].some(g=> !grupoColapsado[g]);
+    contenido += `<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:2px">
+      <button class="mini" id="capColapsar">🗂 ${algunaExpandida?'Comprimir carpetas':'Expandir carpetas'}</button>
+      <button class="mini" id="capOnTodo">👁 Encender todo</button>
+      <button class="mini" id="capOffTodo">⦸ Apagar todo</button>
+    </div>`;
     for(const [nombreGrupo, capasG] of grupos){
       const col = !!grupoColapsado[nombreGrupo];
       const puedeRenombrar = nombreGrupo !== 'Sin grupo';
       contenido += `<div style="margin-top:10px;background:var(--abismo);border:1px solid var(--cauce);border-radius:8px;overflow:hidden">
         <div style="padding:8px 12px;background:var(--cauce);display:flex;justify-content:space-between;align-items:center;user-select:none;font-weight:600;font-size:12px">
           <span data-tgg="${escHtml(nombreGrupo)}" style="cursor:pointer;flex:1">${col?'▸':'▾'} 📁 ${escHtml(nombreGrupo)} <span style="color:var(--musgo);font-weight:400">· ${capasG.length}</span></span>
-          ${puedeRenombrar?`<button class="mini" data-gren="${escHtml(nombreGrupo)}" title="Renombrar grupo" style="margin-left:6px">✎</button>`:''}
+          <button class="mini" data-gon="${escHtml(nombreGrupo)}" title="Encender capas de la carpeta" style="margin-left:6px">👁</button>
+          <button class="mini" data-goff="${escHtml(nombreGrupo)}" title="Apagar capas de la carpeta" style="margin-left:4px">⦸</button>
+          ${puedeRenombrar?`<button class="mini" data-gren="${escHtml(nombreGrupo)}" title="Renombrar grupo" style="margin-left:4px">✎</button>`:''}
         </div>
         ${col?'':`<div style="padding:0 12px">${capasG.map((c)=>{
           const idxGlobal = S.capas.indexOf(c);
@@ -5535,6 +5674,14 @@ function panelCapas(){
   document.querySelectorAll('[data-tgg]').forEach(el=> el.onclick = ()=>{
     const n = el.dataset.tgg; grupoColapsado[n] = !grupoColapsado[n]; panelCapas();
   });
+  const bCol = document.getElementById('capColapsar');
+  if(bCol) bCol.onclick = ()=>{ const alg = [...capasPorGrupo().keys()].some(g=> !grupoColapsado[g]); colapsarTodosGrupos(alg); };
+  const bOn = document.getElementById('capOnTodo');
+  if(bOn) bOn.onclick = ()=> setVisTodasCapas(true);
+  const bOff = document.getElementById('capOffTodo');
+  if(bOff) bOff.onclick = ()=> setVisTodasCapas(false);
+  document.querySelectorAll('[data-gon]').forEach(b=> b.onclick = (e)=>{ e.stopPropagation(); setVisGrupoCapas(b.dataset.gon, true); });
+  document.querySelectorAll('[data-goff]').forEach(b=> b.onclick = (e)=>{ e.stopPropagation(); setVisGrupoCapas(b.dataset.goff, false); });
   document.querySelectorAll('[data-gren]').forEach(b=> b.onclick = (e)=>{ e.stopPropagation(); renombrarGrupo(b.dataset.gren); });
   document.querySelectorAll('[data-tb]').forEach(b=> b.onclick = ()=> tablaAtributos(b.dataset.tb));
   document.querySelectorAll('[data-sm]').forEach(b=> b.onclick = ()=> panelSimbologia(b.dataset.sm));

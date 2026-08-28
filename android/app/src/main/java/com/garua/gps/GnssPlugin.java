@@ -249,6 +249,28 @@ public class GnssPlugin extends Plugin {
         }
     }
 
+    // Abre la pantalla de ajustes de ESTA app (App Info). Desde ahí el usuario
+    // puede conceder ubicación "siempre", quitar restricciones de batería y, en
+    // varios fabricantes, activar el autoarranque. Clave para que el track no
+    // se corte con la pantalla bloqueada en móviles ya instalados.
+    @PluginMethod
+    public void abrirAjustesApp(PluginCall call) {
+        try {
+            Intent i = new Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS);
+            i.setData(android.net.Uri.parse("package:" + getContext().getPackageName()));
+            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            getContext().startActivity(i);
+            call.resolve();
+        } catch (Exception e) {
+            try {
+                Intent i = new Intent(android.provider.Settings.ACTION_SETTINGS);
+                i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                getContext().startActivity(i);
+                call.resolve();
+            } catch (Exception e2) { call.reject("No se pudo abrir ajustes: " + e2.getMessage()); }
+        }
+    }
+
     // Para el track nativo (deja de grabar puntos en background pero mantiene la app viva).
     @PluginMethod
     public void stopNativeTrack(PluginCall call) {
