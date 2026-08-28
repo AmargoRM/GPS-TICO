@@ -1518,6 +1518,13 @@ let fuentePrevTrack = null;   // fuente a restaurar al terminar el track
 async function alternarTrack(){
   const b = document.getElementById('btnTrack');
   if(S.grabando){
+    // 1) Detener la grabación nativa PRIMERO para que el buffer quede completo.
+    await detenerServicioTrack();
+    // 2) Absorber los puntos que el servicio nativo grabó con la pantalla
+    //    bloqueada y que aún no se habían fusionado al track activo.
+    try{ await fusionarPuntosNativosAlTrack(); }catch(e){}
+    // 3) Descartar el buffer nativo para que NO se importe como track aparte.
+    try{ const P = pluginGnss(); if(P && P.descartarTrackParcial) await P.descartarTrackParcial(); }catch(e){}
     // Al detener el track, se marca como pendiente de subir a la nube.
     S.grabando.sincronizado = false;
     await dbPut('tracks', JSON.parse(JSON.stringify(S.grabando)));
@@ -1527,7 +1534,6 @@ async function alternarTrack(){
     disparoAutoSync();
     S.grabando = null;
     b.dataset.on = '0'; b.textContent = 'Grabar track';
-    await detenerServicioTrack();
     await liberarPantalla();
     // Restaurar la fuente que el usuario tenía antes del track.
     if(fuentePrevTrack && fuentePrevTrack !== S.fuente){ S.fuente = fuentePrevTrack; await aplicarFuente(); }
@@ -1609,6 +1615,8 @@ function panelPermisosBackground(){
   const P = pluginGnss();
   abrirPanel('Grabación con pantalla bloqueada', `
     <div class="nota" style="border-color:var(--alerta)">Para que el track <b>no se corte</b> al bloquear el celular, Android necesita que GPS TICO tenga permiso para trabajar en segundo plano. Revisá que los tres estén en verde.</div>
+    <div class="res" style="margin-top:6px"><div class="k">Servicio de grabación</div><div class="v" id="pbSvc" style="font-size:12px">—</div></div>
+    <div class="nota" style="border-color:var(--cauce)">Prueba: iniciá un track, bloqueá el celular y caminá un poco. En la barra de notificaciones debe verse <b>"GPS TICO — grabando… N pts"</b> con el número <b>subiendo</b>. Si sube, está grabando bloqueado.</div>
     <div class="res" style="margin-top:6px"><div class="k">Optimización de batería</div><div class="v" id="pbBat">Consultando…</div></div>
     <button class="ancho" id="pbBatFix">Permitir trabajar sin límite de batería</button>
     <div class="res" style="margin-top:14px"><div class="k">Ubicación</div><div class="v" id="pbLoc">Necesaria (permitir "mientras se usa" o "siempre")</div></div>
@@ -1627,7 +1635,20 @@ function panelPermisosBackground(){
       else { el.innerHTML = '<span style="color:var(--sangre)">✗ Falta permitir — tocá el botón de abajo</span>'; }
     }catch(e){ el.textContent = '—'; }
   };
-  pintarBat();
+  const pintarSvc = async ()=>{
+    const el = document.getElementById('pbSvc'); if(!el) return;
+    if(!P || !P.estadoServicio){ el.textContent = 'No disponible'; return; }
+    try{ const s = await P.estadoServicio();
+      if(s && s.grabando){
+        const exac = (s.exactitud!=null && s.exactitud>=0) ? ' · ±'+Math.round(s.exactitud)+' m' : '';
+        const edad = (s.segDesdeUltimoFix!=null && s.segDesdeUltimoFix>=0) ? ' · último fix hace '+s.segDesdeUltimoFix+' s' : '';
+        el.innerHTML = '<span style="color:var(--fix)">● Grabando</span> · '+(s.puntos||0)+' pts · '+(s.proveedor||'?')+exac+edad;
+      } else {
+        el.innerHTML = '<span style="color:var(--musgo)">○ Inactivo</span> (iniciá un track para probar)';
+      }
+    }catch(e){ el.textContent = '—'; }
+  };
+  pintarBat(); pintarSvc();
   document.getElementById('pbBatFix').onclick = async ()=>{ try{ await P.pedirIgnorarBateria(); }catch(e){} setTimeout(pintarBat, 800); };
   document.getElementById('pbLocFix').onclick = async ()=>{
     try{ const Geo = window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.Geolocation; if(Geo) await Geo.requestPermissions(); }catch(e){}
@@ -1638,7 +1659,7 @@ function panelPermisosBackground(){
     if(P && P.abrirAjustesApp){ try{ await P.abrirAjustesApp(); }catch(e){ toast('No pude abrir los ajustes.'); } }
     else toast('Actualizá la app para usar esta opción.');
   };
-  document.getElementById('pbReVerificar').onclick = ()=> pintarBat();
+  document.getElementById('pbReVerificar').onclick = ()=>{ pintarBat(); pintarSvc(); };
 }
 async function detenerServicioTrack(){
   const P = pluginGnss();
@@ -1650,8 +1671,16 @@ async function detenerServicioTrack(){
 // dormido con el track actual (S.grabando). Se llama al volver al foreground.
 async function fusionarPuntosNativosAlTrack(){
   if(!S.grabando) return;
-  const P = pluginGnss(); if(!P || !P.importarPendientes) return;
-  let data; try{ data = await P.importarPendientes(); }catch(e){ return; }
+  const P = pluginGnss(); if(!P) return;
+  // Lectura NO destructiva del buffer que el servicio nativo graba en segundo
+  // plano (pantalla bloqueada). Antes se usaba importarPendientes, que se negaba
+  // a devolver el track mientras seguía grabando → los puntos capturados con el
+  // celular bloqueado nunca aparecían en el track activo.
+  let data;
+  try{
+    if(P.leerTrackParcial) data = await P.leerTrackParcial();
+    else data = await P.importarPendientes();
+  }catch(e){ return; }
   if(!data || !data.track || !Array.isArray(data.track.pts) || !data.track.pts.length) return;
   // data.track.pts vienen como [lat, lon, alt, exac, vexac, t].
   // Se agregan los que aún no están (comparando por timestamp) al track actual.
@@ -2170,6 +2199,18 @@ function tsPunto(p){ return p.t || 0; }
 function tsTrack(t){ return t.ini || (t.pts && t.pts[0] && t.pts[0].t) || 0; }
 function fechaClave(ts){ return ts ? new Date(ts).toLocaleDateString('es-CR') : 'Sin fecha'; }
 const esVisible = it => it.visible!==false;   // por defecto visible
+// Estado de colapso de las pestañas por período (mes/año) en Puntos y tracks.
+let periodoColapsado = {};
+// Clave/etiqueta de mes y año a partir de una marca de tiempo.
+function infoPeriodo(ts){
+  const D = new Date(ts||0);
+  const mesLbl = D.toLocaleDateString('es-CR', { month:'long', year:'numeric' });
+  return {
+    anio: String(D.getFullYear()),
+    mes: D.getFullYear()+'-'+String(D.getMonth()+1).padStart(2,'0'),
+    mesLabel: mesLbl.charAt(0).toUpperCase()+mesLbl.slice(1)   // "Agosto de 2026"
+  };
+}
 
 async function fijarVis(store, arr, id, vis){
   const it = arr.find(x=>x.id===id); if(!it) return;
@@ -2204,7 +2245,8 @@ async function panelDatos(){
   for(const t of S.tracks){ const ts=tsTrack(t); meter(fechaClave(ts), ts).tracks.push(t); }
   const fechas = [...grupos.entries()].sort((a,b)=> b[1].ts - a[1].ts);
 
-  const bloques = fechas.map(([f,g])=>{
+  // HTML de un día (encabezado con toggle de visibilidad + sus filas).
+  const htmlDia = (f,g)=>{
     const filasP = g.puntos.map(p=>{
       const c = fmtCoord(p.lat, p.lon, S.modo);
       const prom = p.promediado ? ` <span style="color:var(--fix)">◎ ${p.muestras} m · σ±${p.desvStd!=null?p.desvStd.toFixed(2):'?'}m</span>` : '';
@@ -2226,7 +2268,57 @@ async function panelDatos(){
         <div class="fechaLbl">${f} · ${g.puntos.length+g.tracks.length}</div>
         <button class="mini" data-vf="${f}" data-von="${algunoVis?'0':'1'}">${algunoVis?'Ocultar día':'Mostrar día'}</button>
       </div>${filasP}${filasT}`;
-  }).join('');
+  };
+  // Pestaña colapsable de período (mes o año). El estado por defecto (colapsado)
+  // se persiste en periodoColapsado la primera vez para poder alternarlo.
+  const wrapPeriodo = (key, label, count, defCol, inner, nivel)=>{
+    if(periodoColapsado[key]===undefined) periodoColapsado[key] = defCol;
+    const col = periodoColapsado[key];
+    return `<div style="margin-top:8px;background:var(--abismo);border:1px solid var(--cauce);border-radius:8px;overflow:hidden">
+      <div data-tp="${escHtml(key)}" style="padding:9px 12px;background:var(--cauce);display:flex;justify-content:space-between;align-items:center;cursor:pointer;user-select:none;font-weight:700;font-size:${nivel===1?13:12}px">
+        <span>${col?'▸':'▾'} ${nivel===1?'📅':'🗓'} ${escHtml(label)}</span>
+        <span style="color:var(--musgo);font-weight:400">${count}</span>
+      </div>
+      ${col?'':`<div style="padding:0 10px 4px">${inner}</div>`}
+    </div>`;
+  };
+  // Decidir el nivel de agrupación según el volumen temporal de los datos.
+  const aniosSet = new Set(), mesesSet = new Set();
+  for(const [,g] of fechas){ const i = infoPeriodo(g.ts); aniosSet.add(i.anio); mesesSet.add(i.mes); }
+  const modo = aniosSet.size > 1 ? 'anio' : (mesesSet.size > 1 ? 'mes' : 'dia');
+  const cont = (arr, key)=> arr.reduce((s,[,g])=> s + g.puntos.length + g.tracks.length, 0);
+  let bloques;
+  if(modo === 'dia'){
+    bloques = fechas.map(([f,g])=> htmlDia(f,g)).join('');
+  } else if(modo === 'mes'){
+    // Agrupar los días por mes; el mes más reciente arranca expandido.
+    const meses = new Map();
+    for(const [f,g] of fechas){ const i = infoPeriodo(g.ts);
+      if(!meses.has(i.mes)) meses.set(i.mes, { label:i.mesLabel, ts:g.ts, dias:[] });
+      const m = meses.get(i.mes); if(g.ts>m.ts) m.ts=g.ts; m.dias.push([f,g]); }
+    const ord = [...meses.entries()].sort((a,b)=> b[1].ts - a[1].ts);
+    bloques = ord.map(([k,m],idx)=> wrapPeriodo(k, m.label, cont(m.dias), idx!==0,
+      m.dias.map(([f,g])=> htmlDia(f,g)).join(''), 1)).join('');
+  } else {
+    // Diferentes años: año → mes → día (dos niveles colapsables).
+    const anios = new Map();
+    for(const [f,g] of fechas){ const i = infoPeriodo(g.ts);
+      if(!anios.has(i.anio)) anios.set(i.anio, { ts:g.ts, meses:new Map() });
+      const A = anios.get(i.anio); if(g.ts>A.ts) A.ts=g.ts;
+      if(!A.meses.has(i.mes)) A.meses.set(i.mes, { label:i.mesLabel, ts:g.ts, dias:[] });
+      const M = A.meses.get(i.mes); if(g.ts>M.ts) M.ts=g.ts; M.dias.push([f,g]); }
+    const ordA = [...anios.entries()].sort((a,b)=> b[1].ts - a[1].ts);
+    bloques = ordA.map(([ak,A],ai)=>{
+      const totalA = [...A.meses.values()].reduce((s,m)=> s + cont(m.dias), 0);
+      let innerA = '';
+      if(periodoColapsado[ak]===undefined ? ai===0 : !periodoColapsado[ak]){
+        const ordM = [...A.meses.entries()].sort((a,b)=> b[1].ts - a[1].ts);
+        innerA = ordM.map(([mk,m],mi)=> wrapPeriodo(mk, m.label, cont(m.dias), mi!==0,
+          m.dias.map(([f,g])=> htmlDia(f,g)).join(''), 2)).join('');
+      }
+      return wrapPeriodo(ak, 'Año '+ak, totalA, ai!==0, innerA, 1);
+    }).join('');
+  }
 
   abrirPanel('Puntos y tracks', `
     ${total ? `<div class="fila">
@@ -2241,6 +2333,7 @@ async function panelDatos(){
   document.querySelectorAll('[data-vp]').forEach(b=> b.onclick = ()=> toggleVisElemento('puntos', S.puntos, b.dataset.vp));
   document.querySelectorAll('[data-vt]').forEach(b=> b.onclick = ()=> toggleVisElemento('tracks', S.tracks, b.dataset.vt));
   document.querySelectorAll('[data-vf]').forEach(b=> b.onclick = ()=> setVisFecha(b.dataset.vf, b.dataset.von==='1'));
+  document.querySelectorAll('[data-tp]').forEach(el=> el.onclick = ()=>{ const k=el.dataset.tp; periodoColapsado[k]=!periodoColapsado[k]; panelDatos(); });
   const vt=document.getElementById('verTodos'); if(vt) vt.onclick = ()=> setVisTodos(true);
   const ot=document.getElementById('ocuTodos'); if(ot) ot.onclick = ()=> setVisTodos(false);
   document.querySelectorAll('[data-dp]').forEach(b=> b.onclick = async ()=>{

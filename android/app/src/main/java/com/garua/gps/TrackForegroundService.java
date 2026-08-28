@@ -50,10 +50,15 @@ public class TrackForegroundService extends Service {
     // Estado consultable por la app.
     public static volatile boolean grabandoNativo = false;
     public static volatile int puntosNativos = 0;
+    public static volatile String provNativo = "";      // "fused" | "gps" | "network"
+    public static volatile float ultimaExacNativa = -1; // exactitud del último fix (m)
+    public static volatile long ultimoFixNativo = 0;    // timestamp del último fix recibido
 
     private PowerManager.WakeLock wakeLock;
     private LocationManager lm;
     private LocationListener listener;
+    private com.google.android.gms.location.FusedLocationProviderClient fused;
+    private com.google.android.gms.location.LocationCallback fusedCb;
     private long trackIni = 0;
     private double[] ultimoPt = null;   // [lat,lon] del último punto grabado (filtro de distancia)
     private long ultimoT = 0;           // timestamp del último punto grabado (filtro anti-salto)
@@ -138,28 +143,65 @@ public class TrackForegroundService extends Service {
         try { t.put("ini", trackIni); t.put("pts", new JSONArray()); t.put("fuente", "gps"); } catch (Exception ignored) {}
         escribir(archTrack(), t.toString());
 
-        if (listener != null) { try { lm.removeUpdates(listener); } catch (Exception ignored) {} }
+        quitarUpdates();
         // Hilo dedicado: los callbacks NO dependen del hilo principal de la app
         // (que se pausa/mata cuando la pantalla se apaga o la app se cierra).
         if (hilo == null || !hilo.isAlive()) {
             hilo = new android.os.HandlerThread("GpsTicoTrack");
             hilo.start();
         }
-        listener = new LocationListener() {
-            @Override public void onLocationChanged(Location loc) { onFixTrack(loc); }
-            @Override public void onProviderEnabled(String p) {}
-            @Override public void onProviderDisabled(String p) {}
-            @Override public void onStatusChanged(String p, int s, Bundle b) {}
-        };
+        // FUENTE PRIMARIA: FusedLocationProviderClient (Play Services) con máxima
+        // precisión. Es mucho más fiable que LocationManager crudo para seguir
+        // recibiendo fixes con la pantalla apagada / la app en segundo plano en
+        // los distintos fabricantes (Xiaomi, Samsung, Huawei…). Filtramos por
+        // exactitud igual que antes, así que no entran posiciones de celda/WiFi.
+        boolean fusedOk = false;
         try {
-            // 1 Hz, sin filtro de distancia nativo (lo hacemos nosotros con calidad).
-            lm.requestLocationUpdates(proveedor(), 1000L, 0f, listener, hilo.getLooper());
-        } catch (Exception e) { /* sin permiso o proveedor */ }
-        updateNotification(this, "Grabando… 0 pts (GPS)");
+            fused = com.google.android.gms.location.LocationServices.getFusedLocationProviderClient(this);
+            com.google.android.gms.location.LocationRequest req =
+                com.google.android.gms.location.LocationRequest.create();
+            req.setPriority(com.google.android.gms.location.LocationRequest.PRIORITY_HIGH_ACCURACY);
+            req.setInterval(1000L);
+            req.setFastestInterval(1000L);
+            fusedCb = new com.google.android.gms.location.LocationCallback() {
+                @Override public void onLocationResult(com.google.android.gms.location.LocationResult r) {
+                    if (r == null) return;
+                    Location l = r.getLastLocation();
+                    if (l != null) onFixTrack(l);
+                }
+            };
+            fused.requestLocationUpdates(req, fusedCb, hilo.getLooper());
+            provNativo = "fused";
+            fusedOk = true;
+        } catch (Throwable e) { fused = null; fusedCb = null; }
+        if (!fusedOk) {
+            // Fallback: LocationManager con GPS puro (equipos sin Play Services).
+            listener = new LocationListener() {
+                @Override public void onLocationChanged(Location loc) { onFixTrack(loc); }
+                @Override public void onProviderEnabled(String p) {}
+                @Override public void onProviderDisabled(String p) {}
+                @Override public void onStatusChanged(String p, int s, Bundle b) {}
+            };
+            try {
+                String prov = proveedor();
+                provNativo = LocationManager.NETWORK_PROVIDER.equals(prov) ? "network" : "gps";
+                lm.requestLocationUpdates(prov, 1000L, 0f, listener, hilo.getLooper());
+            } catch (Exception e) { /* sin permiso o proveedor */ }
+        }
+        updateNotification(this, "Grabando… 0 pts (" + provNativo + ")");
+    }
+
+    // Quita cualquier suscripción de ubicación activa (fused y/o LocationManager).
+    private void quitarUpdates() {
+        if (fusedCb != null && fused != null) { try { fused.removeLocationUpdates(fusedCb); } catch (Exception ignored) {} }
+        fusedCb = null; fused = null;
+        if (listener != null) { try { lm.removeUpdates(listener); } catch (Exception ignored) {} listener = null; }
     }
 
     private void onFixTrack(Location loc) {
         if (!grabandoNativo || loc == null) return;
+        ultimoFixNativo = System.currentTimeMillis();
+        ultimaExacNativa = loc.hasAccuracy() ? loc.getAccuracy() : -1;
         double lat = loc.getLatitude(), lon = loc.getLongitude();
         long tNow = loc.getTime() > 0 ? loc.getTime() : System.currentTimeMillis();
         // --- Filtros de calidad (evitan saltos extremos) ---
@@ -259,7 +301,7 @@ public class TrackForegroundService extends Service {
 
     private void detenerTrackNativo() {
         grabandoNativo = false;
-        if (listener != null) { try { lm.removeUpdates(listener); } catch (Exception ignored) {} listener = null; }
+        quitarUpdates();
         if (hilo != null) { try { hilo.quitSafely(); } catch (Exception ignored) {} hilo = null; }
     }
 

@@ -297,13 +297,44 @@ public class GnssPlugin extends Plugin {
         } catch (Exception e) { call.resolve(); }
     }
 
-    // Estado del servicio nativo (grabando por widget, cuántos puntos).
+    // Estado del servicio nativo (grabando, cuántos puntos, fuente y último fix).
     @PluginMethod
     public void estadoServicio(PluginCall call) {
         JSObject o = new JSObject();
         o.put("grabando", TrackForegroundService.grabandoNativo);
         o.put("puntos", TrackForegroundService.puntosNativos);
+        o.put("proveedor", TrackForegroundService.provNativo);
+        o.put("exactitud", TrackForegroundService.ultimaExacNativa);
+        long ult = TrackForegroundService.ultimoFixNativo;
+        o.put("segDesdeUltimoFix", ult > 0 ? (System.currentTimeMillis() - ult) / 1000 : -1);
         call.resolve(o);
+    }
+
+    // Lee el track que el servicio nativo está grabando SIN borrar el archivo.
+    // Sirve para fusionar los puntos capturados con la pantalla bloqueada al
+    // track activo mientras la grabación sigue en curso (lectura no destructiva).
+    @PluginMethod
+    public void leerTrackParcial(PluginCall call) {
+        JSObject o = new JSObject();
+        try {
+            java.io.File ft = new java.io.File(getContext().getFilesDir(), "pending_track.json");
+            if (ft.exists()) {
+                String s = leerArchivo(ft);
+                if (s != null) o.put("track", new org.json.JSONObject(s));
+            }
+        } catch (Exception e) { /* devolver lo que se pudo */ }
+        call.resolve(o);
+    }
+
+    // Descarta el buffer del track nativo (tras fusionarlo al detener), para que
+    // no se vuelva a importar como un track "de widget" separado.
+    @PluginMethod
+    public void descartarTrackParcial(PluginCall call) {
+        try {
+            java.io.File ft = new java.io.File(getContext().getFilesDir(), "pending_track.json");
+            if (ft.exists()) ft.delete();
+        } catch (Exception ignored) {}
+        call.resolve();
     }
 
     // Lee los archivos que dejó el servicio nativo y los devuelve para importar.
