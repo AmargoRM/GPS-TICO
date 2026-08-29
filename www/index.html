@@ -628,6 +628,41 @@ function featureOculto(capa, f){
   const v = f.properties ? String(f.properties[sim.campo]) : 'undefined';
   return !!sim.ocultas[v];
 }
+// Caché en RAM de las imágenes raster ya decodificadas (por id de capa).
+const rasterImgs = new Map();
+function rasterImg(capa){
+  let e = rasterImgs.get(capa.id);
+  if(!e){
+    const img = new Image();
+    e = { img, ok:false };
+    rasterImgs.set(capa.id, e);
+    img.onload = ()=>{ e.ok=true; dibujar(); };
+    img.onerror = ()=>{ e.ok=false; };
+    img.src = capa.png;
+  }
+  return e.ok ? e.img : null;
+}
+// Dibuja las capas raster (GeoTIFF) georreferenciadas, deformadas al mapa.
+function dibujarRasters(aPant){
+  for(const capa of S.capas){
+    if(!capa.visible || capa.tipo!=='raster' || !capa.esq) continue;
+    const img = rasterImg(capa); if(!img) continue;
+    const e = capa.esq;
+    const tl = aPant(e[0][1], e[0][0]);   // pixel (0,0)
+    const tr = aPant(e[1][1], e[1][0]);   // pixel (w,0)
+    const bl = aPant(e[2][1], e[2][0]);   // pixel (0,h)
+    const w = capa.rw, h = capa.rh;
+    const ax=(tr.x-tl.x)/w, ay=(tr.y-tl.y)/w;   // vector por columna
+    const bx=(bl.x-tl.x)/h, by=(bl.y-tl.y)/h;   // vector por fila
+    ctx.save();
+    ctx.globalAlpha = capa.opacidadRaster!=null ? capa.opacidadRaster : 1;
+    ctx.imageSmoothingEnabled = true;
+    ctx.transform(ax, ay, bx, by, tl.x, tl.y);   // compone sobre la escala DPR
+    try{ ctx.drawImage(img, 0, 0); }catch(err){}
+    ctx.restore();
+    ctx.globalAlpha = 1;
+  }
+}
 // Dibuja las capas vectoriales del usuario (GeoJSON/WFS) sobre el mapa,
 // recortando por el área visible para rendir con capas grandes.
 function dibujarCapasVector(aPant, vista){
@@ -853,6 +888,8 @@ function dibujar(){
   const mLon = (eLon-oLon)*0.1, mLat = (nLat-sLat)*0.1;
   const vista = { oLon:oLon-mLon, eLon:eLon+mLon, nLat:nLat+mLat, sLat:sLat-mLat };
 
+  // Capas raster (GeoTIFF) del usuario, debajo de los vectores.
+  dibujarRasters(aPant);
   // Capas vectoriales del usuario (GeoJSON / WFS), debajo de puntos y tracks.
   dibujarCapasVector(aPant, vista);
 
@@ -3465,7 +3502,7 @@ function panelProyeccion(capaId){
 }
 // Centra el mapa en la caja envolvente de una capa vectorial.
 function centrarEnCapa(capa){
-  if(capa.tipo==='big'){
+  if(capa.tipo==='big' || capa.tipo==='raster'){
     const b=capa.bb; if(!b || !isFinite(b[0])) return;
     S.centro.lon=(b[0]+b[2])/2; S.centro.lat=(b[1]+b[3])/2; S.seguir=false;
     const anchoLon=Math.max(1e-4, b[2]-b[0]); S.zoom=Math.max(3, Math.min(18, Math.log2(360/anchoLon)+0.5));
@@ -4031,10 +4068,360 @@ function chequearTamano(bytes){
   return true;
 }
 
-// Importa una capa desde un archivo del teléfono: GeoJSON, KML, KMZ, SHP o ZIP.
+/* =======================================================================
+   RASTER GEOTIFF  (lectura de .tif/.tiff georreferenciado, sin librerías)
+   Soporta: RGB(A) 8/16-bit, paleta, y una banda (gris / DEM float o entero)
+   con rampa de elevación. Compresión: none, LZW, Deflate, PackBits.
+   Georreferencia: ModelPixelScale+Tiepoint o ModelTransformation.
+   CRS: WGS84 (4326), Web Mercator (3857), CRTM05 (5367), Lambert N/S (5456/57)
+   o autodetección dentro de Costa Rica. Se rasteriza a máx ~2000 px de lado.
+   ======================================================================= */
+const RASTER_OUT_MAX = 2000;      // lado máx del raster rasterizado (px)
+const RASTER_PIX_MAX = 120e6;     // tope de píxeles de entrada (memoria)
+const RASTER_FILE_MAX = 160*1048576; // 160 MB de archivo
+
+// Descompresión Deflate (zlib) del WebView. Prueba con y sin cabecera zlib.
+async function _inflateRaster(bytes){
+  for(const fmt of ['deflate','deflate-raw']){
+    try{
+      const s = new Blob([bytes]).stream().pipeThrough(new DecompressionStream(fmt));
+      return new Uint8Array(await new Response(s).arrayBuffer());
+    }catch(e){}
+  }
+  throw new Error('deflate no disponible');
+}
+// PackBits (RLE de TIFF).
+function _packbits(b){
+  const out=[]; let i=0;
+  while(i<b.length){ let n=b[i++]; if(n>128) n-=256;
+    if(n>=0){ for(let j=0;j<=n && i<b.length;j++) out.push(b[i++]); }
+    else if(n!==-128){ const v=b[i++]; for(let j=0;j<1-n;j++) out.push(v); } }
+  return Uint8Array.from(out);
+}
+// LZW de TIFF (MSB-first, con "early change").
+function _lzwTiff(b){
+  const CLEAR=256, EOI=257; let dict, dictLen, cw, prev;
+  const out=[]; let buf=0, cnt=0, pos=0;
+  const read=()=>{ while(cnt<cw){ if(pos>=b.length) return EOI; buf=(buf<<8)|b[pos++]; cnt+=8; } cnt-=cw; return (buf>>cnt)&((1<<cw)-1); };
+  const init=()=>{ dict=new Array(4096); for(let i=0;i<256;i++) dict[i]=[i]; dictLen=258; cw=9; };
+  init(); prev=null;
+  for(;;){ const code=read(); if(code===EOI) break;
+    if(code===CLEAR){ init(); prev=null; continue; }
+    let entry;
+    if(code<dictLen && dict[code]) entry=dict[code];
+    else if(prev) entry=prev.concat(prev[0]); else break;
+    for(let i=0;i<entry.length;i++) out.push(entry[i]);
+    if(prev) dict[dictLen++]=prev.concat(entry[0]);
+    prev=entry;
+    if(dictLen+1 >= (1<<cw) && cw<12) cw++;
+  }
+  return Uint8Array.from(out);
+}
+// Convierte una coordenada del CRS del raster a WGS84 (lon/lat).
+function _crsRasterAWgs(X, Y, modo){
+  if(modo==='geo') return { lon:X, lat:Y };
+  if(modo==='webmerc'){
+    const R=20037508.342789244;
+    const lon = X/R*180;
+    let lat = Y/R*180;
+    lat = 180/Math.PI*(2*Math.atan(Math.exp(lat*Math.PI/180)) - Math.PI/2);
+    return { lon, lat };
+  }
+  const w = haciaWgs(X, Y, modo);   // crtm05 / ln / ls
+  return { lon:w.lon, lat:w.lat };
+}
+// Lee y decodifica un GeoTIFF. Devuelve {outW,outH,rgba,esq,bb,...} o lanza error.
+async function decodificarGeoTiff(ab){
+  const dv = new DataView(ab);
+  const bom = dv.getUint16(0, false);
+  const le = bom===0x4949;                 // 'II'=little-endian, 'MM'=big
+  if(!le && bom!==0x4D4D) throw new Error('No es un TIFF válido.');
+  const magic = dv.getUint16(2, le);
+  const big = magic===43;                  // BigTIFF
+  if(magic!==42 && magic!==43) throw new Error('No es un TIFF válido.');
+  // --- leer el primer IFD ---
+  const TSIZE=[0,1,1,2,4,8,1,1,2,4,8,4,8,0,0,0,8,8,8];
+  let ifdOff;
+  if(big){ /* BigTIFF: offset 64-bit en byte 8 */ ifdOff = Number(dv.getBigUint64(8, le)); }
+  else ifdOff = dv.getUint32(4, le);
+  const rd = (off,type)=>{
+    switch(type){
+      case 1: case 2: case 6: case 7: return dv.getUint8(off);
+      case 3: return dv.getUint16(off, le);
+      case 8: return dv.getInt16(off, le);
+      case 4: return dv.getUint32(off, le);
+      case 9: return dv.getInt32(off, le);
+      case 11: return dv.getFloat32(off, le);
+      case 12: return dv.getFloat64(off, le);
+      case 5: return dv.getUint32(off, le)/dv.getUint32(off+4, le);
+      case 10: return dv.getInt32(off, le)/dv.getInt32(off+4, le);
+      case 16: case 18: return Number(dv.getBigUint64(off, le));   // BigTIFF LONG8/IFD8
+      case 17: return Number(dv.getBigInt64(off, le));             // BigTIFF SLONG8
+      default: return dv.getUint8(off);
+    }
+  };
+  const entradas = new Map();
+  const nEnt = big ? Number(dv.getBigUint64(ifdOff, le)) : dv.getUint16(ifdOff, le);
+  const entBase = ifdOff + (big?8:2);
+  const entSize = big?20:12;
+  for(let i=0;i<nEnt;i++){
+    const e = entBase + i*entSize;
+    const tag = dv.getUint16(e, le), type = dv.getUint16(e+2, le);
+    const count = big ? Number(dv.getBigUint64(e+4, le)) : dv.getUint32(e+4, le);
+    const valOff = e + (big?12:8);
+    const tsz = TSIZE[type]||1;
+    const total = tsz*count;
+    let dataOff;
+    if(total <= (big?8:4)) dataOff = valOff;
+    else dataOff = big ? Number(dv.getBigUint64(valOff, le)) : dv.getUint32(valOff, le);
+    const vals = [];
+    if(type===2){ // ASCII
+      let s=''; for(let k=0;k<count;k++){ const ch=dv.getUint8(dataOff+k); if(ch) s+=String.fromCharCode(ch); }
+      entradas.set(tag, { type, count, ascii:s });
+      continue;
+    }
+    const maxLeer = Math.min(count, 100000);
+    for(let k=0;k<maxLeer;k++) vals.push(rd(dataOff + k*tsz, type));
+    entradas.set(tag, { type, count, vals, dataOff });
+  }
+  const g1 = t => { const e=entradas.get(t); return e && e.vals ? e.vals[0] : undefined; };
+  const gA = t => { const e=entradas.get(t); return e && e.vals ? e.vals : undefined; };
+
+  const w = g1(256), h = g1(257);
+  if(!w || !h) throw new Error('El TIFF no declara tamaño.');
+  if(w*h > RASTER_PIX_MAX) throw new Error('Raster enorme ('+(Math.round(w*h/1e6))+' MP). Reducilo o recórtalo en QGIS.');
+  const spp = g1(277) || 1;
+  const bitsArr = gA(258) || [8];
+  const bits = bitsArr[0] || 8;
+  const compresion = g1(259) || 1;
+  const photometric = g1(262)!=null ? g1(262) : (spp>=3?2:1);
+  const sampleFmt = (gA(339)||[1])[0];     // 1 uint, 2 int, 3 float
+  const predictor = g1(317) || 1;
+  const planar = g1(284) || 1;
+  const colorMap = gA(320);
+  const tileW = g1(322), tileL = g1(323);
+  const esTiled = !!(tileW && tileL);
+  const rowsPerStrip = g1(278) || h;
+  const offs = esTiled ? gA(324) : gA(273);
+  const cnts = esTiled ? gA(325) : gA(279);
+  if(!offs || !cnts) throw new Error('El TIFF no tiene strips/tiles legibles.');
+  // nodata (GDAL)
+  let nodata = null;
+  const gd = entradas.get(42113); if(gd && gd.ascii){ const v=parseFloat(gd.ascii); if(isFinite(v)) nodata=v; }
+
+  // --- georreferencia ---
+  const scale = gA(33550), tie = gA(33922), mtx = gA(34264);
+  let a=1,b0=0,c=0,d0=0,e0=-1,f=0;   // X=a*col+b*row+c ; Y=d*col+e*row+f
+  if(mtx && mtx.length>=16){
+    a=mtx[0]; b0=mtx[1]; c=mtx[3]; d0=mtx[4]; e0=mtx[5]; f=mtx[7];
+  } else if(scale && tie && tie.length>=6){
+    const sx=scale[0], sy=scale[1];
+    const I=tie[0], J=tie[1], X0=tie[3], Y0=tie[4];
+    a=sx; b0=0; c=X0 - I*sx; d0=0; e0=-sy; f=Y0 + J*sy;
+  } else {
+    throw new Error('El TIFF no está georreferenciado (sin tiepoint/scale ni matriz).');
+  }
+  const pix2crs = (col,row)=>[a*col + b0*row + c, d0*col + e0*row + f];
+
+  // --- CRS desde GeoKeyDirectory ---
+  let epsg=null, modo=null;
+  const gk = gA(34735);
+  if(gk){
+    for(let i=4;i+3<gk.length;i+=4){
+      const key=gk[i], loc=gk[i+1], val=gk[i+3];
+      if(loc===0 && (key===3072 || key===2048)){ epsg=val; break; }
+    }
+  }
+  const MAP={ 4326:'geo', 4258:'geo', 3857:'webmerc', 3785:'webmerc', 900913:'webmerc', 5367:'crtm05', 5456:'ln', 5457:'ls' };
+  if(epsg && MAP[epsg]) modo=MAP[epsg];
+  if(!modo){
+    // Autodetección: probar geo / proyecciones ticas por el centro del raster.
+    const [cx,cy]=pix2crs(w/2, h/2);
+    if(Math.abs(cx)<=180 && Math.abs(cy)<=90) modo='geo';
+    else { modo='crtm05';
+      for(const m of PROY_TICAS){ try{ const ww=haciaWgs(cx,cy,m);
+        if(ww.lat>=CR_BBOX.latMin&&ww.lat<=CR_BBOX.latMax&&ww.lon>=CR_BBOX.lonMin&&ww.lon<=CR_BBOX.lonMax){ modo=m; break; } }catch(_){}}
+    }
+  }
+
+  // --- salida (downsample para acotar memoria) ---
+  const step = Math.max(1, Math.ceil(Math.max(w,h)/RASTER_OUT_MAX));
+  const outW = Math.ceil(w/step), outH = Math.ceil(h/step);
+  const bytesPS = Math.ceil(bits/8);
+  const esFloat = sampleFmt===3;
+  const esGris = (photometric===0 || photometric===1) && photometric!==3 && spp<=2;
+  const usaPaleta = photometric===3 && colorMap;
+  const rgba = new Uint8ClampedArray(outW*outH*4);
+  const vals = esGris ? new Float32Array(outW*outH) : null;   // banda única (gris/DEM)
+  const valNodata = esGris ? new Uint8Array(outW*outH) : null;
+
+  // Lee un sample crudo desde una vista del bloque.
+  const leerSample = (bdv, off)=>{
+    if(bits===8) return sampleFmt===2 ? bdv.getInt8(off) : bdv.getUint8(off);
+    if(bits===16) return sampleFmt===2 ? bdv.getInt16(off, le) : bdv.getUint16(off, le);
+    if(bits===32) return esFloat ? bdv.getFloat32(off, le) : (sampleFmt===2 ? bdv.getInt32(off, le) : bdv.getUint32(off, le));
+    return bdv.getUint8(off);
+  };
+  // Descomprime un bloque (strip o tile) a bytes crudos.
+  const descomprimir = async (idx)=>{
+    const start = Number(offs[idx]); const len = Number(cnts[idx]);
+    let raw = new Uint8Array(ab, start, len);
+    if(compresion===1) raw = raw.slice();
+    else if(compresion===5) raw = _lzwTiff(raw);
+    else if(compresion===8 || compresion===32946) raw = await _inflateRaster(raw);
+    else if(compresion===32773) raw = _packbits(raw);
+    else if(compresion===7) throw new Error('TIFF con JPEG interno no soportado. Reexportá sin compresión JPEG.');
+    else throw new Error('Compresión TIFF '+compresion+' no soportada.');
+    return raw;
+  };
+  const aplicarPredictor = (buf, bw, bh)=>{
+    if(predictor!==2 || esFloat) return;   // solo diferenciación horizontal entera
+    const bdv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+    for(let r=0;r<bh;r++){
+      for(let x=1;x<bw;x++){
+        for(let s=0;s<spp;s++){
+          const o=((r*bw+x)*spp+s)*bytesPS, op=((r*bw+(x-1))*spp+s)*bytesPS;
+          if(bits===8) buf[o]=(buf[o]+buf[op])&0xFF;
+          else if(bits===16){ const v=(bdv.getUint16(o,le)+bdv.getUint16(op,le))&0xFFFF; bdv.setUint16(o,v,le); }
+        }
+      }
+    }
+  };
+  // Escribe un sample de origen (sx,sy) al pixel de salida (ox,oy).
+  const escribir = (bdv, baseOff, ox, oy)=>{
+    const oi = oy*outW+ox;
+    if(usaPaleta){
+      const n = 1<<bits; const idx = leerSample(bdv, baseOff);
+      const R=(colorMap[idx]||0)/257, G=(colorMap[n+idx]||0)/257, B=(colorMap[2*n+idx]||0)/257;
+      rgba[oi*4]=R; rgba[oi*4+1]=G; rgba[oi*4+2]=B; rgba[oi*4+3]=255;
+    } else if(esGris){
+      let v = leerSample(bdv, baseOff);
+      if(photometric===0 && !esFloat){ const mx=(1<<bits)-1; v=mx-v; }
+      const esND = (nodata!=null && v===nodata) || !isFinite(v) || (esFloat && (v<-1e30));
+      vals[oi]=v; valNodata[oi]=esND?1:0;
+    } else {
+      // RGB(A). Escalar a 8-bit si hace falta.
+      const esc = bits===8 ? 1 : (bits===16 ? 1/257 : 1);
+      const r0=leerSample(bdv, baseOff)*esc;
+      const g0=spp>1?leerSample(bdv, baseOff+bytesPS)*esc:r0;
+      const b1=spp>2?leerSample(bdv, baseOff+2*bytesPS)*esc:r0;
+      const al=spp>=4?leerSample(bdv, baseOff+3*bytesPS)*(bits===8?1:1/257):255;
+      rgba[oi*4]=r0; rgba[oi*4+1]=g0; rgba[oi*4+2]=b1; rgba[oi*4+3]=al;
+    }
+  };
+
+  if(planar!==1 && spp>1 && !esGris && !usaPaleta)
+    throw new Error('TIFF planar (bandas separadas) no soportado. Reexportá como "interleaved".');
+
+  if(esTiled){
+    const across = Math.ceil(w/tileW), down = Math.ceil(h/tileL);
+    for(let ty=0; ty<down; ty++){
+      for(let tx=0; tx<across; tx++){
+        const idx = ty*across+tx; if(idx>=offs.length) continue;
+        let buf; try{ buf = await descomprimir(idx); }catch(err){ if(tx===0&&ty===0) throw err; continue; }
+        aplicarPredictor(buf, tileW, tileL);
+        const bdv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+        const bx0=tx*tileW, by0=ty*tileL;
+        const ox0=Math.ceil(bx0/step), ox1=Math.min(outW-1, Math.floor((Math.min(bx0+tileW,w)-1)/step));
+        const oy0=Math.ceil(by0/step), oy1=Math.min(outH-1, Math.floor((Math.min(by0+tileL,h)-1)/step));
+        for(let oy=oy0; oy<=oy1; oy++){ const sy=oy*step; const ly=sy-by0; if(ly<0||ly>=tileL) continue;
+          for(let ox=ox0; ox<=ox1; ox++){ const sx=ox*step; const lx=sx-bx0; if(lx<0||lx>=tileW) continue;
+            escribir(bdv, (ly*tileW+lx)*spp*bytesPS, ox, oy); } }
+      }
+    }
+  } else {
+    const nStrips = offs.length;
+    for(let si=0; si<nStrips; si++){
+      let buf; try{ buf = await descomprimir(si); }catch(err){ if(si===0) throw err; continue; }
+      const by0 = si*rowsPerStrip; const bh = Math.min(rowsPerStrip, h-by0);
+      aplicarPredictor(buf, w, bh);
+      const bdv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+      const oy0=Math.ceil(by0/step), oy1=Math.min(outH-1, Math.floor((by0+bh-1)/step));
+      for(let oy=oy0; oy<=oy1; oy++){ const sy=oy*step; const ly=sy-by0; if(ly<0||ly>=bh) continue;
+        for(let ox=0; ox<outW; ox++){ const sx=Math.min(w-1, ox*step);
+          escribir(bdv, (ly*w+sx)*spp*bytesPS, ox, oy); } }
+    }
+  }
+
+  // Colorizar banda única (gris o DEM) con rampa según min/max.
+  let vmin=null, vmax=null;
+  if(esGris){
+    for(let i=0;i<vals.length;i++){ if(valNodata[i]) continue; const v=vals[i]; if(vmin==null||v<vmin)vmin=v; if(vmax==null||v>vmax)vmax=v; }
+    if(vmin==null){ vmin=0; vmax=1; }
+    const rango = (vmax-vmin)||1;
+    const dem = esFloat || bits>=16;   // rampa de elevación para DEM; gris para imagen
+    for(let i=0;i<vals.length;i++){
+      if(valNodata[i]){ rgba[i*4+3]=0; continue; }
+      const t=(vals[i]-vmin)/rango;
+      let R,G,B;
+      if(dem){ const c=_rampaDEM(t); R=c[0]; G=c[1]; B=c[2]; }
+      else { R=G=B=Math.round(t*255); }
+      rgba[i*4]=R; rgba[i*4+1]=G; rgba[i*4+2]=B; rgba[i*4+3]=255;
+    }
+  }
+
+  // Esquinas en WGS84 (tl, tr, bl) + bbox.
+  const esqPix = [[0,0],[w,0],[0,h],[w,h]];
+  const esqLL = esqPix.map(([col,row])=>{ const [X,Y]=pix2crs(col,row); return _crsRasterAWgs(X,Y,modo); });
+  let bb=[Infinity,Infinity,-Infinity,-Infinity];
+  for(const p of esqLL){ if(p.lon<bb[0])bb[0]=p.lon; if(p.lat<bb[1])bb[1]=p.lat; if(p.lon>bb[2])bb[2]=p.lon; if(p.lat>bb[3])bb[3]=p.lat; }
+  const esq = [[esqLL[0].lon,esqLL[0].lat],[esqLL[1].lon,esqLL[1].lat],[esqLL[2].lon,esqLL[2].lat]];
+  // Resolución aproximada (m/px) para el análisis.
+  const resX = Math.abs(a) * (modo==='geo' ? 111320 : 1);
+  return { outW, outH, rgba, esq, bb, epsg, crsModo:modo,
+           w, h, spp, bits, esDEM: esGris && (esFloat||bits>=16), min:vmin, max:vmax,
+           resX, compresion };
+}
+// Rampa de color para DEM (azul→verde→amarillo→marrón→blanco).
+function _rampaDEM(t){
+  t=Math.max(0,Math.min(1,t));
+  const paradas=[[0,[0,90,160]],[0.25,[40,160,120]],[0.5,[220,210,120]],[0.75,[150,100,50]],[1,[245,245,245]]];
+  for(let i=1;i<paradas.length;i++){ if(t<=paradas[i][0]){
+    const [t0,c0]=paradas[i-1], [t1,c1]=paradas[i]; const f=(t-t0)/((t1-t0)||1);
+    return [Math.round(c0[0]+(c1[0]-c0[0])*f), Math.round(c0[1]+(c1[1]-c0[1])*f), Math.round(c0[2]+(c1[2]-c0[2])*f)]; } }
+  return paradas[paradas.length-1][1];
+}
+// Importa un GeoTIFF como capa raster.
+async function agregarCapaRaster(nombre, ab){
+  if(ab.byteLength > RASTER_FILE_MAX){ toast('TIFF demasiado grande (> 160 MB). Recórtalo o bajá la resolución en QGIS.'); return; }
+  if(typeof DecompressionStream==='undefined'){ /* solo afecta a los comprimidos con Deflate */ }
+  mostrarCargando('Analizando raster…');
+  try{
+    const r = await decodificarGeoTiff(ab);
+    // Rasterizar la salida a un PNG (canvas) para dibujarlo georreferenciado.
+    const cv = document.createElement('canvas'); cv.width=r.outW; cv.height=r.outH;
+    const cx = cv.getContext('2d');
+    cx.putImageData(new ImageData(r.rgba, r.outW, r.outH), 0, 0);
+    const png = cv.toDataURL('image/png');
+    const capa = {
+      id:nid(), nombre, tipo:'raster', visible:true, consultable:false,
+      png, rw:r.outW, rh:r.outH, esq:r.esq, bb:r.bb,
+      epsg:r.epsg||null, crsModo:r.crsModo, w:r.w, h:r.h, bandas:r.spp, bits:r.bits,
+      esDEM:r.esDEM, min:(r.min!=null?r.min:null), max:(r.max!=null?r.max:null),
+      resX:r.resX, opacidadRaster:1, orden:S.capas.length
+    };
+    await dbPut('capas', capa); S.capas.push(capa);
+    centrarEnCapa(capa); dibujar(); panelCapas();
+    const crsTxt = capa.epsg ? ('EPSG:'+capa.epsg) : (capa.crsModo==='geo'?'WGS84':capa.crsModo.toUpperCase());
+    const anal = capa.esDEM
+      ? `DEM · ${r.w}×${r.h} · ${crsTxt} · alturas ${r.min!=null?r.min.toFixed(0):'?'}–${r.max!=null?r.max.toFixed(0):'?'} m`
+      : `Raster ${r.w}×${r.h} · ${r.spp} banda(s) · ${r.bits}-bit · ${crsTxt}`;
+    toast('Capa raster "'+nombre+'": '+anal+'.');
+  }catch(e){
+    toast('No se pudo leer el GeoTIFF: '+((e&&e.message)||e));
+  }finally{ ocultarCargando(); }
+}
+
+// Importa una capa desde un archivo del teléfono: GeoJSON, KML, KMZ, SHP, ZIP o GeoTIFF.
 async function agregarCapaArchivo(file){
-  const nombre = file.name.replace(/\.(geojson|json|kml|kmz|shp|zip)$/i,'');
+  const nombre = file.name.replace(/\.(geojson|json|kml|kmz|shp|zip|tif|tiff|geotiff|dxf)$/i,'');
   const ext = (file.name.split('.').pop()||'').toLowerCase();
+  // GeoTIFF raster: se decodifica y se adjunta como capa (antes del límite de
+  // tamaño clásico; el decodificador tiene su propio tope y downsampling).
+  if(ext==='tif' || ext==='tiff' || ext==='geotiff'){
+    await agregarCapaRaster(nombre, await file.arrayBuffer());
+    return;
+  }
   // GeoJSON grande → motor compacto en streaming (soporta 80 MB y más).
   if(ext==='geojson' || ext==='json'){
     if(file.size!=null && file.size > BIG_MAX){ toast('Archivo enorme (> ~400 MB). Dividilo por zona.'); return; }
@@ -5497,6 +5884,7 @@ async function borrarCapa(id){
   await dbDel('capas', id); S.capas = S.capas.filter(x=>x.id!==id);
   if(c && c.tipo==='wms'){ for(const k of Array.from(memTiles.keys())) if(k.startsWith('wms_'+id+'/')) memTiles.delete(k); }
   if(c && c.tipo==='big'){ await _borrarBigProps(id); }
+  if(c && c.tipo==='raster'){ rasterImgs.delete(id); }
   dibujar(); panelCapas();
 }
 /* --- Simbología por atributo --- */
@@ -5681,6 +6069,27 @@ async function moverCapa(id, dir){
   dibujar(); panelCapas();
 }
 function renderFilaCapa(c, idx, total){
+  // Raster (GeoTIFF): fila propia con controles básicos (no consultable).
+  if(c.tipo==='raster'){
+    const crsTxt = c.epsg ? ('EPSG:'+c.epsg) : (c.crsModo==='geo'?'WGS84':(c.crsModo||'').toUpperCase());
+    const det = c.esDEM
+      ? `DEM ${c.w}×${c.h} · ${crsTxt}${c.min!=null?' · '+c.min.toFixed(0)+'–'+(c.max!=null?c.max.toFixed(0):'?')+' m':''}`
+      : `Raster ${c.w}×${c.h} · ${c.bandas||'?'} banda(s) · ${crsTxt}`;
+    return `<div class="fila">
+      <div style="display:flex;flex-direction:column;gap:2px">
+        <button class="mini" data-up="${c.id}" ${idx===0?'disabled style="opacity:.3"':''} title="Subir">▲</button>
+        <button class="mini" data-dn="${c.id}" ${idx===total-1?'disabled style="opacity:.3"':''} title="Bajar">▼</button>
+      </div>
+      <div class="cuerpo"><div class="t">🖼 ${escHtml(c.nombre)}</div><div class="s">${det}</div></div>
+      <div style="display:flex;flex-direction:column;gap:4px">
+        <button class="mini ${c.visible?'verde':''}" data-tg="${c.id}">${c.visible?'Ver':'off'}</button>
+        <button class="mini" data-rop="${c.id}" title="Opacidad">◐</button>
+        <button class="mini" data-gr="${c.id}" title="Cambiar grupo">📁</button>
+      </div>
+      <button class="mini" data-cir="${c.id}" title="Ir a la capa" style="align-self:center">◎</button>
+      <button class="mini rojo" data-bc="${c.id}">×</button>
+    </div>`;
+  }
   const nElem = c.tipo==='wms' ? 'WMS' : c.tipo==='big' ? ('Grande · '+c.nFeats+' elem.') : 'Vector · '+((c.geojson&&c.geojson.features||[]).length)+' elem.';
   const online = !!(c.fuenteTipo || c.tipo==='wms');
   const fechaFmt = c.fuenteFecha ? ' · desde ' + new Date(c.fuenteFecha).toLocaleDateString('es-CR') : '';
@@ -5752,10 +6161,10 @@ function panelCapas(){
       <option value="wms">WMS (servicio) — escanear capas</option>
       <option value="wfs">WFS (servicio) — escanear capas</option>
       <option value="geojson_url">GeoJSON (enlace directo)</option>
-      <option value="file">Archivo del teléfono (GeoJSON · KML · KMZ · SHP · ZIP · DXF)</option>
+      <option value="file">Archivo del teléfono (GeoJSON · KML · KMZ · SHP · ZIP · DXF · GeoTIFF)</option>
     </select>
     <div id="capForm"></div>
-    <div class="nota">Pegá el enlace del <b>servicio</b> WMS/WFS (el mismo que usás en QGIS) y tocá <b>Escanear</b>: la app lista las capas disponibles para elegir. Las descargas van por HTTP nativo, así que sirve aunque el servidor no permita CORS. <b>Shapefile</b>: subí el <b>.zip</b> completo (con .shp, .dbf y .prj). <b>Proyección automática</b>: si la capa viene en CRTM05 o Lambert, la app lo detecta, la convierte a WGS84 y vuela a la zona sola; si se equivoca, corregila con 🌐. <b>GeoJSON grande</b> (80 MB o más): se carga con un motor compacto que sólo dibuja/consulta lo visible; usá esta opción de <b>archivo</b> (no "abrir con" del sistema). En capas grandes no hay etiqueta ni tabla completa; sí color, consulta al tocar y estilo.</div>
+    <div class="nota">Pegá el enlace del <b>servicio</b> WMS/WFS (el mismo que usás en QGIS) y tocá <b>Escanear</b>: la app lista las capas disponibles para elegir. Las descargas van por HTTP nativo, así que sirve aunque el servidor no permita CORS. <b>Shapefile</b>: subí el <b>.zip</b> completo (con .shp, .dbf y .prj). <b>Proyección automática</b>: si la capa viene en CRTM05 o Lambert, la app lo detecta, la convierte a WGS84 y vuela a la zona sola; si se equivoca, corregila con 🌐. <b>GeoJSON grande</b> (80 MB o más): se carga con un motor compacto que sólo dibuja/consulta lo visible; usá esta opción de <b>archivo</b> (no "abrir con" del sistema). En capas grandes no hay etiqueta ni tabla completa; sí color, consulta al tocar y estilo. <b>GeoTIFF</b> (.tif/.tiff): raster georreferenciado (ortofoto o modelo de elevación DEM). Se detecta el CRS (WGS84, Web Mercator, CRTM05 o Lambert), se analiza y se dibuja sobre el mapa; se reescala a máx 2000 px de lado. Compresión soportada: sin comprimir, LZW, Deflate y PackBits (no JPEG interno). Los DEM se colorean con rampa de elevación y muestran altura mín/máx. Ajustá la opacidad con ◐.</div>
   `);
   document.querySelectorAll('[data-tg]').forEach(b=> b.onclick = ()=> toggleCapa(b.dataset.tg));
   document.querySelectorAll('[data-tq]').forEach(b=> b.onclick = ()=> toggleConsultable(b.dataset.tq));
@@ -5783,11 +6192,19 @@ function panelCapas(){
   document.querySelectorAll('[data-pj]').forEach(b=> b.onclick = ()=> panelProyeccion(b.dataset.pj));
   document.querySelectorAll('[data-cir]').forEach(b=> b.onclick = ()=>{ const c=S.capas.find(x=>x.id===b.dataset.cir); if(c){ centrarEnCapa(c); cerrarPanel(); dibujar(); } });
   document.querySelectorAll('[data-bc]').forEach(b=> b.onclick = ()=> borrarCapa(b.dataset.bc));
+  document.querySelectorAll('[data-rop]').forEach(b=> b.onclick = async ()=>{
+    const c = S.capas.find(x=>x.id===b.dataset.rop); if(!c) return;
+    const seq = [1, 0.6, 0.3]; const cur = c.opacidadRaster!=null?c.opacidadRaster:1;
+    const i = seq.findIndex(v=> Math.abs(v-cur)<0.01);
+    c.opacidadRaster = seq[(i+1)%seq.length];
+    await dbPut('capas', c); dibujar();
+    toast('Opacidad del raster: '+Math.round(c.opacidadRaster*100)+'%');
+  });
   const sel = document.getElementById('capTipo');
   const render = ()=>{
     const cf = document.getElementById('capForm');
     if(sel.value==='file'){
-      cf.innerHTML = `<input type="file" id="capFile" accept=".geojson,.json,.kml,.kmz,.shp,.zip,.dxf,application/geo+json,application/json,application/vnd.google-earth.kml+xml,application/vnd.google-earth.kmz,application/zip,application/dxf,image/vnd.dxf" style="margin-top:8px">
+      cf.innerHTML = `<input type="file" id="capFile" accept=".geojson,.json,.kml,.kmz,.shp,.zip,.dxf,.tif,.tiff,.geotiff,application/geo+json,application/json,application/vnd.google-earth.kml+xml,application/vnd.google-earth.kmz,application/zip,application/dxf,image/vnd.dxf,image/tiff" style="margin-top:8px">
         <button class="ancho" id="capAdd">Agregar archivo</button>`;
       document.getElementById('capAdd').onclick = ()=>{ const f=document.getElementById('capFile').files[0]; if(!f){toast('Elegí un archivo.');return;} agregarCapaArchivo(f); };
     } else if(sel.value==='geojson_url'){
