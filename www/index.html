@@ -1230,6 +1230,16 @@ async function abrirArchivoImportado(f){
   // GeoJSON grande abierto desde el sistema: nativo copió a caché y pasó la
   // RUTA; se transmite por el motor compacto (sin cargar todo en memoria).
   if(f.kind==='geojsonpath'){ await importarGeoJSONDesdePath((f.name||'capa').replace(/\.(geojson|json)$/i,''), f.text); return; }
+  // GeoTIFF abierto desde el sistema ("Abrir con"): el nativo lo copió a caché y
+  // pasó la RUTA (f.text). Se lee como binario y se adjunta como capa raster.
+  if(f.kind==='rasterpath'){
+    try{
+      const url = (window.Capacitor && window.Capacitor.convertFileSrc) ? window.Capacitor.convertFileSrc(f.text) : f.text;
+      const resp = await fetch(url); const ab = await resp.arrayBuffer();
+      await agregarCapaRaster((f.name||'raster').replace(/\.(tif|tiff|geotiff)$/i,''), ab);
+    }catch(e){ toast('No se pudo abrir el raster: '+((e&&e.message)||e)); }
+    return;
+  }
   if(f.kind==='toobig'){ toast('Ese archivo es muy grande para abrirlo así. Agregalo desde Capas → Archivo del teléfono.'); return; }
   if(!f.text) return;
   if(!chequearTamano(f.text.length)) return;   // evita OOM con archivos enormes
@@ -4415,11 +4425,21 @@ async function agregarCapaRaster(nombre, ab){
 // Importa una capa desde un archivo del teléfono: GeoJSON, KML, KMZ, SHP, ZIP o GeoTIFF.
 async function agregarCapaArchivo(file){
   const nombre = file.name.replace(/\.(geojson|json|kml|kmz|shp|zip|tif|tiff|geotiff|dxf)$/i,'');
-  const ext = (file.name.split('.').pop()||'').toLowerCase();
-  // GeoTIFF raster: se decodifica y se adjunta como capa (antes del límite de
-  // tamaño clásico; el decodificador tiene su propio tope y downsampling).
-  if(ext==='tif' || ext==='tiff' || ext==='geotiff'){
-    await agregarCapaRaster(nombre, await file.arrayBuffer());
+  let ext = (file.name.split('.').pop()||'').toLowerCase();
+  // GeoTIFF raster por extensión O por firma (los gestores que reportan MIME
+  // genérico suelen entregar el archivo sin extensión útil). TIFF empieza con
+  // "II*\0" (49 49 2A 00) o "MM\0*" (4D 4D 00 2A).
+  let esTiff = (ext==='tif' || ext==='tiff' || ext==='geotiff');
+  const conocidas = ['geojson','json','kml','kmz','shp','zip','dxf'];
+  if(!esTiff && !conocidas.includes(ext)){
+    try{
+      const h = new Uint8Array(await file.slice(0,4).arrayBuffer());
+      if((h[0]===0x49&&h[1]===0x49&&h[2]===0x2A&&h[3]===0x00) ||
+         (h[0]===0x4D&&h[1]===0x4D&&h[2]===0x00&&h[3]===0x2A)) esTiff=true;
+    }catch(e){}
+  }
+  if(esTiff){
+    await agregarCapaRaster(nombre || 'raster', await file.arrayBuffer());
     return;
   }
   // GeoJSON grande → motor compacto en streaming (soporta 80 MB y más).
@@ -6204,7 +6224,11 @@ function panelCapas(){
   const render = ()=>{
     const cf = document.getElementById('capForm');
     if(sel.value==='file'){
-      cf.innerHTML = `<input type="file" id="capFile" accept=".geojson,.json,.kml,.kmz,.shp,.zip,.dxf,.tif,.tiff,.geotiff,application/geo+json,application/json,application/vnd.google-earth.kml+xml,application/vnd.google-earth.kmz,application/zip,application/dxf,image/vnd.dxf,image/tiff" style="margin-top:8px">
+      // accept="*/*": en Android muchos gestores reportan .tif/.shp/.dxf como
+      // "application/octet-stream" y un accept específico los deja sin poder
+      // seleccionar (en gris). Aceptamos todo y validamos por extensión/firma.
+      cf.innerHTML = `<input type="file" id="capFile" accept="*/*" style="margin-top:8px">
+        <div class="nota" style="margin-top:6px">Elegí el archivo. Formatos: GeoJSON · KML · KMZ · SHP · ZIP · DXF · <b>GeoTIFF (.tif/.tiff)</b>. Si tu gestor no lo muestra, buscalo en "Archivos" o en la carpeta donde lo guardaste.</div>
         <button class="ancho" id="capAdd">Agregar archivo</button>`;
       document.getElementById('capAdd').onclick = ()=>{ const f=document.getElementById('capFile').files[0]; if(!f){toast('Elegí un archivo.');return;} agregarCapaArchivo(f); };
     } else if(sel.value==='geojson_url'){

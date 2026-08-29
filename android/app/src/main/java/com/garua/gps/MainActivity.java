@@ -41,6 +41,24 @@ public class MainActivity extends BridgeActivity {
             String nombre = nombreDe(uri);
             String lower = nombre != null ? nombre.toLowerCase() : "";
             String nom = nombre != null ? nombre : "archivo";
+            String mime = intent.getType();
+            // GeoTIFF: binario. Se copia a caché y se entrega la RUTA (rasterpath)
+            // para que JS lo lea como bytes. Detección por extensión o por MIME.
+            boolean esTiff = lower.endsWith(".tif") || lower.endsWith(".tiff") || lower.endsWith(".geotiff")
+                             || (mime != null && mime.toLowerCase().contains("tiff"));
+            if (esTiff) {
+                java.io.File out = new java.io.File(getCacheDir(), "import_" + System.currentTimeMillis() + ".tif");
+                java.io.InputStream in = getContentResolver().openInputStream(uri);
+                if (in == null) return;
+                java.io.FileOutputStream fos = new java.io.FileOutputStream(out);
+                byte[] tb = new byte[65536]; int tn;
+                while ((tn = in.read(tb)) > 0) fos.write(tb, 0, tn);
+                fos.flush(); fos.close(); in.close();
+                String rn = (nombre != null && !lower.endsWith(".tif") && !lower.endsWith(".tiff") && !lower.endsWith(".geotiff")) ? (nom + ".tif") : nom;
+                if (frio) FileOpenBridge.setPending(rn, "rasterpath", out.getAbsolutePath());
+                else FileOpenBridge.deliver(rn, "rasterpath", out.getAbsolutePath());
+                return;
+            }
             boolean esGeojson = lower.endsWith(".geojson") || lower.endsWith(".json");
             if (esGeojson) {
                 java.io.File out = new java.io.File(getCacheDir(), "import_" + System.currentTimeMillis() + ".geojson");
