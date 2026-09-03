@@ -2760,10 +2760,17 @@ async function bajar(nom, txt, tipo){
   // Escribimos el archivo con Filesystem y abrimos el menú Compartir.
   if(P && P.Filesystem){
     try{
+      // IMPORTANTE: escribir en CACHE, no en DATA. El FileProvider
+      // (res/xml/file_paths.xml) solo expone la carpeta de caché por
+      // completo (<cache-path path="."/>); la carpeta interna DATA no está
+      // expuesta, así que su file:// no se puede convertir a un content://
+      // legible por otras apps. Al compartir un archivo de DATA a WhatsApp,
+      // este recibía un flujo vacío y avisaba "no se puede enviar un mensaje
+      // vacío". Desde CACHE el archivo llega correctamente adjunto.
       const res = await P.Filesystem.writeFile({
         path: safe,
         data: txt,
-        directory: 'DATA',
+        directory: 'CACHE',
         encoding: 'utf8'
       });
       if(P.Share){
