@@ -5335,13 +5335,23 @@ function puntoParaNube(p){
 }
 // Formato del track para enviar al proxy: la geometría LineString viaja en `geojson`.
 function trackParaNube(t){
+  // Coordenadas del track: preferimos las del geojson guardado; si no, las de pts.
+  const gjCoords = (t.geojson && t.geojson.geometry && Array.isArray(t.geojson.geometry.coordinates))
+                   ? t.geojson.geometry.coordinates : null;
+  const coords = (gjCoords && gjCoords.length) ? gjCoords : ((t.pts||[]).map(pt=>[pt.lon, pt.lat]));
+  // Una LineString válida en PostGIS necesita AL MENOS 2 vértices. Con 0 o 1
+  // punto, ST_GeomFromGeoJSON lanza en el Worker y hacía fallar TODO el lote:
+  // por eso, con varios tracks el mismo día, solo se guardaban los anteriores
+  // al primer track degenerado. Si no hay 2 vértices, se manda geometry:null
+  // (el track se guarda igual, sin línea) y el resto del lote no se ve afectado.
+  const geom = (coords.length >= 2) ? { type:'LineString', coordinates: coords } : null;
   return { id:t.id, proy:t.proy||null,
            nombre: t.nom || '',
            detalle: t.desc || '',
            fecha: new Date(t.ini || t.t || Date.now()).toISOString(),
            distancia_m: t.dist!=null ? t.dist : null,
            n_puntos: (t.pts && t.pts.length) || 0,
-           geojson: t.geojson || (t.pts ? { type:'Feature', geometry:{ type:'LineString', coordinates: t.pts.map(pt=>[pt.lon, pt.lat]) }, properties:{ nom:t.nom, dist:t.dist } } : null) };
+           geojson: { type:'Feature', geometry: geom, properties:{ nom:t.nom, dist:t.dist } } };
 }
 // POST al proxy con validación ESTRICTA: solo consideramos éxito si HTTP 2xx
 // y el JSON trae ok:true. Cualquier otra cosa (Worker viejo, error de red,

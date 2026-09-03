@@ -402,16 +402,17 @@ export default {
             `SELECT id FROM tracks_borrados WHERE id = ANY($1::text[])`, [ids]);
           for (const row of (r.rows || r)) borrados.add(row.id);
         }
-        let n = 0, ignorados = 0;
-        for (const t of tracks) {
-          if (borrados.has(t.id)) { ignorados++; continue; }
-          const gj = t.geojson ? JSON.stringify(t.geojson) : null;
+        // Inserta un track. Si `conGeom` es false, guarda geom NULL (para tracks
+        // cuya geometría no es una LineString válida — 0 o 1 vértice).
+        async function insertarTrack(t, gj, conGeom) {
+          const geomExpr = conGeom
+            ? `CASE WHEN $8::text IS NULL THEN NULL
+                    ELSE ST_SetSRID(ST_GeomFromGeoJSON(($8::jsonb)->>'geometry'), 4326) END`
+            : `NULL`;
           await sql(
             `INSERT INTO tracks (id, proy, nombre, detalle, fecha, distancia_m, n_puntos, geojson, geom)
              VALUES ($1::text, $2::text, $3::text, $4::text, $5::timestamptz,
-                     $6::double precision, $7::integer, $8::jsonb,
-                     CASE WHEN $8::text IS NULL THEN NULL
-                          ELSE ST_SetSRID(ST_GeomFromGeoJSON(($8::jsonb)->>'geometry'), 4326) END)
+                     $6::double precision, $7::integer, $8::jsonb, ${geomExpr})
              ON CONFLICT (id) DO UPDATE SET
                nombre = EXCLUDED.nombre,
                detalle = EXCLUDED.detalle,
@@ -423,10 +424,29 @@ export default {
             [t.id, t.proy || null, t.nombre || '', t.detalle || '', t.fecha || new Date().toISOString(),
              t.distancia_m ?? null, t.n_puntos ?? null, gj]
           );
-          n++;
+        }
+        let n = 0, ignorados = 0, fallidos = 0; const errores = [];
+        for (const t of tracks) {
+          if (borrados.has(t.id)) { ignorados++; continue; }
+          const gj = t.geojson ? JSON.stringify(t.geojson) : null;
+          try {
+            await insertarTrack(t, gj, true);
+            n++;
+          } catch (e) {
+            // Una geometría inválida (LineString con <2 vértices, etc.) NO debe
+            // tumbar todo el lote ni bloquear a los demás tracks del día:
+            // reintentamos guardando el track SIN geometría (geom NULL).
+            try {
+              await insertarTrack(t, gj, false);
+              n++;
+            } catch (e2) {
+              fallidos++;
+              if (errores.length < 5) errores.push(String(t.id) + ': ' + (e2.message || e2));
+            }
+          }
         }
         await refrescarVistasPorDia();
-        return json({ ok: true, recibidos: n, ignorados_borrados: ignorados });
+        return json({ ok: true, recibidos: n, fallidos, errores, ignorados_borrados: ignorados });
       }
 
       // Lista de IDs borrados desde la última consulta. La app la usa para
