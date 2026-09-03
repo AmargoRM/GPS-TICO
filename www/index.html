@@ -2258,6 +2258,20 @@ function infoPeriodo(ts){
     mesLabel: mesLbl.charAt(0).toUpperCase()+mesLbl.slice(1)   // "Agosto de 2026"
   };
 }
+// Clave e etiqueta de período para exportar por día / mes / año.
+function claveDiaISO(ts){ const d=new Date(ts||0); if(isNaN(d.getTime())) return ''; return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0'); }
+function clavePeriodo(ts, modo){
+  const ip = infoPeriodo(ts);
+  if(modo==='anio') return ip.anio;
+  if(modo==='mes')  return ip.mes;
+  return claveDiaISO(ts);   // día
+}
+function etiquetaPeriodo(ts, modo){
+  const d = new Date(ts||0);
+  if(modo==='anio') return String(d.getFullYear());
+  if(modo==='mes')  return infoPeriodo(ts).mesLabel;
+  return isNaN(d.getTime()) ? 'Sin fecha' : d.toLocaleDateString('es-CR');
+}
 
 async function fijarVis(store, arr, id, vis){
   const it = arr.find(x=>x.id===id); if(!it) return;
@@ -2572,11 +2586,37 @@ async function panelOffline(){
 }
 
 /* --- exportar --- */
-function panelExport(){
+async function panelExport(){
   if(!S.proy){ toast('Sin proyecto activo.'); return; }
+  // Fuente de verdad: releer del almacenamiento local (IndexedDB). Evita que
+  // por un estado en memoria desincronizado la exportación diga "sin datos"
+  // aunque los puntos SÍ existan guardados.
+  try{
+    S.puntos = await porIndice('puntos','proy',S.proy.id) || [];
+    S.tracks = await porIndice('tracks','proy',S.proy.id) || [];
+  }catch(e){ console.error('Exportar: recarga de datos', e); }
+
+  // Períodos presentes (día/mes/año) según las fechas de puntos y tracks.
+  const fechados = [...S.puntos.map(tsPunto), ...S.tracks.map(tsTrack)].filter(Boolean);
+  const opcionesPeriodo = (modo)=>{
+    const vis = new Map();   // clave -> {label, n}
+    for(const p of S.puntos){ const k=clavePeriodo(tsPunto(p),modo); if(!vis.has(k)) vis.set(k,{label:etiquetaPeriodo(tsPunto(p),modo),n:0}); vis.get(k).n++; }
+    return [...vis.entries()].sort((a,b)=> b[0]<a[0]?-1:1)   // más reciente primero
+      .map(([k,v])=>`<option value="${k}">${escHtml(v.label)} · ${v.n} pt</option>`).join('');
+  };
+
   abrirPanel('Exportar proyecto', `
-    <div class="res"><div class="k">Proyecto</div><div class="v">${S.proy.nom}</div></div>
+    <div class="res"><div class="k">Proyecto</div><div class="v">${escHtml(S.proy.nom)}</div></div>
     <div class="res"><div class="k">Contenido</div><div class="v">${S.puntos.length} puntos · ${S.tracks.length} tracks</div></div>
+    <label>Período a exportar</label>
+    <select id="exPerModo">
+      <option value="todo">Todo el proyecto</option>
+      <option value="anio">Por año</option>
+      <option value="mes">Por mes</option>
+      <option value="dia">Por día</option>
+    </select>
+    <select id="exPerVal" style="display:none;margin-top:6px"></select>
+    <div class="res" id="exPerRes"><div class="k">Se exportará</div><div class="v" id="exPerCount">${S.puntos.length} puntos · ${S.tracks.length} tracks</div></div>
     <label>Sistema para el CSV</label>
     <select id="exSys"><option value="crtm05">CRTM05 (EPSG:5367)</option><option value="ln">Lambert Norte (EPSG:5456)</option><option value="ls">Lambert Sur (EPSG:5457)</option><option value="geo">Geográficas (WGS84)</option></select>
     <button class="ancho" id="exCsv">Descargar CSV</button>
@@ -2585,14 +2625,35 @@ function panelExport(){
     <label>Sistema para el DXF (CAD)</label>
     <select id="exDxfSys"><option value="crtm05">CRTM05 (EPSG:5367)</option><option value="ln">Lambert Norte (EPSG:5456)</option><option value="ls">Lambert Sur (EPSG:5457)</option></select>
     <button class="ancho borde" id="exDxf">Descargar DXF (CAD · AutoCAD/QGIS)</button>
-    <div class="nota">El GeoJSON sale en WGS84 (lo que QGIS espera). El <b>DXF</b> sale en metros del sistema elegido, listo para CAD; <b>DWG</b> no se genera (binario): abrí el DXF en AutoCAD/Civil y guardá como DWG si lo necesitás. Reproyectá en QGIS si querés la transformación oficial.</div>
+    <div class="nota">Elegí <b>Por año / mes / día</b> para exportar solo los puntos de esa fecha en cualquiera de los tres formatos. El GeoJSON sale en WGS84 (lo que QGIS espera). El <b>DXF</b> sale en metros del sistema elegido, listo para CAD; <b>DWG</b> no se genera (binario): abrí el DXF en AutoCAD/Civil y guardá como DWG si lo necesitás. Reproyectá en QGIS si querés la transformación oficial.</div>
   `);
+
+  // --- Filtro por período: puntos/tracks a exportar y sufijo de nombre ---
+  const selModo = document.getElementById('exPerModo');
+  const selVal  = document.getElementById('exPerVal');
+  const modoAct = ()=> selModo.value;
+  const puntosExp = ()=>{ const m=modoAct(); if(m==='todo') return S.puntos; const v=selVal.value; return S.puntos.filter(p=> clavePeriodo(tsPunto(p),m)===v); };
+  const tracksExp = ()=>{ const m=modoAct(); if(m==='todo') return S.tracks; const v=selVal.value; return S.tracks.filter(t=> clavePeriodo(tsTrack(t),m)===v); };
+  const sufijo = ()=>{ const m=modoAct(); if(m==='todo') return ''; return '_'+(selVal.value||'periodo'); };
+  const refrescar = ()=>{
+    const m = modoAct();
+    if(m==='todo'){ selVal.style.display='none'; }
+    else{ selVal.innerHTML = opcionesPeriodo(m==='dia'?'dia':m); selVal.style.display=''; }
+    const nP = puntosExp().length, nT = tracksExp().length;
+    document.getElementById('exPerCount').textContent = nP+' puntos · '+nT+' tracks';
+  };
+  selModo.onchange = refrescar;
+  selVal.onchange  = refrescar;
+  refrescar();
+
   document.getElementById('exCsv').onclick = ()=>{
+    const puntos = puntosExp();
+    if(!puntos.length){ toast('No hay puntos en ese período para exportar.'); return; }
     const m = document.getElementById('exSys').value;
     const colsCal = ['tipo','muestras','desv_std_m','hdop_medio','cn0_medio','duracion_s'];
     const enc = m==='geo' ? ['nombre','lat','lon','altura_orto_m','altura_elip_m','geoide_m','altura_fuente','exactitud_m','exac_vert_m','fuente',...colsCal,'fecha','descripcion']
                           : ['nombre','este','norte','altura_orto_m','altura_elip_m','geoide_m','altura_fuente','exactitud_m','exac_vert_m','fuente',...colsCal,'fecha','descripcion','epsg'];
-    const filas = S.puntos.map(p=>{
+    const filas = puntos.map(p=>{
       const c = m==='geo' ? [p.lat.toFixed(7), p.lon.toFixed(7)]
                           : (q=> [q.e.toFixed(3), q.n.toFixed(3)])(desdeWgs(p.lat,p.lon,m));
       const orto = p.altOrto!=null ? p.altOrto.toFixed(1) : '';
@@ -2602,33 +2663,37 @@ function panelExport(){
                     p.cn0Medio!=null?p.cn0Medio.toFixed(1):'', p.duracion!=null?p.duracion:'' ];
       const base = [p.nom, ...c, orto, elip, p.geoide!=null?p.geoide.toFixed(1):'', p.altOrtoFuente||'',
                     p.exac!=null?p.exac.toFixed(1):'', p.vexac!=null?p.vexac.toFixed(1):'', p.fuente||'fused', ...cal,
-                    new Date(p.t).toISOString(), p.desc||''];
+                    isoTS(p.t), p.desc||''];
       if(m!=='geo') base.push(PROY[m].epsg);
       return base.map(v=>`"${String(v).replace(/"/g,'""')}"`).join(',');
     });
-    bajar(S.proy.nom+'.csv', enc.join(',')+'\n'+filas.join('\n'), 'text/csv');
+    bajar(S.proy.nom+sufijo()+'.csv', enc.join(',')+'\n'+filas.join('\n'), 'text/csv');
   };
   document.getElementById('exGpx').onclick = ()=>{
+    const puntos = puntosExp(), tracks = tracksExp();
+    if(!puntos.length && !tracks.length){ toast('No hay datos en ese período para exportar.'); return; }
     const esc = s => String(s||'').replace(/[<>&]/g, c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]));
     let g = `<?xml version="1.0" encoding="UTF-8"?>\n<gpx version="1.1" creator="Garua Campo" xmlns="http://www.topografix.com/GPX/1/1">\n<metadata><name>${esc(S.proy.nom)}</name></metadata>\n`;
     // GPX <ele> es altura sobre el nivel del mar: usamos la ortométrica si está.
     const ele = o => { const v = o.altOrto ?? o.altElip ?? o.alt; return (v != null && !isNaN(v)) ? v : null; };
-    for(const p of S.puntos){
+    for(const p of puntos){
       const e = ele(p);
       g += `<wpt lat="${p.lat}" lon="${p.lon}">${e!=null?`<ele>${e.toFixed(1)}</ele>`:''}${(()=>{const _t=isoTS(p.t);return _t?`<time>${_t}</time>`:''})()}<name>${esc(p.nom)}</name>${esc(p.desc)?`<desc>${esc(p.desc)}</desc>`:''}</wpt>\n`;
     }
-    for(const t of S.tracks){
+    for(const t of tracks){
       g += `<trk><name>${esc(t.nom)}</name><trkseg>\n`;
       for(const q of t.pts){ const e = ele(q); g += `<trkpt lat="${q.lat}" lon="${q.lon}">${e!=null?`<ele>${e.toFixed(1)}</ele>`:''}${(()=>{const _t=isoTS(q.t);return _t?`<time>${_t}</time>`:''})()}</trkpt>\n`; }
       g += `</trkseg></trk>\n`;
     }
-    bajar(S.proy.nom+'.gpx', g+'</gpx>', 'application/gpx+xml');
+    bajar(S.proy.nom+sufijo()+'.gpx', g+'</gpx>', 'application/gpx+xml');
   };
   document.getElementById('exGeo').onclick = async ()=>{
+    const puntos = puntosExp(), tracks = tracksExp();
+    if(!puntos.length && !tracks.length){ toast('No hay datos en ese período para exportar.'); return; }
     const fc = { type:'FeatureCollection', name:S.proy.nom, crs:{type:'name',properties:{name:'urn:ogc:def:crs:OGC:1.3:CRS84'}}, features:[] };
     const fotoFiles = [];   // { nombre, datos } para la carpeta fotos/ del ZIP
     let idx = 0;
-    for(const p of S.puntos){
+    for(const p of puntos){
       idx++;
       const zOrto = p.altOrto!=null ? p.altOrto : null;
       const zElip = p.altElip!=null ? p.altElip : (p.alt!=null?p.alt:null);
@@ -2656,7 +2721,7 @@ function panelExport(){
       fc.features.push({ type:'Feature', properties: props,
         geometry:{ type:'Point', coordinates:[p.lon, p.lat, (zOrto!=null?zOrto:(zElip!=null?zElip:0))] } });
     }
-    for(const t of S.tracks) fc.features.push({ type:'Feature',
+    for(const t of tracks) fc.features.push({ type:'Feature',
       properties:{ nombre:t.nom, distancia_m:Math.round(t.dist), puntos:t.pts.length,
         puntos_aceptados:(t.aceptados!=null?t.aceptados:null), puntos_filtrados:(t.rechazados!=null?t.rechazados:null),
         filtro: t.filtroConfig ? `HDOP<=${t.filtroConfig.hdopMax} sat>=${t.filtroConfig.satMin} exac<=${t.filtroConfig.exacMax}m CN0>=${t.filtroConfig.cn0Min}` : null },
@@ -2665,23 +2730,24 @@ function panelExport(){
     // Si hay fotos, exportar un ZIP con el .geojson + carpeta fotos/. Si no, .geojson plano.
     if(fotoFiles.length){
       const baseNom = (S.proy.nom||'proyecto').normalize('NFC').replace(/[^\w\-]+/g,'_') || 'proyecto';
-      const archivos = [{ nombre: baseNom+'.geojson', datos: new TextEncoder().encode(json) }, ...fotoFiles];
+      const archivos = [{ nombre: baseNom+sufijo()+'.geojson', datos: new TextEncoder().encode(json) }, ...fotoFiles];
       try{
         const zipBytes = construirZip(archivos);
-        await bajarBlob(S.proy.nom+'.zip', new Blob([zipBytes], {type:'application/zip'}));
+        await bajarBlob(S.proy.nom+sufijo()+'.zip', new Blob([zipBytes], {type:'application/zip'}));
         toast(`GeoJSON + ${fotoFiles.length} foto(s) exportado en ZIP.`);
       }catch(e){
         // Si algo falla al armar el ZIP, exportar al menos el GeoJSON.
-        bajar(S.proy.nom+'.geojson', json, 'application/geo+json');
+        bajar(S.proy.nom+sufijo()+'.geojson', json, 'application/geo+json');
         toast('Exporté el GeoJSON (no pude armar el ZIP de fotos).');
       }
     } else {
-      bajar(S.proy.nom+'.geojson', json, 'application/geo+json');
+      bajar(S.proy.nom+sufijo()+'.geojson', json, 'application/geo+json');
     }
   };
   document.getElementById('exDxf').onclick = ()=>{
-    if(!S.puntos.length && !S.tracks.length){ toast('No hay puntos ni tracks para exportar.'); return; }
-    exportarDXF(document.getElementById('exDxfSys').value);
+    const puntos = puntosExp(), tracks = tracksExp();
+    if(!puntos.length && !tracks.length){ toast('No hay datos en ese período para exportar.'); return; }
+    exportarDXF(document.getElementById('exDxfSys').value, puntos, tracks, sufijo());
   };
 }
 // Timestamp ISO seguro: UTC (Z) o '' si es nulo/inválido (evita que
@@ -3782,19 +3848,20 @@ function dxfAGeoJSON(text){
   return { type:'FeatureCollection', features:feats };
 }
 // Exporta puntos y tracks del proyecto a DXF (ASCII R12) en metros proyectados.
-function exportarDXF(modo){
+function exportarDXF(modo, puntos, tracks, suf){
+  puntos = puntos || S.puntos; tracks = tracks || S.tracks; suf = suf || '';
   const pr = (lat,lon)=> desdeWgs(lat,lon,modo);   // {e,n}
   let s = '0\nSECTION\n2\nENTITIES\n';
   const P = (x,y,capa)=> `0\nPOINT\n8\n${capa}\n10\n${x.toFixed(3)}\n20\n${y.toFixed(3)}\n30\n0\n`;
   const T = (x,y,capa,h,str)=> `0\nTEXT\n8\n${capa}\n10\n${x.toFixed(3)}\n20\n${y.toFixed(3)}\n30\n0\n40\n${h}\n1\n${String(str||'').replace(/[\r\n]/g,' ')}\n`;
-  for(const p of S.puntos){ const q=pr(p.lat,p.lon); s+=P(q.e,q.n,'PUNTOS'); s+=T(q.e+1,q.n+1,'PUNTOS',3,p.nom); }
-  for(const t of S.tracks){ if(!t.pts||t.pts.length<2) continue;
+  for(const p of puntos){ const q=pr(p.lat,p.lon); s+=P(q.e,q.n,'PUNTOS'); s+=T(q.e+1,q.n+1,'PUNTOS',3,p.nom); }
+  for(const t of tracks){ if(!t.pts||t.pts.length<2) continue;
     s += `0\nPOLYLINE\n8\nTRACKS\n66\n1\n70\n0\n`;
     for(const w of t.pts){ const q=pr(w.lat,w.lon); s+=`0\nVERTEX\n8\nTRACKS\n10\n${q.e.toFixed(3)}\n20\n${q.n.toFixed(3)}\n30\n0\n`; }
     s += `0\nSEQEND\n`;
   }
   s += '0\nENDSEC\n0\nEOF\n';
-  bajar(S.proy.nom+'_'+modo+'.dxf', s, 'application/dxf');
+  bajar(S.proy.nom+suf+'_'+modo+'.dxf', s, 'application/dxf');
 }
 
 /* =======================================================================
