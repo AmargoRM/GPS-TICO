@@ -2226,7 +2226,7 @@ function panelConfig(){
     <div class="fila"><div class="cuerpo"><div class="t">Filtros de calidad</div><div class="s">${S.filtros.activo?'Activo · '+S.filtros.preset:'Apagado'}</div></div><button class="mini" id="cFilt">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Alertas de proximidad</div><div class="s">${alertas.filter(a=>a.activa).length} activa(s) de ${alertas.length}</div></div><button class="mini" id="cAlert">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Fuente de posición</div><div class="s">${S.fuente==='gps'?'GPS puro (nativo)':'Fusionada (GPS+WiFi+celda)'}</div></div><button class="mini" id="cFuente">Cambiar</button></div>
-    <div class="fila"><div class="cuerpo"><div class="t">Brújula (flecha de dirección)</div><div class="s">${brujInvertir?'Invertida (corrección activada)':'Normal'} · calibrar / corregir</div></div><button class="mini" id="cBruj">Abrir</button></div>
+    <div class="fila"><div class="cuerpo"><div class="t">Brújula (flecha de dirección)</div><div class="s">${brujOffset?('Ajuste '+Math.round(brujOffset)+'°'):'Sin ajuste'} · calibrar / corregir</div></div><button class="mini" id="cBruj">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Grabación con pantalla bloqueada</div><div class="s">Permisos para que el track no se corte al bloquear el celular</div></div><button class="mini" id="cBg">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Precisión y advertencias</div><div class="s">Términos de uso · leer antes de usar en expedientes</div></div><button class="mini" id="cInfo">Abrir</button></div>
   `);
@@ -3171,25 +3171,55 @@ function panelFuente(){
 function panelBrujula(){
   const dir = d => ['N','NE','E','SE','S','SO','O','NO'][Math.round(((d%360)/45))%8];
   abrirPanel('Brújula (flecha de dirección)', `
-    <div class="nota" style="border-color:var(--fix)">La flecha/cono verde sobre tu posición marca hacia dónde <b>apunta el borde superior del teléfono</b>. Sostenelo bastante plano, como una brújula.</div>
-    <div class="res"><div class="k">Rumbo actual</div><div class="v" id="brujVal">—</div></div>
-    <button class="ancho ${brujInvertir?'':'borde'}" id="brujInv">${brujInvertir?'✓ Corrección activada (flecha invertida 180°)':'La flecha apunta al revés → Invertir'}</button>
-    <div class="nota">Algunos equipos (por ejemplo ciertos <b>Motorola</b>) traen el sensor de la brújula invertido de fábrica y la flecha marca justo al lado contrario. Si te pasa, activá <b>Invertir</b>: se corrige 180° y queda guardado <b>solo para este teléfono</b>.</div>
-    <div class="nota"><b>Calibrar:</b> si la aguja tiembla o queda un poco desviada, movés el teléfono en el aire dibujando un <b>8</b> unas 3–4 veces, lejos de metales, parlantes o imanes. Es la calibración del magnetómetro del propio equipo.</div>
+    <div class="nota" style="border-color:var(--fix)">La flecha/cono verde marca hacia dónde <b>apunta el borde superior del teléfono</b>. En casi todos los equipos sale bien; esto es el <b>ajuste fino</b>, como última alternativa si en tu modelo la flecha queda desviada.</div>
+    <div class="res"><div class="k">La flecha marca ahora</div><div class="v" id="brujVal">—</div></div>
+    <div class="res"><div class="k">Sensor sin ajuste</div><div class="v" id="brujRaw">—</div></div>
+
+    <label>Calibración fácil (recomendada)</label>
+    <div class="nota">Apuntá el <b>borde superior</b> del teléfono exactamente al <b>Norte</b> (con otra brújula, el sol o una calle conocida) y tocá el botón: la app calcula el ángulo exacto para tu equipo, sea cual sea.</div>
+    <button class="ancho" id="brujNorte">📍 Estoy apuntando al Norte → calibrar</button>
+
+    <label style="margin-top:14px">Ajuste manual (grados, 0–359)</label>
+    <div class="grid2">
+      <input id="brujOff" inputmode="numeric" value="${Math.round(brujOffset)}" placeholder="0">
+      <button class="ancho" id="brujAplicar" style="margin-top:0">Aplicar</button>
+    </div>
+    <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px">
+      <button class="mini" data-boff="0">Sin ajuste</button>
+      <button class="mini" data-boff="90">90°</button>
+      <button class="mini" data-boff="180">180°</button>
+      <button class="mini" data-boff="270">270°</button>
+    </div>
+    <div class="nota" style="margin-top:12px"><b>Calibrar el sensor:</b> si la aguja tiembla o cambia sola, movés el teléfono en el aire dibujando un <b>8</b> unas 3–4 veces, lejos de metales, parlantes o imanes. Es la calibración del magnetómetro del propio equipo.</div>
   `);
-  const tick = ()=>{ const el=document.getElementById('brujVal'); if(!el) return; const v=S.rumboDisp;
-    el.textContent = (v==null) ? 'sin sensor / esperando…' : (Math.round(v)+'° ('+dir(v)+')'); };
-  tick();
-  if(window._brujIv) clearInterval(window._brujIv);
-  window._brujIv = setInterval(()=>{ if(!document.getElementById('brujVal')){ clearInterval(window._brujIv); window._brujIv=null; return; } tick(); }, 300);
-  document.getElementById('brujInv').onclick = async ()=>{
-    brujInvertir = !brujInvertir;
-    try{ await dbPut('conf', brujInvertir, 'brujInvertir'); }catch(e){}
-    if(S.rumboDisp!=null) S.rumboDisp = (S.rumboDisp + 180) % 360;
+  const setOff = async (v)=>{
+    brujOffset = ((Math.round(v) % 360) + 360) % 360;
+    try{ await dbPut('conf', brujOffset, 'brujOffset'); }catch(e){}
+    if(S.rumboCrudo != null) S.rumboDisp = ((S.rumboCrudo + brujOffset) % 360 + 360) % 360;
     dibujar();
-    toast(brujInvertir ? 'Brújula invertida: corrección activada.' : 'Brújula normal.');
+    toast('Ajuste de brújula: ' + brujOffset + '°.');
     panelBrujula();
   };
+  const tick = ()=>{
+    const a=document.getElementById('brujVal'), b=document.getElementById('brujRaw');
+    if(!a) return;
+    const v=S.rumboDisp, r=S.rumboCrudo;
+    a.textContent = (v==null) ? 'sin sensor / esperando…' : (Math.round(v)+'° ('+dir(v)+')');
+    if(b) b.textContent = (r==null) ? '—' : (Math.round(r)+'° ('+dir(r)+')');
+  };
+  tick();
+  if(window._brujIv) clearInterval(window._brujIv);
+  window._brujIv = setInterval(()=>{ if(!document.getElementById('brujVal')){ clearInterval(window._brujIv); window._brujIv=null; return; } tick(); }, 250);
+  document.getElementById('brujNorte').onclick = ()=>{
+    if(S.rumboCrudo == null){ toast('Esperá a que el sensor dé lectura y volvé a intentar.'); return; }
+    setOff((360 - S.rumboCrudo) % 360);   // el rumbo actual pasa a 0 (Norte)
+  };
+  document.getElementById('brujAplicar').onclick = ()=>{
+    const v = parseFloat((document.getElementById('brujOff').value||'').replace(',','.'));
+    if(!isFinite(v)){ toast('Ingresá un número de grados.'); return; }
+    setOff(v);
+  };
+  document.querySelectorAll('[data-boff]').forEach(b=> b.onclick = ()=> setOff(+b.dataset.boff));
 }
 
 /* --- filtros de calidad (F5) --- */
@@ -6648,12 +6678,14 @@ function exportarDiagCSV(){
  * acelerómetro) para saber hacia dónde apunta el aparato, igual que la
  * flecha/cono de Google Maps. No es rumbo GPS (curso), que solo sirve en
  * movimiento; este funciona parado. Suaviza para que el cono no tiemble. */
-// Corrección por equipo: en algunos modelos (p. ej. ciertos Motorola) el sensor
-// de orientación entrega el rumbo 180° invertido por un defecto del fabricante.
-// No es detectable de forma fiable por software (el rumbo GPS no sirve porque el
-// teléfono no siempre apunta hacia donde uno camina), así que se ofrece un
-// interruptor por equipo, persistido. true = suma 180° al rumbo mostrado.
-let brujInvertir = false;
+// Corrección por equipo: el sensor de orientación de algunos modelos (p. ej.
+// ciertos Motorola) entrega el rumbo desviado un ángulo fijo —no siempre 180°—
+// por cómo viene montado/calibrado de fábrica. No es detectable de forma fiable
+// por software (el rumbo GPS no sirve: el teléfono no siempre apunta hacia donde
+// uno camina), así que se ofrece un AJUSTE ABIERTO en grados, por equipo y
+// persistido, que se suma al rumbo del sensor. La forma cómoda de fijarlo es
+// "apuntar al norte y calibrar" (calcula el ángulo exacto).
+let brujOffset = 0;   // grados a sumar al rumbo del sensor (0..359)
 const Brujula = (()=>{
   let suave = null, ultDibujo = 0, activo = false;
   // Aplica un rumbo (0..360, 0=N horario) con suavizado circular y redibuja.
@@ -6662,7 +6694,8 @@ const Brujula = (()=>{
     let h = ((deg % 360) + 360) % 360;
     if(suave == null) suave = h;
     else { const d = ((h - suave + 540) % 360) - 180; suave = (suave + d*0.2 + 360) % 360; }
-    S.rumboDisp = brujInvertir ? (suave + 180) % 360 : suave;
+    S.rumboCrudo = suave;                                   // rumbo del sensor sin ajuste
+    S.rumboDisp = ((suave + brujOffset) % 360 + 360) % 360; // rumbo mostrado (con ajuste)
     const ahora = (performance && performance.now) ? performance.now() : Date.now();
     if(ahora - ultDibujo > 90){ ultDibujo = ahora; try{ dibujar(); }catch(e){} }
   }
@@ -6707,7 +6740,7 @@ const Brujula = (()=>{
   await migrarAGeoJSON();
   S.modo = await dbGet('conf','modo') || 'geo';
   S.capa = await dbGet('conf','capa') || 'sat';
-  try{ brujInvertir = !!(await dbGet('conf','brujInvertir')); }catch(e){}
+  try{ const bo = await dbGet('conf','brujOffset'); if(bo!=null && isFinite(bo)) brujOffset = ((Number(bo)%360)+360)%360; }catch(e){}
   const filtGuardados = await dbGet('conf','filtros');
   if(filtGuardados) S.filtros = Object.assign(S.filtros, filtGuardados);
   try{
