@@ -38,6 +38,9 @@
                 <data android:mimeType="text/plain" />
                 <data android:mimeType="text/xml" />
                 <data android:mimeType="image/tiff" />
+                <data android:mimeType="application/vnd.google-earth.kmz" />
+                <data android:mimeType="application/zip" />
+                <data android:mimeType="application/x-zip-compressed" />
             </intent-filter>
             <!-- Coincidencia por extensión (algunos gestores mandan mime genérico) -->
             <intent-filter android:label="@string/app_name">
@@ -49,9 +52,13 @@
                 <data android:host="*" />
                 <data android:mimeType="*/*" />
                 <data android:pathPattern=".*\\.geojson" />
+                <data android:pathPattern=".*\\.json" />
                 <data android:pathPattern=".*\\.gpx" />
                 <data android:pathPattern=".*\\.kml" />
+                <data android:pathPattern=".*\\.kmz" />
                 <data android:pathPattern=".*\\.dxf" />
+                <data android:pathPattern=".*\\.shp" />
+                <data android:pathPattern=".*\\.zip" />
                 <data android:pathPattern=".*\\.tif" />
                 <data android:pathPattern=".*\\.tiff" />
                 <data android:pathPattern=".*\\.geotiff" />

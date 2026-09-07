@@ -59,6 +59,25 @@ public class MainActivity extends BridgeActivity {
                 else FileOpenBridge.deliver(rn, "rasterpath", out.getAbsolutePath());
                 return;
             }
+            // KMZ / SHP / ZIP: binarios. Se copian a caché y se entrega la RUTA
+            // (kind "archpath"); JS los lee como bytes y los enruta al mismo
+            // importador de "Capas → Archivo del teléfono". Leerlos como texto
+            // los corrompía (ZIP/SHP son binarios) y no se podían abrir.
+            boolean esArch = lower.endsWith(".kmz") || lower.endsWith(".shp") || lower.endsWith(".zip");
+            if (esArch) {
+                String extA = lower.endsWith(".kmz") ? ".kmz" : lower.endsWith(".shp") ? ".shp" : ".zip";
+                java.io.File out = new java.io.File(getCacheDir(), "import_" + System.currentTimeMillis() + extA);
+                java.io.InputStream in = getContentResolver().openInputStream(uri);
+                if (in == null) return;
+                java.io.FileOutputStream fos = new java.io.FileOutputStream(out);
+                byte[] ab = new byte[65536]; int an;
+                while ((an = in.read(ab)) > 0) fos.write(ab, 0, an);
+                fos.flush(); fos.close(); in.close();
+                String an2 = (nombre != null && !lower.endsWith(extA)) ? (nom + extA) : nom;
+                if (frio) FileOpenBridge.setPending(an2, "archpath", out.getAbsolutePath());
+                else FileOpenBridge.deliver(an2, "archpath", out.getAbsolutePath());
+                return;
+            }
             boolean esGeojson = lower.endsWith(".geojson") || lower.endsWith(".json");
             if (esGeojson) {
                 java.io.File out = new java.io.File(getCacheDir(), "import_" + System.currentTimeMillis() + ".geojson");

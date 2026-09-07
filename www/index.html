@@ -489,7 +489,8 @@ const S = {
   centro: { lat: 9.4318, lon: -84.1620 },   // Quepos
   zoom: 15,
   puntos: [],
-  tracks: []
+  tracks: [],
+  rumboDisp: null      // rumbo de la brújula magnética (0..360, N horario) para el cono de dirección
 };
 
 const CAPAS = {
@@ -939,6 +940,39 @@ function dibujar(){
       ctx.fillStyle = 'rgba(79,209,197,.10)'; ctx.fill();
       ctx.strokeStyle = 'rgba(79,209,197,.55)'; ctx.lineWidth = 1; ctx.stroke();
     }
+    // Cono de dirección de la brújula (hacia dónde apunta el teléfono), estilo
+    // Google Maps: cono verde translúcido + flecha verde punteada al 50%. El
+    // mapa está orientado con el Norte arriba, así que el rumbo geográfico
+    // (0 = N, horario) se convierte directo a vector de pantalla (N = -y).
+    if(S.rumboDisp != null){
+      const th = S.rumboDisp * D2R;
+      const dx = Math.sin(th), dy = -Math.cos(th);   // eje del cono
+      const px = -dy, py = dx;                        // perpendicular
+      const L = 54, halfW = 27;                       // largo y medio-ancho
+      const tipx = s.x + dx*L, tipy = s.y + dy*L;
+      const grad = ctx.createLinearGradient(s.x, s.y, tipx, tipy);
+      grad.addColorStop(0, 'rgba(46,204,113,.55)');
+      grad.addColorStop(1, 'rgba(46,204,113,0)');
+      ctx.beginPath();
+      ctx.moveTo(s.x, s.y);
+      ctx.lineTo(s.x + dx*L + px*halfW, s.y + dy*L + py*halfW);
+      ctx.lineTo(s.x + dx*L - px*halfW, s.y + dy*L - py*halfW);
+      ctx.closePath();
+      ctx.fillStyle = grad; ctx.fill();
+      ctx.save();
+      ctx.globalAlpha = 0.5;                           // 50% de transparencia
+      ctx.strokeStyle = '#2ecc71'; ctx.lineWidth = 2.5; ctx.setLineDash([3,4]);
+      ctx.beginPath(); ctx.moveTo(s.x, s.y); ctx.lineTo(tipx, tipy); ctx.stroke();
+      ctx.setLineDash([]);
+      const ah = 8;                                    // punta de flecha
+      ctx.beginPath();
+      ctx.moveTo(tipx, tipy);
+      ctx.lineTo(tipx - dx*ah + px*ah*0.6, tipy - dy*ah + py*ah*0.6);
+      ctx.lineTo(tipx - dx*ah - px*ah*0.6, tipy - dy*ah - py*ah*0.6);
+      ctx.closePath();
+      ctx.fillStyle = '#2ecc71'; ctx.fill();
+      ctx.restore();
+    }
     ctx.beginPath(); ctx.arc(s.x, s.y, 7, 0, 7);
     ctx.fillStyle = '#4FD1C5'; ctx.fill();
     ctx.lineWidth = 2.5; ctx.strokeStyle = '#0A1214'; ctx.stroke();
@@ -1238,6 +1272,18 @@ async function abrirArchivoImportado(f){
       const resp = await fetch(url); const ab = await resp.arrayBuffer();
       await agregarCapaRaster((f.name||'raster').replace(/\.(tif|tiff|geotiff)$/i,''), ab);
     }catch(e){ toast('No se pudo abrir el raster: '+((e&&e.message)||e)); }
+    return;
+  }
+  // KMZ / SHP / ZIP abiertos desde el sistema ("Abrir con"): el nativo los copió
+  // a caché y pasó la RUTA. Se leen como bytes y se enrutan al mismo importador
+  // de archivos (que ya maneja shapefile, KMZ y zip camuflado).
+  if(f.kind==='archpath'){
+    try{
+      const url = (window.Capacitor && window.Capacitor.convertFileSrc) ? window.Capacitor.convertFileSrc(f.text) : f.text;
+      const resp = await fetch(url); const blob = await resp.blob();
+      const file = new File([blob], f.name||'capa.zip');
+      await agregarCapaArchivo(file);
+    }catch(e){ toast('No se pudo abrir el archivo: '+((e&&e.message)||e)); }
     return;
   }
   if(f.kind==='toobig'){ toast('Ese archivo es muy grande para abrirlo así. Agregalo desde Capas → Archivo del teléfono.'); return; }
@@ -3021,6 +3067,71 @@ async function construirPDF(canvas, geo){
   return new Blob(parts, {type:'application/pdf'});
 }
 
+// GeoTIFF georreferenciado del ÁREA DE MAPA (sin márgenes/leyenda), pensado
+// para QField/QGIS, que abren GeoTIFF nativamente (a diferencia del GeoPDF,
+// que QField no rasteriza bien). Se georreferencia en Web Mercator (EPSG:3857),
+// que es la proyección real de los tiles, así el registro es EXACTO (sin el
+// error de latitud que tendría un world file en grados). TIFF RGB sin comprimir,
+// una sola tira, little-endian.
+function construirGeoTIFF(canvas, geo){
+  const w = geo.mW, h = geo.mH;
+  // Recortar el área de mapa (descarta márgenes, cuadrícula y leyenda).
+  const rc = document.createElement('canvas'); rc.width = w; rc.height = h;
+  const rg = rc.getContext('2d');
+  rg.drawImage(canvas, geo.padL, geo.padT, w, h, 0, 0, w, h);
+  const idata = rg.getImageData(0, 0, w, h).data;
+  // Esquinas geográficas -> metros Web Mercator (EPSG:3857).
+  const R = 6378137, D2Rl = Math.PI/180;
+  const merX = lon => R * lon * D2Rl;
+  const merY = lat => R * Math.log(Math.tan(Math.PI/4 + lat*D2Rl/2));
+  const xW = merX(geo.lonW), xE = merX(geo.lonE);
+  const yN = merY(geo.latN), yS = merY(geo.latS);
+  const scaleX = (xE - xW)/w, scaleY = (yN - yS)/h;   // metros por píxel
+  // Distribución de memoria del TIFF.
+  const nStrip = w*h*3;
+  const ifdCount = 12;
+  const ifdBytes = 2 + ifdCount*12 + 4;
+  let aux = 8 + ifdBytes;
+  const bpsOff = aux; aux += 6;          // BitsPerSample: 3 SHORT
+  aux = (aux + 7) & ~7;                  // alinear DOUBLE a 8
+  const psOff = aux; aux += 24;          // ModelPixelScale: 3 DOUBLE
+  const tpOff = aux; aux += 48;          // ModelTiepoint: 6 DOUBLE
+  const gkOff = aux; aux += 32;          // GeoKeyDirectory: 16 SHORT
+  const imgOff = aux;
+  const buf = new ArrayBuffer(imgOff + nStrip);
+  const dv = new DataView(buf), u8 = new Uint8Array(buf), LE = true;
+  u8[0]=0x49; u8[1]=0x49; dv.setUint16(2,42,LE); dv.setUint32(4,8,LE);   // "II", 42, IFD@8
+  dv.setUint16(8, ifdCount, LE);
+  let e = 10;
+  const entry = (tag,type,count,val)=>{ dv.setUint16(e,tag,LE); dv.setUint16(e+2,type,LE); dv.setUint32(e+4,count,LE); dv.setUint32(e+8,val,LE); e+=12; };
+  // types: 3=SHORT, 4=LONG, 12=DOUBLE. Tags en orden ascendente (lo exige TIFF).
+  entry(256,4,1,w);        // ImageWidth
+  entry(257,4,1,h);        // ImageLength
+  entry(258,3,3,bpsOff);   // BitsPerSample [8,8,8]
+  entry(259,3,1,1);        // Compression: ninguna
+  entry(262,3,1,2);        // Photometric: RGB
+  entry(273,4,1,imgOff);   // StripOffsets
+  entry(277,3,1,3);        // SamplesPerPixel
+  entry(278,4,1,h);        // RowsPerStrip (una tira)
+  entry(279,4,1,nStrip);   // StripByteCounts
+  entry(33550,12,3,psOff); // ModelPixelScale
+  entry(33922,12,6,tpOff); // ModelTiepoint
+  entry(34735,3,16,gkOff); // GeoKeyDirectory
+  dv.setUint32(e,0,LE);    // siguiente IFD = 0
+  dv.setUint16(bpsOff,8,LE); dv.setUint16(bpsOff+2,8,LE); dv.setUint16(bpsOff+4,8,LE);
+  dv.setFloat64(psOff,scaleX,LE); dv.setFloat64(psOff+8,scaleY,LE); dv.setFloat64(psOff+16,0,LE);
+  // Tiepoint: píxel (0,0) -> esquina NO del extent (xW, yN).
+  dv.setFloat64(tpOff,0,LE); dv.setFloat64(tpOff+8,0,LE); dv.setFloat64(tpOff+16,0,LE);
+  dv.setFloat64(tpOff+24,xW,LE); dv.setFloat64(tpOff+32,yN,LE); dv.setFloat64(tpOff+40,0,LE);
+  // GeoKeyDirectory: version 1.1.0, 3 claves. Modelo proyectado, PixelIsArea, EPSG:3857.
+  const gk=[1,1,0,3, 1024,0,1,1, 1025,0,1,1, 3072,0,1,3857];
+  for(let i=0;i<gk.length;i++) dv.setUint16(gkOff+i*2, gk[i], LE);
+  // Datos de imagen RGB, filas de arriba (N) hacia abajo (S).
+  let q = imgOff;
+  for(let i=0;i<w*h;i++){ u8[q++]=idata[i*4]; u8[q++]=idata[i*4+1]; u8[q++]=idata[i*4+2]; }
+  return new Blob([buf], {type:'image/tiff'});
+}
+
 // Capas/puntos/tracks visibles dentro de la vista actual (para la leyenda).
 function itemsLeyendaEnVista(){
   const b = boundsVista();   // {w,e,n,s}
@@ -3049,6 +3160,7 @@ function panelExportMapa(){
     <input id="emTit" value="" placeholder="Dejalo en blanco si no querés título">
     <label>Formato</label>
     <select id="emFmt">
+      <option value="tif">GeoTIFF georreferenciado (QField / QGIS) — recomendado</option>
       <option value="pdf">PDF georreferenciado (QGIS / Avenza)</option>
       <option value="png">PNG (imagen)</option>
     </select>
@@ -3060,7 +3172,7 @@ function panelExportMapa(){
       </div>`).join('') : '<div class="vacio">No hay capas activas dentro de la vista.</div>'}
     </div>
     <button class="ancho" id="emOk">Generar y compartir</button>
-    <div class="nota">El PDF lleva un viewport geográfico (WGS84) para abrirse ubicado en QGIS/Avenza; la <b>cuadrícula visible es CRTM05</b>, que es la referencia legal en Costa Rica. La georreferencia es exacta a escala de campo; en áreas muy grandes puede haber una leve diferencia por la proyección del mapa base.</div>
+    <div class="nota"><b>GeoTIFF</b> (recomendado para QField): imagen del área de mapa georreferenciada en Web Mercator (EPSG:3857), la proyección real de los tiles, así el registro es <b>exacto</b>. Es un solo archivo que QField y QGIS abren ubicado; no lleva márgenes ni cuadrícula (esos son parte del papel del PDF). El <b>PDF</b> lleva un viewport geográfico (WGS84) con cuadrícula CRTM05 en el borde, ideal para imprimir o Avenza, pero <b>QField no rasteriza bien el GeoPDF</b>: para QField usá el GeoTIFF. La cuadrícula del PDF es CRTM05 (referencia legal en Costa Rica).</div>
   `);
   document.getElementById('emOk').onclick = async ()=>{
     const titulo = document.getElementById('emTit').value.trim();
@@ -3075,6 +3187,9 @@ function panelExportMapa(){
       if(fmt==='png'){
         const blob = await new Promise(r=> res.canvas.toBlob(r, 'image/png'));
         await bajarBlob(base+'.png', blob);
+      } else if(fmt==='tif'){
+        const blob = construirGeoTIFF(res.canvas, res.geo);
+        await bajarBlob(base+'.tif', blob);
       } else {
         const blob = await construirPDF(res.canvas, res.geo);
         await bajarBlob(base+'.pdf', blob);
@@ -3650,6 +3765,42 @@ function kmlAGeoJSON(xmlText){
     feats.push({ type:'Feature', geometry, properties:props });
   }
   if(!feats.length) throw new Error('El KML no tenía elementos con geometría');
+  return { type:'FeatureCollection', features:feats };
+}
+
+// GPX -> GeoJSON para cargarlo como CAPA (waypoints como puntos, rutas y
+// tracks como líneas). Se usa desde "Archivo del teléfono" en Capas. Para
+// traer el GPX como puntos/tracks EDITABLES del proyecto se usa importarGPX.
+function gpxAGeoJSON(xmlText){
+  const doc = new DOMParser().parseFromString(xmlText, 'application/xml');
+  if(doc.getElementsByTagName('parsererror').length) throw new Error('GPX mal formado');
+  const num = (el,a)=> parseFloat(el.getAttribute(a));
+  const txt = (el,tag)=>{ const n=el.getElementsByTagName(tag)[0]; return n?n.textContent.trim():''; };
+  const coordsDe = (el,tag)=>{ const out=[]; const ns=el.getElementsByTagName(tag);
+    for(let i=0;i<ns.length;i++){ const lat=num(ns[i],'lat'), lon=num(ns[i],'lon'); if(!isNaN(lat)&&!isNaN(lon)) out.push([lon,lat]); } return out; };
+  const feats = [];
+  // Waypoints -> puntos.
+  const wpts = doc.getElementsByTagName('wpt');
+  for(let i=0;i<wpts.length;i++){
+    const w=wpts[i], lat=num(w,'lat'), lon=num(w,'lon'); if(isNaN(lat)||isNaN(lon)) continue;
+    feats.push({ type:'Feature', geometry:{type:'Point',coordinates:[lon,lat]},
+      properties:{ nombre:txt(w,'name'), desc:txt(w,'desc'), ele:txt(w,'ele') } });
+  }
+  // Rutas -> líneas.
+  const rtes = doc.getElementsByTagName('rte');
+  for(let i=0;i<rtes.length;i++){ const c=coordsDe(rtes[i],'rtept'); if(c.length>1)
+    feats.push({ type:'Feature', geometry:{type:'LineString',coordinates:c}, properties:{ nombre:txt(rtes[i],'name')||('Ruta '+(i+1)) } }); }
+  // Tracks -> líneas (una por segmento; si no hay trkseg, todo el trk).
+  const trks = doc.getElementsByTagName('trk');
+  for(let i=0;i<trks.length;i++){
+    const tk=trks[i], nom=txt(tk,'name')||('Track '+(i+1));
+    const segs=tk.getElementsByTagName('trkseg');
+    if(segs.length){ for(let j=0;j<segs.length;j++){ const c=coordsDe(segs[j],'trkpt'); if(c.length>1)
+      feats.push({ type:'Feature', geometry:{type:'LineString',coordinates:c}, properties:{ nombre:nom } }); } }
+    else { const c=coordsDe(tk,'trkpt'); if(c.length>1)
+      feats.push({ type:'Feature', geometry:{type:'LineString',coordinates:c}, properties:{ nombre:nom } }); }
+  }
+  if(!feats.length) throw new Error('El GPX no tenía waypoints, rutas ni tracks');
   return { type:'FeatureCollection', features:feats };
 }
 
@@ -4498,7 +4649,7 @@ async function agregarCapaRaster(nombre, ab){
 
 // Importa una capa desde un archivo del teléfono: GeoJSON, KML, KMZ, SHP, ZIP o GeoTIFF.
 async function agregarCapaArchivo(file){
-  const nombre = file.name.replace(/\.(geojson|json|kml|kmz|shp|zip|tif|tiff|geotiff|dxf)$/i,'');
+  const nombre = file.name.replace(/\.(geojson|json|kml|kmz|shp|zip|tif|tiff|geotiff|dxf|gpx)$/i,'');
   let ext = (file.name.split('.').pop()||'').toLowerCase();
   // GeoTIFF raster por extensión O por firma (los gestores que reportan MIME
   // genérico suelen entregar el archivo sin extensión útil). TIFF empieza con
@@ -4543,10 +4694,12 @@ async function agregarCapaArchivo(file){
       await importarShapefileZip(nombre, await file.arrayBuffer());
     } else if(ext==='dxf'){
       await guardarCapaVector(nombre, dxfAGeoJSON(await file.text()));
+    } else if(ext==='gpx'){
+      await guardarCapaVector(nombre, gpxAGeoJSON(await file.text()));
     } else if(ext==='dwg'){
       toast('DWG es binario y no se puede leer sin conversión. Convertilo a DXF (ODA File Converter, AutoCAD o QGIS) y cargá el .dxf.');
     } else {
-      toast('Formato no reconocido. Usá GeoJSON, KML, KMZ, SHP, ZIP o DXF.');
+      toast('Formato no reconocido. Usá GeoJSON, KML, KMZ, GPX, SHP, ZIP o DXF.');
     }
   }catch(e){ toast('No se pudo importar: '+(e.message||e)); }
   finally{ ocultarCargando(); }
@@ -6265,7 +6418,7 @@ function panelCapas(){
       <option value="wms">WMS (servicio) — escanear capas</option>
       <option value="wfs">WFS (servicio) — escanear capas</option>
       <option value="geojson_url">GeoJSON (enlace directo)</option>
-      <option value="file">Archivo del teléfono (GeoJSON · KML · KMZ · SHP · ZIP · DXF · GeoTIFF)</option>
+      <option value="file">Archivo del teléfono (GeoJSON · KML · KMZ · GPX · SHP · ZIP · DXF · GeoTIFF)</option>
     </select>
     <div id="capForm"></div>
     <div class="nota">Pegá el enlace del <b>servicio</b> WMS/WFS (el mismo que usás en QGIS) y tocá <b>Escanear</b>: la app lista las capas disponibles para elegir. Las descargas van por HTTP nativo, así que sirve aunque el servidor no permita CORS. <b>Shapefile</b>: subí el <b>.zip</b> completo (con .shp, .dbf y .prj). <b>Proyección automática</b>: si la capa viene en CRTM05 o Lambert, la app lo detecta, la convierte a WGS84 y vuela a la zona sola; si se equivoca, corregila con 🌐. <b>GeoJSON grande</b> (80 MB o más): se carga con un motor compacto que sólo dibuja/consulta lo visible; usá esta opción de <b>archivo</b> (no "abrir con" del sistema). En capas grandes no hay etiqueta ni tabla completa; sí color, consulta al tocar y estilo. <b>GeoTIFF</b> (.tif/.tiff): raster georreferenciado (ortofoto o modelo de elevación DEM). Se detecta el CRS (WGS84, Web Mercator, CRTM05 o Lambert), se analiza y se dibuja sobre el mapa; se reescala a máx 2000 px de lado. Compresión soportada: sin comprimir, LZW, Deflate y PackBits (no JPEG interno). Los DEM se colorean con rampa de elevación y muestran altura mín/máx. Ajustá la opacidad con ◐.</div>
@@ -6312,7 +6465,7 @@ function panelCapas(){
       // "application/octet-stream" y un accept específico los deja sin poder
       // seleccionar (en gris). Aceptamos todo y validamos por extensión/firma.
       cf.innerHTML = `<input type="file" id="capFile" accept="*/*" style="margin-top:8px">
-        <div class="nota" style="margin-top:6px">Elegí el archivo. Formatos: GeoJSON · KML · KMZ · SHP · ZIP · DXF · <b>GeoTIFF (.tif/.tiff)</b>. Si tu gestor no lo muestra, buscalo en "Archivos" o en la carpeta donde lo guardaste.</div>
+        <div class="nota" style="margin-top:6px">Elegí el archivo. Formatos: GeoJSON · KML · KMZ · <b>GPX</b> · SHP · ZIP · DXF · <b>GeoTIFF (.tif/.tiff)</b>. El GPX entra como capa (waypoints, rutas y tracks); si querés los puntos editables del proyecto, abrí el .gpx con "abrir con GPS TICO". Si tu gestor no muestra el archivo, buscalo en "Archivos" o en la carpeta donde lo guardaste.</div>
         <button class="ancho" id="capAdd">Agregar archivo</button>`;
       document.getElementById('capAdd').onclick = ()=>{ const f=document.getElementById('capFile').files[0]; if(!f){toast('Elegí un archivo.');return;} agregarCapaArchivo(f); };
     } else if(sel.value==='geojson_url'){
@@ -6531,6 +6684,44 @@ function exportarDiagCSV(){
 }
 
 /* =======================================================================
+   BRÚJULA (orientación del dispositivo para el cono de dirección)
+   ======================================================================= *
+ * Usa el sensor de orientación absoluta del teléfono (magnetómetro +
+ * acelerómetro) para saber hacia dónde apunta el aparato, igual que la
+ * flecha/cono de Google Maps. No es rumbo GPS (curso), que solo sirve en
+ * movimiento; este funciona parado. Suaviza para que el cono no tiemble. */
+const Brujula = (()=>{
+  let suave = null, ultDibujo = 0, activo = false;
+  function anguloPantalla(){
+    try{ return (screen.orientation && screen.orientation.angle) || window.orientation || 0; }
+    catch(e){ return 0; }
+  }
+  function onOrient(e){
+    let h = null;
+    if(e.webkitCompassHeading != null && !isNaN(e.webkitCompassHeading)) h = e.webkitCompassHeading; // iOS
+    else if(e.alpha != null) h = 360 - e.alpha;                                                       // Android
+    if(h == null || isNaN(h)) return;
+    h = (h + anguloPantalla()) % 360; if(h < 0) h += 360;
+    // Suavizado circular (evita saltos 359↔0).
+    if(suave == null) suave = h;
+    else { let d = ((h - suave + 540) % 360) - 180; suave = (suave + d*0.25 + 360) % 360; }
+    S.rumboDisp = suave;
+    const ahora = (performance && performance.now) ? performance.now() : Date.now();
+    if(ahora - ultDibujo > 90){ ultDibujo = ahora; try{ dibujar(); }catch(e){} }
+  }
+  function iniciar(){
+    if(activo) return; activo = true;
+    try{
+      if('ondeviceorientationabsolute' in window)
+        window.addEventListener('deviceorientationabsolute', onOrient, true);
+      else
+        window.addEventListener('deviceorientation', onOrient, true);
+    }catch(e){}
+  }
+  return { iniciar };
+})();
+
+/* =======================================================================
    9. ARRANQUE
    ======================================================================= */
 (async ()=>{
@@ -6590,6 +6781,7 @@ function exportarDiagCSV(){
     if(Geo) await Geo.requestPermissions();
   }catch(e){}
   await arrancarGPS();
+  Brujula.iniciar();   // cono de dirección de la brújula
   // Buscar actualización en silencio al arrancar (si hay red).
   pintarBadgeActualizacion();
   if(navigator.onLine){ setTimeout(()=> buscarActualizacion(false), 4000); }
