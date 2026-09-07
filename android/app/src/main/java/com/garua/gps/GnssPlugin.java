@@ -28,6 +28,16 @@ public class GnssPlugin extends Plugin {
     private OnNmeaMessageListener nmeaListener;
     private boolean isListening = false;
 
+    // Brújula (cono de dirección): sensor de vector de rotación (fusión de
+    // magnetómetro + acelerómetro + giroscopio). Es la vía fiable para saber
+    // hacia dónde apunta el teléfono, a diferencia de deviceorientation del
+    // WebView, que solo acierta con el equipo plano.
+    private android.hardware.SensorManager sensorManager;
+    private android.hardware.Sensor rotationSensor;
+    private android.hardware.SensorEventListener rotationListener;
+    private boolean brujulaOn = false;
+    private long ultBrujulaMs = 0;
+
     // Motor de voz nativo (android.speech.tts). Es fiable y funciona sin internet,
     // a diferencia de speechSynthesis del WebView (que en muchos Android no suena).
     private android.speech.tts.TextToSpeech tts;
@@ -58,7 +68,64 @@ public class GnssPlugin extends Plugin {
         WidgetActionBridge.unregister(this);
         FileOpenBridge.unregister(this);
         try { if (tts != null) { tts.stop(); tts.shutdown(); } } catch (Exception e) {}
+        try { if (sensorManager != null && rotationListener != null) sensorManager.unregisterListener(rotationListener); } catch (Exception e) {}
         super.handleOnDestroy();
+    }
+
+    // ---- Brújula: rumbo del dispositivo para el cono de dirección ----
+    // Emite "heading" con {deg} = 0..360 (0=Norte, horario) del borde SUPERIOR
+    // del teléfono, con remapeo según la rotación de la pantalla. Es el método
+    // canónico (getRotationMatrixFromVector + remapCoordinateSystem + getOrientation).
+    @PluginMethod
+    public void iniciarBrujula(PluginCall call) {
+        try {
+            if (brujulaOn) { call.resolve(new JSObject().put("status", "already")); return; }
+            if (sensorManager == null)
+                sensorManager = (android.hardware.SensorManager) getContext().getSystemService(android.content.Context.SENSOR_SERVICE);
+            rotationSensor = sensorManager.getDefaultSensor(android.hardware.Sensor.TYPE_ROTATION_VECTOR);
+            if (rotationSensor == null)
+                rotationSensor = sensorManager.getDefaultSensor(android.hardware.Sensor.TYPE_GEOMAGNETIC_ROTATION_VECTOR);
+            if (rotationSensor == null) { call.reject("Sin sensor de orientación"); return; }
+            rotationListener = new android.hardware.SensorEventListener() {
+                private final float[] R = new float[9];
+                private final float[] Rout = new float[9];
+                private final float[] ori = new float[3];
+                @Override public void onSensorChanged(android.hardware.SensorEvent ev) {
+                    long now = System.currentTimeMillis();
+                    if (now - ultBrujulaMs < 80) return;   // ~12 Hz
+                    ultBrujulaMs = now;
+                    try {
+                        android.hardware.SensorManager.getRotationMatrixFromVector(R, ev.values);
+                        int rot = 0;
+                        try { rot = getActivity().getWindowManager().getDefaultDisplay().getRotation(); } catch (Exception e) {}
+                        int ax = android.hardware.SensorManager.AXIS_X, ay = android.hardware.SensorManager.AXIS_Y;
+                        switch (rot) {
+                            case android.view.Surface.ROTATION_90:  ax = android.hardware.SensorManager.AXIS_Y;       ay = android.hardware.SensorManager.AXIS_MINUS_X; break;
+                            case android.view.Surface.ROTATION_180: ax = android.hardware.SensorManager.AXIS_MINUS_X; ay = android.hardware.SensorManager.AXIS_MINUS_Y; break;
+                            case android.view.Surface.ROTATION_270: ax = android.hardware.SensorManager.AXIS_MINUS_Y; ay = android.hardware.SensorManager.AXIS_X;       break;
+                            default: break;
+                        }
+                        android.hardware.SensorManager.remapCoordinateSystem(R, ax, ay, Rout);
+                        android.hardware.SensorManager.getOrientation(Rout, ori);
+                        double az = (Math.toDegrees(ori[0]) + 360.0) % 360.0;
+                        notifyListeners("heading", new JSObject().put("deg", az));
+                    } catch (Exception ignored) {}
+                }
+                @Override public void onAccuracyChanged(android.hardware.Sensor s, int a) {}
+            };
+            sensorManager.registerListener(rotationListener, rotationSensor, android.hardware.SensorManager.SENSOR_DELAY_UI);
+            brujulaOn = true;
+            call.resolve(new JSObject().put("status", "on"));
+        } catch (Exception e) { call.reject("No se pudo iniciar la brújula: " + e.getMessage()); }
+    }
+
+    @PluginMethod
+    public void detenerBrujula(PluginCall call) {
+        try {
+            if (sensorManager != null && rotationListener != null) sensorManager.unregisterListener(rotationListener);
+            brujulaOn = false;
+        } catch (Exception ignored) {}
+        if (call != null) call.resolve();
     }
 
     // Habla un texto con el motor TTS nativo (español). Lo usa el módulo Voz de la web.
