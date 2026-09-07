@@ -2226,6 +2226,7 @@ function panelConfig(){
     <div class="fila"><div class="cuerpo"><div class="t">Filtros de calidad</div><div class="s">${S.filtros.activo?'Activo · '+S.filtros.preset:'Apagado'}</div></div><button class="mini" id="cFilt">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Alertas de proximidad</div><div class="s">${alertas.filter(a=>a.activa).length} activa(s) de ${alertas.length}</div></div><button class="mini" id="cAlert">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Fuente de posición</div><div class="s">${S.fuente==='gps'?'GPS puro (nativo)':'Fusionada (GPS+WiFi+celda)'}</div></div><button class="mini" id="cFuente">Cambiar</button></div>
+    <div class="fila"><div class="cuerpo"><div class="t">Brújula (flecha de dirección)</div><div class="s">${brujInvertir?'Invertida (corrección activada)':'Normal'} · calibrar / corregir</div></div><button class="mini" id="cBruj">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Grabación con pantalla bloqueada</div><div class="s">Permisos para que el track no se corte al bloquear el celular</div></div><button class="mini" id="cBg">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Precisión y advertencias</div><div class="s">Términos de uso · leer antes de usar en expedientes</div></div><button class="mini" id="cInfo">Abrir</button></div>
   `);
@@ -2234,6 +2235,7 @@ function panelConfig(){
   document.getElementById('cFilt').onclick  = ()=> navegarPanel(panelFiltros);
   document.getElementById('cAlert').onclick = ()=> navegarPanel(panelAlertas);
   document.getElementById('cFuente').onclick = ()=> navegarPanel(panelFuente);
+  document.getElementById('cBruj').onclick   = ()=> navegarPanel(panelBrujula);
   document.getElementById('cBg').onclick    = ()=> navegarPanel(panelPermisosBackground);
   document.getElementById('cInfo').onclick  = ()=> navegarPanel(panelInfo);
 }
@@ -3162,6 +3164,31 @@ function panelFuente(){
     if(!hayPlugin) return;
     S.fuente = 'gps'; await aplicarFuente();
     toast('Fuente: GPS puro. El primer fix puede tardar; salí a cielo abierto.'); cerrarPanel();
+  };
+}
+
+/* --- brújula: corrección/calibración de la flecha de dirección --- */
+function panelBrujula(){
+  const dir = d => ['N','NE','E','SE','S','SO','O','NO'][Math.round(((d%360)/45))%8];
+  abrirPanel('Brújula (flecha de dirección)', `
+    <div class="nota" style="border-color:var(--fix)">La flecha/cono verde sobre tu posición marca hacia dónde <b>apunta el borde superior del teléfono</b>. Sostenelo bastante plano, como una brújula.</div>
+    <div class="res"><div class="k">Rumbo actual</div><div class="v" id="brujVal">—</div></div>
+    <button class="ancho ${brujInvertir?'':'borde'}" id="brujInv">${brujInvertir?'✓ Corrección activada (flecha invertida 180°)':'La flecha apunta al revés → Invertir'}</button>
+    <div class="nota">Algunos equipos (por ejemplo ciertos <b>Motorola</b>) traen el sensor de la brújula invertido de fábrica y la flecha marca justo al lado contrario. Si te pasa, activá <b>Invertir</b>: se corrige 180° y queda guardado <b>solo para este teléfono</b>.</div>
+    <div class="nota"><b>Calibrar:</b> si la aguja tiembla o queda un poco desviada, movés el teléfono en el aire dibujando un <b>8</b> unas 3–4 veces, lejos de metales, parlantes o imanes. Es la calibración del magnetómetro del propio equipo.</div>
+  `);
+  const tick = ()=>{ const el=document.getElementById('brujVal'); if(!el) return; const v=S.rumboDisp;
+    el.textContent = (v==null) ? 'sin sensor / esperando…' : (Math.round(v)+'° ('+dir(v)+')'); };
+  tick();
+  if(window._brujIv) clearInterval(window._brujIv);
+  window._brujIv = setInterval(()=>{ if(!document.getElementById('brujVal')){ clearInterval(window._brujIv); window._brujIv=null; return; } tick(); }, 300);
+  document.getElementById('brujInv').onclick = async ()=>{
+    brujInvertir = !brujInvertir;
+    try{ await dbPut('conf', brujInvertir, 'brujInvertir'); }catch(e){}
+    if(S.rumboDisp!=null) S.rumboDisp = (S.rumboDisp + 180) % 360;
+    dibujar();
+    toast(brujInvertir ? 'Brújula invertida: corrección activada.' : 'Brújula normal.');
+    panelBrujula();
   };
 }
 
@@ -6621,6 +6648,12 @@ function exportarDiagCSV(){
  * acelerómetro) para saber hacia dónde apunta el aparato, igual que la
  * flecha/cono de Google Maps. No es rumbo GPS (curso), que solo sirve en
  * movimiento; este funciona parado. Suaviza para que el cono no tiemble. */
+// Corrección por equipo: en algunos modelos (p. ej. ciertos Motorola) el sensor
+// de orientación entrega el rumbo 180° invertido por un defecto del fabricante.
+// No es detectable de forma fiable por software (el rumbo GPS no sirve porque el
+// teléfono no siempre apunta hacia donde uno camina), así que se ofrece un
+// interruptor por equipo, persistido. true = suma 180° al rumbo mostrado.
+let brujInvertir = false;
 const Brujula = (()=>{
   let suave = null, ultDibujo = 0, activo = false;
   // Aplica un rumbo (0..360, 0=N horario) con suavizado circular y redibuja.
@@ -6629,7 +6662,7 @@ const Brujula = (()=>{
     let h = ((deg % 360) + 360) % 360;
     if(suave == null) suave = h;
     else { const d = ((h - suave + 540) % 360) - 180; suave = (suave + d*0.2 + 360) % 360; }
-    S.rumboDisp = suave;
+    S.rumboDisp = brujInvertir ? (suave + 180) % 360 : suave;
     const ahora = (performance && performance.now) ? performance.now() : Date.now();
     if(ahora - ultDibujo > 90){ ultDibujo = ahora; try{ dibujar(); }catch(e){} }
   }
@@ -6674,6 +6707,7 @@ const Brujula = (()=>{
   await migrarAGeoJSON();
   S.modo = await dbGet('conf','modo') || 'geo';
   S.capa = await dbGet('conf','capa') || 'sat';
+  try{ brujInvertir = !!(await dbGet('conf','brujInvertir')); }catch(e){}
   const filtGuardados = await dbGet('conf','filtros');
   if(filtGuardados) S.filtros = Object.assign(S.filtros, filtGuardados);
   try{
