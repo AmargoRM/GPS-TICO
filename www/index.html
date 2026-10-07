@@ -2393,6 +2393,7 @@ async function panelDatos(){
     const filasT = g.tracks.map(t=>`<div class="fila">
         <button class="mini ${esVisible(t)?'verde':''}" data-vt="${t.id}" title="Ver/ocultar">${ojo(esVisible(t))}</button>
         <div class="cuerpo" style="opacity:${esVisible(t)?1:.45}"><div class="t">〜 ${t.nom}</div><div class="s">${t.pts.length} pts · ${t.dist.toFixed(0)} m${t.rechazados?` · ${t.rechazados} filtrados`:''}</div></div>
+        <button class="mini" data-act="${t.id}" title="Perfil de actividad">📊</button>
         <button class="mini" data-irt="${t.id}">Ir</button>
         <button class="mini rojo" data-dt="${t.id}">×</button>
       </div>`).join('');
@@ -2463,6 +2464,7 @@ async function panelDatos(){
   const irA = (a,o)=>{ S.centro.lat=a; S.centro.lon=o; S.zoom=18; S.seguir=false; cerrarPanel(); dibujar(); };
   document.querySelectorAll('[data-ir]').forEach(b=> b.onclick = ()=>{ const [a,o]=b.dataset.ir.split(',').map(Number); irA(a,o); });
   document.querySelectorAll('[data-irt]').forEach(b=> b.onclick = ()=>{ const t=S.tracks.find(x=>x.id===b.dataset.irt); if(t&&t.pts&&t.pts[0]) irA(t.pts[0].lat, t.pts[0].lon); });
+  document.querySelectorAll('[data-act]').forEach(b=> b.onclick = ()=> navegarPanel(()=> panelActividad(b.dataset.act)));
   document.querySelectorAll('[data-vp]').forEach(b=> b.onclick = ()=> toggleVisElemento('puntos', S.puntos, b.dataset.vp));
   document.querySelectorAll('[data-vt]').forEach(b=> b.onclick = ()=> toggleVisElemento('tracks', S.tracks, b.dataset.vt));
   document.querySelectorAll('[data-vf]').forEach(b=> b.onclick = ()=> setVisFecha(b.dataset.vf, b.dataset.von==='1'));
@@ -3264,13 +3266,23 @@ function panelPodometro(){
     <div class="nota" style="border-color:var(--fix)">Cuenta <b>pasos</b> y <b>distancia caminada</b>. La distancia solo suma cuando vas a <b>velocidad de caminata</b> (hasta ${pedoCfg.vmax} km/h); si vas más rápido (trote o vehículo) ese tramo <b>no</b> se suma a lo caminado.</div>
     ${avisoSensor}
 
-    <label>Todo el día (se reinicia a medianoche)</label>
-    <div class="res"><div class="k">Pasos hoy</div><div class="v" id="pedoDiaPasos">—</div></div>
-    <div class="res"><div class="k">Distancia caminada hoy</div><div class="v" id="pedoDiaDist">—</div></div>
+    <button class="ancho" id="pedoResultados" style="margin-top:4px">📊 Resultados (semana · mes · año)</button>
+
+    <label style="margin-top:16px">Hoy (se reinicia a medianoche)</label>
+    <div class="res"><div class="k">Pasos</div><div class="v" id="pedoDiaPasos">—</div></div>
+    <div class="res"><div class="k">Distancia caminada</div><div class="v" id="pedoDiaDist">—</div></div>
+    <div class="res"><div class="k">Calorías</div><div class="v" id="pedoDiaKcal">—</div></div>
     <button class="ancho borde" id="pedoReset" style="margin-top:8px">Reiniciar el conteo de hoy</button>
 
     <label style="margin-top:16px">Solo cuando el Track está activo</label>
     <div id="pedoTrackBox"></div>
+
+    <label style="margin-top:16px">Perfil físico (para las calorías)</label>
+    <div class="grid2">
+      <input id="pedoPeso" inputmode="decimal" value="${perfilFisico.peso||''}" placeholder="peso kg">
+      <button class="ancho" id="pedoPesoAp" style="margin-top:0">Guardar</button>
+    </div>
+    <div class="nota">Las calorías se estiman con el método científico <b>ACSM</b> (velocidad + pendiente del terreno + tu peso). Entre más exacto el peso, mejor la estimación.</div>
 
     <label style="margin-top:16px">Velocidad tope de caminata (km/h)</label>
     <div class="grid2">
@@ -3295,11 +3307,13 @@ function panelPodometro(){
     const estN = Pedometro.estado();
     dp.textContent = Pedometro.pasosDia().toLocaleString('es-CR') + (estN.disponible===false?' (est.)':'');
     const dd = document.getElementById('pedoDiaDist'); if(dd) dd.textContent = fmtDist(pedoDia ? pedoDia.distM : 0);
+    const dk = document.getElementById('pedoDiaKcal'); if(dk) dk.textContent = Math.round(Pedometro.kcalDia()) + ' kcal';
     const box = document.getElementById('pedoTrackBox');
     if(box){
       if(S.grabando){
         box.innerHTML = `<div class="res"><div class="k">Pasos del track</div><div class="v">${Pedometro.pasosTrack().toLocaleString('es-CR')}${estN.disponible===false?' (est.)':''}</div></div>
           <div class="res"><div class="k">Caminado en el track</div><div class="v">${fmtDist(S.grabando.distCaminada||0)}</div></div>
+          <div class="res"><div class="k">Calorías del track</div><div class="v">${Math.round(S.grabando.kcal||0)} kcal</div></div>
           <div class="res"><div class="k">Recorrido total del track</div><div class="v">${fmtDist(S.grabando.dist||0)}</div></div>`;
       } else {
         box.innerHTML = `<div class="nota">No hay ningún track grabando. Tocá <b>Grabar track</b> y acá vas a ver los pasos y los metros caminados de ese recorrido.</div>`;
@@ -3315,6 +3329,13 @@ function panelPodometro(){
   }, 700);
   const permBtn = document.getElementById('pedoPerm');
   if(permBtn) permBtn.onclick = async ()=>{ await Pedometro.reintentar(); toast('Si aceptaste el permiso, los pasos empiezan a contar.'); setTimeout(panelPodometro, 600); };
+  document.getElementById('pedoResultados').onclick = ()=> navegarPanel(panelPodoResultados);
+  document.getElementById('pedoPesoAp').onclick = ()=>{
+    const p = parseFloat((document.getElementById('pedoPeso').value||'').replace(',','.'));
+    if(!isFinite(p) || p<20 || p>300){ toast('Ingresá un peso válido (20–300 kg).'); return; }
+    perfilFisico.peso = Math.round(p*10)/10; Pedometro.guardarPerfil();
+    toast('Peso guardado: ' + perfilFisico.peso + ' kg.');
+  };
   document.getElementById('pedoReset').onclick = ()=>{ Pedometro.reiniciarDia(); toast('Conteo de hoy reiniciado.'); tick(); };
   const aplicarV = (v)=>{
     if(!isFinite(v) || v<1 || v>20){ toast('Ingresá una velocidad entre 1 y 20 km/h.'); return; }
@@ -3324,6 +3345,201 @@ function panelPodometro(){
   document.getElementById('pedoVmaxAp').onclick = ()=> aplicarV(parseFloat((document.getElementById('pedoVmax').value||'').replace(',','.')));
   document.querySelectorAll('[data-vmax]').forEach(b=> b.onclick = ()=> aplicarV(+b.dataset.vmax));
   document.getElementById('pedoTodoDia').onclick = ()=>{ pedoCfg.todoDia = !pedoCfg.todoDia; Pedometro.guardarCfg(); toast(pedoCfg.todoDia?'Contando todo el día.':'Solo se cuenta con track activo.'); panelPodometro(); };
+}
+
+/* --- podómetro: RESULTADOS (semana / mes / año) --- */
+function keyDia(d){ return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0'); }
+function parseKeyDia(k){ const p=String(k).split('-').map(Number); return new Date(p[0], (p[1]||1)-1, p[2]||1); }
+function inicioSemana(d){ const x=new Date(d); x.setHours(0,0,0,0); const dow=(x.getDay()+6)%7; x.setDate(x.getDate()-dow); return x; }  // lunes
+function pedoSerie(){
+  const m = Object.assign({}, pedoHist);
+  if(pedoDia && pedoDia.fecha){ m[pedoDia.fecha] = pedoFotoDia(pedoDia); }
+  return m;
+}
+let _podoChartPer = '7d';
+function barrasSVG(items, color){
+  const W=320, H=140, padB=22, padT=12, padL=6, padR=6;
+  const max = Math.max(1, ...items.map(i=> i.valor||0));
+  const n = Math.max(1, items.length), bw=(W-padL-padR)/n;
+  let out='';
+  items.forEach((it,idx)=>{
+    const h = (it.valor||0)/max*(H-padB-padT);
+    const x = padL+idx*bw+bw*0.15, y = H-padB-h, w = bw*0.7;
+    out += `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${w.toFixed(1)}" height="${Math.max(0,h).toFixed(1)}" rx="2" fill="${color}"/>`;
+    out += `<text x="${(x+w/2).toFixed(1)}" y="${H-padB+11}" font-size="8" fill="#6E8B86" text-anchor="middle">${escHtml(it.label)}</text>`;
+    if((it.valor||0)>0){ const et = it.valor>=1000 ? (Math.round(it.valor/100)/10)+'k' : String(it.valor); out += `<text x="${(x+w/2).toFixed(1)}" y="${(y-2).toFixed(1)}" font-size="7.5" fill="#DCE6E4" text-anchor="middle">${et}</text>`; }
+  });
+  return `<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto;display:block;background:var(--abismo);border:1px solid var(--cauce);border-radius:8px">${out}</svg>`;
+}
+function panelPodoResultados(){
+  const serie = pedoSerie();
+  const hoy = new Date();
+  const wk0 = inicioSemana(hoy);
+  const sumSi = (pred)=>{ let p=0,di=0,k=0,dias=0; for(const key in serie){ const dt=parseKeyDia(key); if(pred(dt)){ const f=serie[key]; p+=f.pasos||0; di+=f.distM||0; k+=f.kcal||0; dias++; } } return {pasos:p, distM:di, kcal:k, dias}; };
+  const semana = sumSi(dt=> dt>=wk0);
+  const mes = sumSi(dt=> dt.getFullYear()===hoy.getFullYear() && dt.getMonth()===hoy.getMonth());
+  const anio = sumSi(dt=> dt.getFullYear()===hoy.getFullYear());
+  const todo = sumSi(()=>true);
+  // Datos para el gráfico según el período elegido.
+  const diaCorto = ['D','L','M','M','J','V','S'];
+  const mesCorto = ['ene','feb','mar','abr','may','jun','jul','ago','sep','oct','nov','dic'];
+  let chart = [];
+  if(_podoChartPer==='7d'){
+    for(let i=6;i>=0;i--){ const d=new Date(hoy); d.setDate(d.getDate()-i); const f=serie[keyDia(d)]; chart.push({label:diaCorto[d.getDay()], valor:Math.round(f?f.pasos:0)}); }
+  } else if(_podoChartPer==='12s'){
+    for(let i=11;i>=0;i--){ const s=new Date(wk0); s.setDate(s.getDate()-i*7); const e=new Date(s); e.setDate(e.getDate()+7); let v=0; for(const key in serie){ const dt=parseKeyDia(key); if(dt>=s&&dt<e) v+=serie[key].pasos||0; } chart.push({label:s.getDate()+'/'+(s.getMonth()+1), valor:Math.round(v)}); }
+  } else {
+    for(let i=11;i>=0;i--){ const d=new Date(hoy.getFullYear(), hoy.getMonth()-i, 1); let v=0; for(const key in serie){ const dt=parseKeyDia(key); if(dt.getFullYear()===d.getFullYear()&&dt.getMonth()===d.getMonth()) v+=serie[key].pasos||0; } chart.push({label:mesCorto[d.getMonth()], valor:Math.round(v)}); }
+  }
+  const tarjeta = (titulo, r)=> `<div style="background:var(--lecho);border:1px solid var(--cauce);border-radius:8px;padding:10px 12px;margin-top:8px">
+      <div style="font-weight:700;font-size:13px;margin-bottom:6px">${titulo}</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:4px 10px;font-size:12px">
+        <div><span style="color:var(--musgo)">Pasos</span><br><b>${(r.pasos||0).toLocaleString('es-CR')}</b></div>
+        <div><span style="color:var(--musgo)">Distancia</span><br><b>${fmtDist(r.distM)}</b></div>
+        <div><span style="color:var(--musgo)">Calorías</span><br><b>${Math.round(r.kcal||0)} kcal</b></div>
+        <div><span style="color:var(--musgo)">Días activos</span><br><b>${r.dias||0}</b></div>
+      </div></div>`;
+  // Tracks recientes (perfil de actividad individual).
+  const tracks = (S.tracks||[]).slice().sort((a,b)=> tsTrack(b)-tsTrack(a)).slice(0,8);
+  const listaTracks = tracks.length ? tracks.map(t=> `<div class="fila">
+      <div class="cuerpo"><div class="t">〜 ${escHtml(t.nom||'Track')}</div><div class="s">${new Date(tsTrack(t)).toLocaleDateString('es-CR')} · ${fmtDist(t.dist||0)}</div></div>
+      <button class="mini" data-act="${t.id}">📊 Perfil</button></div>`).join('') : '<div class="nota">Todavía no hay tracks grabados. Grabá uno y acá vas a ver su perfil de actividad (mapa + elevación).</div>';
+
+  abrirPanel('Resultados', `
+    ${todo.dias ? '' : '<div class="nota">Aún no hay historial. A medida que camines (y pasen los días), acá vas a ver tus totales por semana, mes y año.</div>'}
+    <div style="display:flex;gap:6px;flex-wrap:wrap">
+      <button class="mini ${_podoChartPer==='7d'?'verde':''}" data-per="7d">7 días</button>
+      <button class="mini ${_podoChartPer==='12s'?'verde':''}" data-per="12s">12 semanas</button>
+      <button class="mini ${_podoChartPer==='12m'?'verde':''}" data-per="12m">12 meses</button>
+    </div>
+    <div style="color:var(--musgo);font-size:11px;margin:6px 0 2px">Pasos por ${_podoChartPer==='7d'?'día':_podoChartPer==='12s'?'semana':'mes'}</div>
+    ${barrasSVG(chart, '#4FD1C5')}
+    ${tarjeta('Esta semana', semana)}
+    ${tarjeta('Este mes', mes)}
+    ${tarjeta('Este año', anio)}
+    ${tarjeta('Histórico total', todo)}
+    <label style="margin-top:16px">Perfil de actividad por track</label>
+    ${listaTracks}
+    <div class="nota" style="margin-top:10px">Los totales salen del historial diario (pasos, distancia caminada y calorías). La distancia y las calorías dependen del GPS, así que reflejan lo registrado con la app activa.</div>
+  `);
+  document.querySelectorAll('[data-per]').forEach(b=> b.onclick = ()=>{ _podoChartPer=b.dataset.per; panelPodoResultados(); });
+  document.querySelectorAll('[data-act]').forEach(b=> b.onclick = ()=> navegarPanel(()=> panelActividad(b.dataset.act)));
+}
+
+/* --- perfil de actividad de un track (mapa + elevación + métricas) --- */
+function elevOf(p){ return p.altOrto!=null ? p.altOrto : (p.altElip!=null ? p.altElip : (p.alt!=null ? p.alt : null)); }
+function fmtDur(s){ s=Math.round(s||0); const h=Math.floor(s/3600), m=Math.floor((s%3600)/60), ss=s%60; return (h?h+'h ':'')+((h||m)?m+'m ':'')+ss+'s'; }
+function fmtPace(secKm){ if(!isFinite(secKm)||secKm<=0) return '—'; const m=Math.floor(secKm/60), s=Math.round(secKm%60); return m+':'+String(s).padStart(2,'0')+' /km'; }
+function calcActividad(t){
+  const pts=(t&&t.pts)||[];
+  const out={dist:0,dur:0,mov:0,vmax:0,gain:0,loss:0,kcal:0,eleMin:null,eleMax:null,cum:[],ele:[],sinTiempo:false};
+  if(pts.length<2) return out;
+  out.cum.push(0); out.ele.push(elevOf(pts[0]));
+  let ref = elevOf(pts[0]), cum=0;
+  for(let i=1;i<pts.length;i++){
+    const a=pts[i-1], b=pts[i];
+    const d=distM(a.lat,a.lon,b.lat,b.lon); cum+=d; out.dist+=d;
+    out.cum.push(cum); const eb=elevOf(b); out.ele.push(eb);
+    const dt=(b.t&&a.t)?(b.t-a.t)/1000:0;
+    if(dt>0 && dt<3600){
+      out.dur+=dt; const v=d/dt;
+      if(v>0.3) out.mov+=dt;
+      if(v>out.vmax && v<12) out.vmax=v;
+      const ea=elevOf(a); const dEle=(eb!=null&&ea!=null)?(eb-ea):null;
+      out.kcal += kcalSegmento(d, dt, dEle, perfilFisico.peso||70);
+    }
+    if(eb!=null && ref!=null){ const de=eb-ref; if(de>=1.5){ out.gain+=de; ref=eb; } else if(de<=-1.5){ out.loss+=-de; ref=eb; } }
+    else if(eb!=null && ref==null){ ref=eb; }
+    if(eb!=null){ out.eleMin=(out.eleMin==null?eb:Math.min(out.eleMin,eb)); out.eleMax=(out.eleMax==null?eb:Math.max(out.eleMax,eb)); }
+  }
+  if(out.dur < 5){ out.sinTiempo=true; out.kcal=(perfilFisico.peso||70)*(out.dist/1000)*0.9; }  // sin tiempo: estimar por distancia
+  return out;
+}
+function perfilElevSVG(A){
+  const W=320,H=120,padL=30,padR=8,padT=8,padB=18;
+  const xs=[], ys=[];
+  for(let i=0;i<A.ele.length;i++){ if(A.ele[i]!=null){ xs.push(A.cum[i]); ys.push(A.ele[i]); } }
+  if(xs.length<2) return '<div class="nota">Este track no tiene datos de altura para el perfil de elevación.</div>';
+  const minE=Math.min(...ys), maxE=Math.max(...ys), rng=Math.max(1,maxE-minE), maxD=xs[xs.length-1]||1;
+  const X=d=> padL+(d/maxD)*(W-padL-padR);
+  const Y=e=> padT+(1-(e-minE)/rng)*(H-padT-padB);
+  let d='M'+X(xs[0]).toFixed(1)+' '+Y(ys[0]).toFixed(1);
+  for(let i=1;i<xs.length;i++) d+=' L'+X(xs[i]).toFixed(1)+' '+Y(ys[i]).toFixed(1);
+  const area=d+` L${X(maxD).toFixed(1)} ${(H-padB).toFixed(1)} L${X(0).toFixed(1)} ${(H-padB).toFixed(1)} Z`;
+  const xkm=(maxD/1000).toFixed(maxD>=1000?1:2);
+  return `<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto;display:block;background:var(--abismo);border:1px solid var(--cauce);border-radius:8px">
+    <path d="${area}" fill="rgba(79,209,197,.15)"/>
+    <path d="${d}" fill="none" stroke="#4FD1C5" stroke-width="1.6"/>
+    <line x1="${padL}" y1="${padT}" x2="${padL}" y2="${H-padB}" stroke="#1B3136"/>
+    <line x1="${padL}" y1="${H-padB}" x2="${W-padR}" y2="${H-padB}" stroke="#1B3136"/>
+    <text x="2" y="${(Y(maxE)+3).toFixed(1)}" font-size="8" fill="#6E8B86">${Math.round(maxE)} m</text>
+    <text x="2" y="${(Y(minE)+3).toFixed(1)}" font-size="8" fill="#6E8B86">${Math.round(minE)} m</text>
+    <text x="${W-padR}" y="${H-5}" font-size="8" fill="#6E8B86" text-anchor="end">${xkm} km</text>
+  </svg>`;
+}
+// Mini-mapa del recorrido: tiles del mapa base (satélite) + la línea del track.
+function trazMini(g, pts, z, ox, oy){ g.beginPath(); for(let i=0;i<pts.length;i++){ const px=lon2px(pts[i].lon,z)-ox, py=lat2px(pts[i].lat,z)-oy; if(i===0) g.moveTo(px,py); else g.lineTo(px,py); } g.stroke(); }
+function renderMiniMapa(cv, pts, intento){
+  intento = intento||0;
+  const g=cv.getContext('2d'), W=cv.width, H=cv.height;
+  g.fillStyle='#0A1214'; g.fillRect(0,0,W,H);
+  if(!pts || !pts.length) return;
+  let minLa=Infinity,maxLa=-Infinity,minLo=Infinity,maxLo=-Infinity;
+  for(const p of pts){ if(p.lat<minLa)minLa=p.lat; if(p.lat>maxLa)maxLa=p.lat; if(p.lon<minLo)minLo=p.lon; if(p.lon>maxLo)maxLo=p.lon; }
+  if(!isFinite(minLa)) return;
+  const pad=14, maxZ=(CAPAS[S.capa].max)||19;
+  let z=maxZ;
+  for(; z>2; z--){ const dx=lon2px(maxLo,z)-lon2px(minLo,z), dy=lat2px(minLa,z)-lat2px(maxLa,z); if(dx<=(W-2*pad) && dy<=(H-2*pad)) break; }
+  const cLon=(minLo+maxLo)/2, cLat=(minLa+maxLa)/2;
+  const ox=lon2px(cLon,z)-W/2, oy=lat2px(cLat,z)-H/2;
+  const tx0=Math.floor(ox/256), ty0=Math.floor(oy/256), tx1=Math.floor((ox+W)/256), ty1=Math.floor((oy+H)/256);
+  let faltan=false;
+  for(let ty=ty0;ty<=ty1;ty++) for(let tx=tx0;tx<=tx1;tx++){
+    const img=tile(z,tx,ty,S.capa); const sx=tx*256-ox, sy=ty*256-oy;
+    if(img && !(img instanceof Promise)){ try{ g.drawImage(img, Math.round(sx), Math.round(sy), 257, 257); }catch(e){} }
+    else { faltan=true; g.fillStyle='#1B2528'; g.fillRect(Math.round(sx), Math.round(sy), 257, 257); }
+  }
+  g.lineJoin=g.lineCap='round';
+  g.strokeStyle='rgba(10,18,20,.6)'; g.lineWidth=5; trazMini(g, pts, z, ox, oy);
+  g.strokeStyle='#4FD1C5'; g.lineWidth=2.5; trazMini(g, pts, z, ox, oy);
+  const mk=(p,col)=>{ const px=lon2px(p.lon,z)-ox, py=lat2px(p.lat,z)-oy; g.beginPath(); g.arc(px,py,5,0,7); g.fillStyle=col; g.fill(); g.lineWidth=2; g.strokeStyle='#0A1214'; g.stroke(); };
+  mk(pts[0],'#2ecc71'); mk(pts[pts.length-1],'#C75146');
+  if(faltan && intento<6) setTimeout(()=> renderMiniMapa(cv, pts, intento+1), 400+intento*300);
+}
+function panelActividad(trackId){
+  const t=(S.tracks||[]).find(x=> x.id===trackId);
+  if(!t){ toast('Track no encontrado.'); return; }
+  const A=calcActividad(t);
+  const tMov = A.mov>5 ? A.mov : A.dur;
+  const vmed = tMov>0 ? (A.dist/tMov) : 0;
+  const pace = (A.dist>0 && tMov>0) ? (tMov/(A.dist/1000)) : 0;
+  const pasos = t.pasosCaminados ? t.pasosCaminados : Math.round((t.distCaminada||A.dist)/ZANCADA);
+  const cuando = new Date(tsTrack(t)).toLocaleString('es-CR');
+  abrirPanel('Actividad', `
+    <div class="nota" style="border-color:var(--fix)">〜 <b>${escHtml(t.nom||'Track')}</b> · ${escHtml(cuando)}</div>
+    <canvas id="actMap" style="width:100%;height:180px;border:1px solid var(--cauce);border-radius:8px;display:block"></canvas>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:10px">
+      <div class="res"><div class="k">Distancia</div><div class="v">${fmtDist(A.dist)}</div></div>
+      <div class="res"><div class="k">Duración</div><div class="v">${A.dur>0?fmtDur(A.dur):'—'}</div></div>
+      <div class="res"><div class="k">En movimiento</div><div class="v">${A.mov>0?fmtDur(A.mov):'—'}</div></div>
+      <div class="res"><div class="k">Vel. media</div><div class="v">${vmed>0?(vmed*3.6).toFixed(1)+' km/h':'—'}</div></div>
+      <div class="res"><div class="k">Vel. máx</div><div class="v">${A.vmax>0?(A.vmax*3.6).toFixed(1)+' km/h':'—'}</div></div>
+      <div class="res"><div class="k">Ritmo</div><div class="v">${fmtPace(pace)}</div></div>
+      <div class="res"><div class="k">Desnivel +</div><div class="v">${Math.round(A.gain)} m</div></div>
+      <div class="res"><div class="k">Desnivel −</div><div class="v">${Math.round(A.loss)} m</div></div>
+      <div class="res"><div class="k">Pendiente media</div><div class="v">${A.dist>0?((A.gain/A.dist)*100).toFixed(1)+' %':'—'}</div></div>
+      <div class="res"><div class="k">Pasos</div><div class="v">${pasos.toLocaleString('es-CR')}</div></div>
+      <div class="res"><div class="k">Calorías</div><div class="v">${Math.round(A.kcal)} kcal</div></div>
+      <div class="res"><div class="k">Alt. mín/máx</div><div class="v">${A.eleMin!=null?Math.round(A.eleMin)+' / '+Math.round(A.eleMax)+' m':'—'}</div></div>
+    </div>
+    <label style="margin-top:14px">Perfil de elevación</label>
+    ${perfilElevSVG(A)}
+    <button class="ancho" id="actVerMapa" style="margin-top:12px">Ver el recorrido en el mapa</button>
+    <div class="nota" style="margin-top:10px">Calorías por método <b>ACSM</b> (velocidad + pendiente + peso ${perfilFisico.peso||70} kg).${A.sinTiempo?' Este track no tiene marcas de tiempo: las calorías se estimaron por distancia.':''} El desnivel usa una banda muerta de 1,5 m para descartar el ruido del GPS. Podés cambiar tu peso en Podómetro.</div>
+  `);
+  const cvA=document.getElementById('actMap');
+  if(cvA){ const w=cvA.clientWidth||320; cvA.width=Math.max(160, Math.round(w)); cvA.height=180; renderMiniMapa(cvA, t.pts, 0); }
+  document.getElementById('actVerMapa').onclick = ()=>{ if(t.pts && t.pts[0]){ S.centro.lat=t.pts[0].lat; S.centro.lon=t.pts[0].lon; S.zoom=16; S.seguir=false; } cerrarPanel(); dibujar(); };
 }
 
 /* --- filtros de calidad (F5) --- */
@@ -6849,8 +7065,37 @@ const Brujula = (()=>{
    Si el equipo no tiene sensor de pasos, se estima desde la distancia.
    ======================================================================= */
 let pedoCfg = { vmax: 6, todoDia: true };   // vmax en km/h
-let pedoDia = null;                          // { fecha, base, banco, distM, last }
+let pedoDia = null;                          // { fecha, base, banco, distM, last, kcal }
+let pedoHist = {};                           // { 'YYYY-MM-DD': {pasos, distM, kcal} } histórico
+let perfilFisico = { peso: 70, altura: null, edad: null, sexo: null };  // para calorías
 const ZANCADA = 0.75;                        // m por paso (para estimar sin sensor)
+
+// --- Calorías: método ACSM (American College of Sports Medicine) ---
+// VO2 (ml/kg/min) a partir de la velocidad (m/min) y la pendiente (fracción).
+// Energía: 5 kcal por litro de O2 consumido. Es el estándar científico para
+// estimar el gasto en caminata/carrera a partir de velocidad y desnivel.
+function kcalSegmento(d_m, dt_s, dEle_m, pesoKg){
+  if(!(d_m > 0) || !(dt_s > 0) || !(pesoKg > 0)) return 0;
+  const vmin = d_m / (dt_s/60);                 // m/min horizontal
+  let grade = 0;
+  if(dEle_m != null && d_m > 0) grade = Math.max(0, Math.min(0.30, dEle_m / d_m));
+  const corriendo = vmin > 116.7;               // > ~7 km/h ⇒ ecuación de carrera
+  const vo2 = corriendo
+    ? (0.2 * vmin + 0.9 * vmin * grade + 3.5)   // ACSM carrera
+    : (0.1 * vmin + 1.8 * vmin * grade + 3.5);  // ACSM caminata
+  const kcalMin = vo2 * pesoKg / 1000 * 5;      // 5 kcal / L O2
+  const k = kcalMin * (dt_s/60);
+  return (isFinite(k) && k > 0) ? k : 0;
+}
+// Convierte un registro de día (base/banco/last) en una foto para el histórico.
+function pedoFotoDia(rec){
+  if(!rec) return null;
+  let pasos;
+  if(rec.base != null && rec.last != null) pasos = (rec.banco||0) + (rec.last - rec.base);
+  else if(rec.distM) pasos = rec.distM / ZANCADA;   // sin sensor: estimar por distancia
+  else pasos = rec.banco || 0;
+  return { pasos: Math.max(0, Math.round(pasos)), distM: rec.distM || 0, kcal: rec.kcal || 0 };
+}
 const Pedometro = (()=>{
   let total = null;          // pasos acumulados del sensor (desde el arranque)
   let disponible = null;     // true | false | null(desconocido)
@@ -6861,7 +7106,15 @@ const Pedometro = (()=>{
   function asegurarDia(){
     const h = hoyStr();
     if(!pedoDia || pedoDia.fecha !== h){
-      pedoDia = { fecha:h, base:(total!=null?total:null), banco:0, distM:0, last:(total!=null?total:null) };
+      // Archivar el día que termina en el histórico (si tuvo actividad).
+      if(pedoDia && pedoDia.fecha && pedoDia.fecha !== h){
+        const foto = pedoFotoDia(pedoDia);
+        if(foto && (foto.pasos > 0 || foto.distM > 0 || foto.kcal > 0)){
+          pedoHist[pedoDia.fecha] = foto;
+          try{ dbPut('conf', pedoHist, 'pedoHist'); }catch(e){}
+        }
+      }
+      pedoDia = { fecha:h, base:(total!=null?total:null), banco:0, distM:0, last:(total!=null?total:null), kcal:0 };
       guardarDia(true);
     }
   }
@@ -6905,9 +7158,10 @@ const Pedometro = (()=>{
     }
     refrescar();
   }
-  // Llega un fix GPS: sumar distancia caminada si la velocidad <= vmax.
+  // Llega un fix GPS: sumar distancia caminada y calorías si la velocidad <= vmax.
   function alFix(pos){
     const c = pos.coords, t = pos.timestamp || Date.now();
+    const ele = (pos.altOrto!=null) ? pos.altOrto : (pos.altElip!=null ? pos.altElip : null);
     const vmaxMs = (pedoCfg.vmax||6)/3.6;
     if(prevFix){
       const d = distM(prevFix.lat, prevFix.lon, c.latitude, c.longitude);
@@ -6917,12 +7171,21 @@ const Pedometro = (()=>{
       const accOk = (c.accuracy==null) || (c.accuracy <= 25);
       // Ignorar jitter de GPS parado y descartar tramos por encima de caminata.
       if(accOk && d >= 0.7 && d <= vmaxMs*dts*1.6 && v <= vmaxMs){
+        const dEle = (ele!=null && prevFix.ele!=null) ? (ele - prevFix.ele) : null;
+        const kc = kcalSegmento(d, dts, dEle, perfilFisico.peso||70);
         asegurarDia();
-        if(pedoCfg.todoDia){ pedoDia.distM = (pedoDia.distM||0) + d; guardarDia(false); }
-        if(S.grabando){ S.grabando.distCaminada = (S.grabando.distCaminada||0) + d; }
+        if(pedoCfg.todoDia){
+          pedoDia.distM = (pedoDia.distM||0) + d;
+          pedoDia.kcal = (pedoDia.kcal||0) + kc;
+          guardarDia(false);
+        }
+        if(S.grabando){
+          S.grabando.distCaminada = (S.grabando.distCaminada||0) + d;
+          S.grabando.kcal = (S.grabando.kcal||0) + kc;
+        }
       }
     }
-    prevFix = { lat:c.latitude, lon:c.longitude, t };
+    prevFix = { lat:c.latitude, lon:c.longitude, t, ele };
     refrescar();
   }
   async function iniciar(){
@@ -6948,14 +7211,16 @@ const Pedometro = (()=>{
     S.grabando.distCaminada = 0;
   }
   function reiniciarDia(){
-    pedoDia = { fecha:hoyStr(), base:(total!=null?total:null), banco:0, distM:0, last:(total!=null?total:null) };
+    pedoDia = { fecha:hoyStr(), base:(total!=null?total:null), banco:0, distM:0, last:(total!=null?total:null), kcal:0 };
     guardarDia(true); refrescar();
   }
+  function kcalDia(){ return pedoDia ? (pedoDia.kcal||0) : 0; }
+  function guardarPerfil(){ try{ dbPut('conf', perfilFisico, 'perfilFisico'); }catch(e){} }
   function refrescar(){ if(_hook){ try{ _hook(); }catch(e){} } }
   function setHook(fn){ _hook = fn; }
   function estado(){ return { total, disponible, permiso }; }
   return { iniciar, reintentar, onPasos, alFix, trackInicia, reiniciarDia,
-           pasosDia, pasosTrack, setHook, estado, guardarCfg };
+           pasosDia, pasosTrack, kcalDia, setHook, estado, guardarCfg, guardarPerfil };
 })();
 
 /* =======================================================================
@@ -6970,6 +7235,8 @@ const Pedometro = (()=>{
   try{ const bo = await dbGet('conf','brujOffset'); if(bo!=null && isFinite(bo)) brujOffset = ((Number(bo)%360)+360)%360; }catch(e){}
   try{ const pc = await dbGet('conf','pedoCfg'); if(pc){ pedoCfg = Object.assign(pedoCfg, pc); } }catch(e){}
   try{ const pd = await dbGet('conf','pedoDia'); if(pd && pd.fecha){ pedoDia = pd; } }catch(e){}
+  try{ const ph = await dbGet('conf','pedoHist'); if(ph && typeof ph==='object'){ pedoHist = ph; } }catch(e){}
+  try{ const pf = await dbGet('conf','perfilFisico'); if(pf){ perfilFisico = Object.assign(perfilFisico, pf); } }catch(e){}
   const filtGuardados = await dbGet('conf','filtros');
   if(filtGuardados) S.filtros = Object.assign(S.filtros, filtGuardados);
   try{
