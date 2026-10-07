@@ -532,6 +532,12 @@ function medir(){
 function tileGen(k, url, nativo){
   if(memTiles.has(k)) return memTiles.get(k);
   if(pidiendo.has(k)) return null;
+  // Freno a la avalancha: durante un pellizco/zoom rápido se piden tiles de
+  // varios niveles a la vez y cada uno decodifica un ImageBitmap. Si hay
+  // demasiados en vuelo, no encolamos más en este fotograma (se vuelven a
+  // pedir en el siguiente redibujo). Evita picos de memoria que mataban el
+  // proceso de render.
+  if(pidiendo.size >= 24) return null;
   pidiendo.add(k);
   cargarTileURL(k, url, nativo);
   return null;
@@ -558,7 +564,18 @@ async function cargarTileURL(k, url, nativo){
       }
     }
     const img = await createImageBitmap(blob);
-    if(memTiles.size > 400){ for(const kk of Array.from(memTiles.keys()).slice(0,150)) memTiles.delete(kk); }
+    // Al desalojar tiles de la caché en RAM hay que liberar su memoria nativa
+    // con close(): soltarlos del Map no basta y se acumulan hasta que el GC
+    // actúa. En zoom/paneo intenso eso agotaba la memoria del proceso de
+    // render de la WebView y Android lo mataba (la app se "recargaba" sola:
+    // volvía a "Buscando señal GPS" y se perdía el estado en pantalla).
+    if(memTiles.size > 260){
+      for(const kk of Array.from(memTiles.keys()).slice(0,120)){
+        const vb = memTiles.get(kk);
+        try{ if(vb && typeof vb.close === 'function') vb.close(); }catch(e){}
+        memTiles.delete(kk);
+      }
+    }
     memTiles.set(k, img);
     pidiendo.delete(k);
     dibujar();
