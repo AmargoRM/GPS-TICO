@@ -1438,6 +1438,7 @@ function alFix(pos){
   dibujarAnillo(c.accuracy);
   if(pendientePuntoWidget){ pendientePuntoWidget = false; marcarPuntoRapido(); }
   if(S.grabando) grabarPunto(pos);
+  try{ Pedometro.alFix(pos); }catch(e){}
   if(ocupacion && ocupacion.activa) ocupacion.muestras.push({
     lat:c.latitude, lon:c.longitude, acc:(c.accuracy!=null?c.accuracy:null),
     altElip:pos.altElip, altOrto:pos.altOrto, altOrtoFuente:pos.altOrtoFuente,
@@ -1640,7 +1641,9 @@ async function alternarTrack(){
     await dbPut('tracks', JSON.parse(JSON.stringify(S.grabando)));
     await dbDel('conf','trackEnCurso');
     const rech = S.grabando.rechazados||0;
-    toast(`Track guardado · ${S.grabando.pts.length} puntos · ${S.grabando.dist.toFixed(0)} m` + (rech?` · ${rech} filtrados`:''));
+    let camInfo = '';
+    try{ const pt = Pedometro.pasosTrack(); const dc = S.grabando.distCaminada||0; if(pt || dc) camInfo = ` · 👟 ${pt} pasos · ${dc>=1000?(dc/1000).toFixed(2)+' km':Math.round(dc)+' m'} caminados`; }catch(e){}
+    toast(`Track guardado · ${S.grabando.pts.length} puntos · ${S.grabando.dist.toFixed(0)} m` + (rech?` · ${rech} filtrados`:'') + camInfo);
     disparoAutoSync();
     S.grabando = null;
     b.dataset.on = '0'; b.textContent = 'Grabar track';
@@ -1660,6 +1663,8 @@ async function alternarTrack(){
       aceptados:0, rechazados:0,
       filtroConfig: (S.filtros && S.filtros.activo) ? JSON.parse(JSON.stringify(S.filtros)) : null,
       geojson:{type:'Feature',geometry:{type:'LineString',coordinates:[]},properties:{}} };
+    // Arrancar el contador de pasos/distancia caminada de ESTE track.
+    try{ Pedometro.trackInicia(); }catch(e){}
     // Marcar el track como "en curso" para poder recuperarlo si la app se mata.
     await dbPut('tracks', JSON.parse(JSON.stringify(S.grabando)));
     await dbPut('conf', S.grabando.id, 'trackEnCurso');
@@ -2156,6 +2161,7 @@ function abrirMenu(){
   abrirPanel('Menú', `
     <div class="fila"><div class="cuerpo"><div class="t">Capas del proyecto</div><div class="s">${S.capas.length} capa(s) · GeoJSON · KML · SHP · WFS · WMS</div></div><button class="mini" id="mCapas">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Puntos y tracks</div><div class="s">${S.puntos.length} puntos · ${S.tracks.length} tracks</div></div><button class="mini" id="mDatos">Ver</button></div>
+    <div class="fila"><div class="cuerpo"><div class="t">Podómetro (pasos)</div><div class="s">Pasos y distancia caminada · todo el día / por track</div></div><button class="mini" id="mPasos">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Convertir coordenadas</div><div class="s">Geo ↔ CRTM05 ↔ Lambert N/S</div></div><button class="mini" id="mConv">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Mapa sin conexión</div><div class="s">Zonas y parches descargables</div></div><button class="mini" id="mOff">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Exportar proyecto</div><div class="s">GPX · CSV · GeoJSON</div></div><button class="mini" id="mExp">Abrir</button></div>
@@ -2168,6 +2174,7 @@ function abrirMenu(){
   document.getElementById('mUpd').onclick = ()=> buscarActualizacion(true);
   document.getElementById('mCapas').onclick = ()=> navegarPanel(panelCapas);
   document.getElementById('mDatos').onclick = ()=> navegarPanel(panelDatos);
+  document.getElementById('mPasos').onclick = ()=> navegarPanel(panelPodometro);
   document.getElementById('mConv').onclick  = ()=> navegarPanel(panelConv);
   document.getElementById('mOff').onclick   = ()=> navegarPanel(panelOffline);
   document.getElementById('mExp').onclick   = ()=> navegarPanel(panelExport);
@@ -3237,6 +3244,86 @@ function panelBrujula(){
     setOff(v);
   };
   document.querySelectorAll('[data-boff]').forEach(b=> b.onclick = ()=> setOff(+b.dataset.boff));
+}
+
+/* --- podómetro: pasos + distancia caminada (2 vistas) --- */
+function fmtDist(m){
+  if(m==null || !isFinite(m)) return '—';
+  return m >= 1000 ? (m/1000).toFixed(2)+' km' : Math.round(m)+' m';
+}
+function panelPodometro(){
+  const est = Pedometro.estado();
+  let avisoSensor = '';
+  if(est.disponible === false){
+    avisoSensor = `<div class="nota">Tu teléfono no reporta sensor de pasos. Muestro los pasos <b>estimados</b> a partir de la distancia caminada (≈${ZANCADA} m por paso).</div>`;
+  } else if(est.permiso === false){
+    avisoSensor = `<div class="nota" style="border-color:var(--sangre)">Falta el permiso de <b>actividad física</b> para leer los pasos. Tocá el botón y aceptá; luego volvé a entrar a esta pantalla.</div>
+      <button class="ancho" id="pedoPerm">Activar permiso de actividad física</button>`;
+  }
+  abrirPanel('Podómetro (pasos)', `
+    <div class="nota" style="border-color:var(--fix)">Cuenta <b>pasos</b> y <b>distancia caminada</b>. La distancia solo suma cuando vas a <b>velocidad de caminata</b> (hasta ${pedoCfg.vmax} km/h); si vas más rápido (trote o vehículo) ese tramo <b>no</b> se suma a lo caminado.</div>
+    ${avisoSensor}
+
+    <label>Todo el día (se reinicia a medianoche)</label>
+    <div class="res"><div class="k">Pasos hoy</div><div class="v" id="pedoDiaPasos">—</div></div>
+    <div class="res"><div class="k">Distancia caminada hoy</div><div class="v" id="pedoDiaDist">—</div></div>
+    <button class="ancho borde" id="pedoReset" style="margin-top:8px">Reiniciar el conteo de hoy</button>
+
+    <label style="margin-top:16px">Solo cuando el Track está activo</label>
+    <div id="pedoTrackBox"></div>
+
+    <label style="margin-top:16px">Velocidad tope de caminata (km/h)</label>
+    <div class="grid2">
+      <input id="pedoVmax" inputmode="decimal" value="${pedoCfg.vmax}" placeholder="6">
+      <button class="ancho" id="pedoVmaxAp" style="margin-top:0">Aplicar</button>
+    </div>
+    <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px">
+      <button class="mini" data-vmax="5">5</button>
+      <button class="mini" data-vmax="6">6</button>
+      <button class="mini" data-vmax="7">7</button>
+    </div>
+
+    <label style="margin-top:16px">Contar todo el día</label>
+    <div class="nota">Si lo apagás, solo se cuenta mientras grabás un track. Los pasos siempre se leen del sensor; esto controla el <b>contador diario</b> y la suma de distancia de todo el día.</div>
+    <button class="ancho ${pedoCfg.todoDia?'':'borde'}" id="pedoTodoDia">${pedoCfg.todoDia?'✓ Encendido (contando todo el día)':'Apagado (solo con track)'}</button>
+
+    <div class="nota" style="margin-top:12px">Los pasos vienen del <b>sensor del teléfono</b> y se cuentan aunque la pantalla esté apagada o la app cerrada. La <b>distancia caminada</b> se mide con el GPS, así que solo avanza mientras la app o la grabación están activas.</div>
+  `);
+  const tick = ()=>{
+    const dp = document.getElementById('pedoDiaPasos');
+    if(!dp) return;   // panel cerrado
+    const estN = Pedometro.estado();
+    dp.textContent = Pedometro.pasosDia().toLocaleString('es-CR') + (estN.disponible===false?' (est.)':'');
+    const dd = document.getElementById('pedoDiaDist'); if(dd) dd.textContent = fmtDist(pedoDia ? pedoDia.distM : 0);
+    const box = document.getElementById('pedoTrackBox');
+    if(box){
+      if(S.grabando){
+        box.innerHTML = `<div class="res"><div class="k">Pasos del track</div><div class="v">${Pedometro.pasosTrack().toLocaleString('es-CR')}${estN.disponible===false?' (est.)':''}</div></div>
+          <div class="res"><div class="k">Caminado en el track</div><div class="v">${fmtDist(S.grabando.distCaminada||0)}</div></div>
+          <div class="res"><div class="k">Recorrido total del track</div><div class="v">${fmtDist(S.grabando.dist||0)}</div></div>`;
+      } else {
+        box.innerHTML = `<div class="nota">No hay ningún track grabando. Tocá <b>Grabar track</b> y acá vas a ver los pasos y los metros caminados de ese recorrido.</div>`;
+      }
+    }
+  };
+  tick();
+  Pedometro.setHook(tick);
+  if(window._pedoIv) clearInterval(window._pedoIv);
+  window._pedoIv = setInterval(()=>{
+    if(!document.getElementById('pedoDiaPasos')){ clearInterval(window._pedoIv); window._pedoIv=null; Pedometro.setHook(null); return; }
+    tick();
+  }, 700);
+  const permBtn = document.getElementById('pedoPerm');
+  if(permBtn) permBtn.onclick = async ()=>{ await Pedometro.reintentar(); toast('Si aceptaste el permiso, los pasos empiezan a contar.'); setTimeout(panelPodometro, 600); };
+  document.getElementById('pedoReset').onclick = ()=>{ Pedometro.reiniciarDia(); toast('Conteo de hoy reiniciado.'); tick(); };
+  const aplicarV = (v)=>{
+    if(!isFinite(v) || v<1 || v>20){ toast('Ingresá una velocidad entre 1 y 20 km/h.'); return; }
+    pedoCfg.vmax = Math.round(v*10)/10; Pedometro.guardarCfg();
+    toast('Velocidad tope: ' + pedoCfg.vmax + ' km/h.'); panelPodometro();
+  };
+  document.getElementById('pedoVmaxAp').onclick = ()=> aplicarV(parseFloat((document.getElementById('pedoVmax').value||'').replace(',','.')));
+  document.querySelectorAll('[data-vmax]').forEach(b=> b.onclick = ()=> aplicarV(+b.dataset.vmax));
+  document.getElementById('pedoTodoDia').onclick = ()=>{ pedoCfg.todoDia = !pedoCfg.todoDia; Pedometro.guardarCfg(); toast(pedoCfg.todoDia?'Contando todo el día.':'Solo se cuenta con track activo.'); panelPodometro(); };
 }
 
 /* --- filtros de calidad (F5) --- */
@@ -6749,6 +6836,129 @@ const Brujula = (()=>{
 })();
 
 /* =======================================================================
+   8b. PODÓMETRO  (pasos del sensor de hardware + distancia caminada)
+   -----------------------------------------------------------------------
+   Dos vistas del mismo contador:
+     · TODO EL DÍA: contador diario, se reinicia solo a medianoche.
+     · SOLO TRACK: atado a la grabación activa (pasos y metros del track).
+   Los pasos vienen del sensor TYPE_STEP_COUNTER (acumulativo desde que
+   arrancó el teléfono); llevamos una línea base por día y por track para
+   sacar el delta, con banca en caso de reinicio del equipo. La DISTANCIA
+   caminada solo suma cuando la velocidad es <= vmax (velocidad de
+   caminata); por encima se asume trote/vehículo y NO se suma a lo caminado.
+   Si el equipo no tiene sensor de pasos, se estima desde la distancia.
+   ======================================================================= */
+let pedoCfg = { vmax: 6, todoDia: true };   // vmax en km/h
+let pedoDia = null;                          // { fecha, base, banco, distM, last }
+const ZANCADA = 0.75;                        // m por paso (para estimar sin sensor)
+const Pedometro = (()=>{
+  let total = null;          // pasos acumulados del sensor (desde el arranque)
+  let disponible = null;     // true | false | null(desconocido)
+  let permiso = null;        // true | false | null
+  let prevFix = null;        // último fix usado para medir distancia
+  let ultGuardo = 0, _hook = null;
+  function hoyStr(){ const d=new Date(); return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0'); }
+  function asegurarDia(){
+    const h = hoyStr();
+    if(!pedoDia || pedoDia.fecha !== h){
+      pedoDia = { fecha:h, base:(total!=null?total:null), banco:0, distM:0, last:(total!=null?total:null) };
+      guardarDia(true);
+    }
+  }
+  function guardarDia(forzar){
+    const ahora = Date.now();
+    if(!forzar && ahora - ultGuardo < 3000) return;
+    ultGuardo = ahora;
+    try{ dbPut('conf', pedoDia, 'pedoDia'); }catch(e){}
+  }
+  function guardarCfg(){ try{ dbPut('conf', pedoCfg, 'pedoCfg'); }catch(e){} }
+  // Pasos de hoy (del sensor, o estimados desde la distancia si no hay sensor).
+  function pasosDia(){
+    if(disponible === false) return Math.round((pedoDia ? pedoDia.distM : 0) / ZANCADA);
+    if(!pedoDia || pedoDia.base==null || pedoDia.last==null) return pedoDia ? Math.round(pedoDia.banco||0) : 0;
+    return Math.round((pedoDia.banco||0) + (pedoDia.last - pedoDia.base));
+  }
+  function pasosTrack(){
+    if(!S.grabando) return 0;
+    if(disponible === false) return Math.round((S.grabando.distCaminada||0) / ZANCADA);
+    return Math.round(S.grabando.pasosCaminados || 0);
+  }
+  // Llega una lectura del sensor de pasos.
+  function onPasos(t){
+    if(t==null || isNaN(t)) return;
+    total = Number(t);
+    asegurarDia();
+    if(pedoDia.base==null) pedoDia.base = total;
+    // Reinicio del teléfono: el contador de hardware volvió a un valor menor.
+    if(pedoDia.last!=null && total < pedoDia.last - 1){
+      pedoDia.banco = (pedoDia.banco||0) + (pedoDia.last - pedoDia.base);
+      pedoDia.base = total;
+    }
+    pedoDia.last = total;
+    guardarDia(false);
+    // Track activo.
+    if(S.grabando){
+      if(S.grabando.pasosBase == null) S.grabando.pasosBase = total;
+      let dt = total - S.grabando.pasosBase;
+      if(dt < 0){ S.grabando.pasosBanco = (S.grabando.pasosCaminados||0); S.grabando.pasosBase = total; dt = 0; }
+      S.grabando.pasosCaminados = Math.round((S.grabando.pasosBanco||0) + dt);
+    }
+    refrescar();
+  }
+  // Llega un fix GPS: sumar distancia caminada si la velocidad <= vmax.
+  function alFix(pos){
+    const c = pos.coords, t = pos.timestamp || Date.now();
+    const vmaxMs = (pedoCfg.vmax||6)/3.6;
+    if(prevFix){
+      const d = distM(prevFix.lat, prevFix.lon, c.latitude, c.longitude);
+      const dts = Math.max(0.25, (t - prevFix.t)/1000);
+      // Velocidad: la del fix si viene; si no, la calculada entre fixes.
+      const v = (c.speed!=null && isFinite(c.speed) && c.speed>=0) ? c.speed : (d/dts);
+      const accOk = (c.accuracy==null) || (c.accuracy <= 25);
+      // Ignorar jitter de GPS parado y descartar tramos por encima de caminata.
+      if(accOk && d >= 0.7 && d <= vmaxMs*dts*1.6 && v <= vmaxMs){
+        asegurarDia();
+        if(pedoCfg.todoDia){ pedoDia.distM = (pedoDia.distM||0) + d; guardarDia(false); }
+        if(S.grabando){ S.grabando.distCaminada = (S.grabando.distCaminada||0) + d; }
+      }
+    }
+    prevFix = { lat:c.latitude, lon:c.longitude, t };
+    refrescar();
+  }
+  async function iniciar(){
+    const P = pluginGnss();
+    if(P && P.iniciarPasos){
+      try{
+        await P.addListener('pasos', ev=> onPasos(ev && ev.total));
+        const r = await P.iniciarPasos();
+        disponible = !!(r && r.disponible); permiso = !!(r && r.permiso);
+      }catch(e){ disponible = false; }
+    } else { disponible = false; }
+  }
+  // Reintenta registrar el sensor (p. ej. tras conceder el permiso de actividad).
+  async function reintentar(){
+    const P = pluginGnss();
+    if(P && P.iniciarPasos){ try{ const r = await P.iniciarPasos(); disponible = !!(r && r.disponible); permiso = !!(r && r.permiso); }catch(e){} }
+  }
+  function trackInicia(){
+    if(!S.grabando) return;
+    S.grabando.pasosBase = (total!=null?total:null);
+    S.grabando.pasosBanco = 0;
+    S.grabando.pasosCaminados = 0;
+    S.grabando.distCaminada = 0;
+  }
+  function reiniciarDia(){
+    pedoDia = { fecha:hoyStr(), base:(total!=null?total:null), banco:0, distM:0, last:(total!=null?total:null) };
+    guardarDia(true); refrescar();
+  }
+  function refrescar(){ if(_hook){ try{ _hook(); }catch(e){} } }
+  function setHook(fn){ _hook = fn; }
+  function estado(){ return { total, disponible, permiso }; }
+  return { iniciar, reintentar, onPasos, alFix, trackInicia, reiniciarDia,
+           pasosDia, pasosTrack, setHook, estado, guardarCfg };
+})();
+
+/* =======================================================================
    9. ARRANQUE
    ======================================================================= */
 (async ()=>{
@@ -6758,6 +6968,8 @@ const Brujula = (()=>{
   S.modo = await dbGet('conf','modo') || 'geo';
   S.capa = await dbGet('conf','capa') || 'sat';
   try{ const bo = await dbGet('conf','brujOffset'); if(bo!=null && isFinite(bo)) brujOffset = ((Number(bo)%360)+360)%360; }catch(e){}
+  try{ const pc = await dbGet('conf','pedoCfg'); if(pc){ pedoCfg = Object.assign(pedoCfg, pc); } }catch(e){}
+  try{ const pd = await dbGet('conf','pedoDia'); if(pd && pd.fecha){ pedoDia = pd; } }catch(e){}
   const filtGuardados = await dbGet('conf','filtros');
   if(filtGuardados) S.filtros = Object.assign(S.filtros, filtGuardados);
   try{
@@ -6810,6 +7022,7 @@ const Brujula = (()=>{
   }catch(e){}
   await arrancarGPS();
   Brujula.iniciar();   // cono de dirección de la brújula
+  Pedometro.iniciar(); // podómetro: pasos + distancia caminada
   // Buscar actualización en silencio al arrancar (si hay red).
   pintarBadgeActualizacion();
   if(navigator.onLine){ setTimeout(()=> buscarActualizacion(false), 4000); }

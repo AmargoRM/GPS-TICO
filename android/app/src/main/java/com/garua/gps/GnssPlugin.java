@@ -37,6 +37,10 @@ public class GnssPlugin extends Plugin {
     private android.hardware.SensorEventListener rotationListener;
     private boolean brujulaOn = false;
     private long ultBrujulaMs = 0;
+    // Podómetro (sensor de pasos de hardware).
+    private android.hardware.Sensor pasosSensor;
+    private android.hardware.SensorEventListener pasosListener;
+    private boolean pasosOn = false;
 
     // Motor de voz nativo (android.speech.tts). Es fiable y funciona sin internet,
     // a diferencia de speechSynthesis del WebView (que en muchos Android no suena).
@@ -69,6 +73,7 @@ public class GnssPlugin extends Plugin {
         FileOpenBridge.unregister(this);
         try { if (tts != null) { tts.stop(); tts.shutdown(); } } catch (Exception e) {}
         try { if (sensorManager != null && rotationListener != null) sensorManager.unregisterListener(rotationListener); } catch (Exception e) {}
+        try { if (sensorManager != null && pasosListener != null) sensorManager.unregisterListener(pasosListener); } catch (Exception e) {}
         super.handleOnDestroy();
     }
 
@@ -124,6 +129,54 @@ public class GnssPlugin extends Plugin {
         try {
             if (sensorManager != null && rotationListener != null) sensorManager.unregisterListener(rotationListener);
             brujulaOn = false;
+        } catch (Exception ignored) {}
+        if (call != null) call.resolve();
+    }
+
+    // ---- Podómetro: pasos del sensor de hardware (TYPE_STEP_COUNTER) ----
+    // Emite "pasos" con {total} = pasos acumulados desde que arrancó el teléfono
+    // (el JS lleva la línea base por día/por track para sacar el delta). En
+    // Android 10+ (API 29) requiere el permiso ACTIVITY_RECOGNITION; si no está
+    // concedido se solicita y se resuelve con permiso:false para que la UI avise.
+    @PluginMethod
+    public void iniciarPasos(PluginCall call) {
+        try {
+            if (sensorManager == null)
+                sensorManager = (android.hardware.SensorManager) getContext().getSystemService(android.content.Context.SENSOR_SERVICE);
+            if (pasosSensor == null)
+                pasosSensor = sensorManager.getDefaultSensor(android.hardware.Sensor.TYPE_STEP_COUNTER);
+            if (pasosSensor == null) { call.resolve(new JSObject().put("disponible", false).put("permiso", false)); return; }
+            boolean perm = true;
+            if (Build.VERSION.SDK_INT >= 29) {
+                perm = getContext().checkSelfPermission("android.permission.ACTIVITY_RECOGNITION")
+                       == android.content.pm.PackageManager.PERMISSION_GRANTED;
+            }
+            if (!perm) {
+                try { getActivity().requestPermissions(new String[]{"android.permission.ACTIVITY_RECOGNITION"}, 7731); } catch (Exception e) {}
+                call.resolve(new JSObject().put("disponible", true).put("permiso", false));
+                return;
+            }
+            if (pasosListener == null) {
+                pasosListener = new android.hardware.SensorEventListener() {
+                    @Override public void onSensorChanged(android.hardware.SensorEvent ev) {
+                        try { notifyListeners("pasos", new JSObject().put("total", (double) ev.values[0])); } catch (Exception ignored) {}
+                    }
+                    @Override public void onAccuracyChanged(android.hardware.Sensor s, int a) {}
+                };
+            }
+            if (!pasosOn) {
+                sensorManager.registerListener(pasosListener, pasosSensor, android.hardware.SensorManager.SENSOR_DELAY_NORMAL);
+                pasosOn = true;
+            }
+            call.resolve(new JSObject().put("disponible", true).put("permiso", true));
+        } catch (Exception e) { call.reject("No se pudo iniciar el podómetro: " + e.getMessage()); }
+    }
+
+    @PluginMethod
+    public void detenerPasos(PluginCall call) {
+        try {
+            if (sensorManager != null && pasosListener != null) sensorManager.unregisterListener(pasosListener);
+            pasosOn = false;
         } catch (Exception ignored) {}
         if (call != null) call.resolve();
     }
