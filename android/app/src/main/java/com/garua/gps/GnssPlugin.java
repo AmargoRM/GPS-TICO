@@ -84,20 +84,14 @@ public class GnssPlugin extends Plugin {
     @PluginMethod
     public void iniciarBrujula(PluginCall call) {
         try {
+            if (brujulaOn) { call.resolve(new JSObject().put("status", "already")); return; }
             if (sensorManager == null)
                 sensorManager = (android.hardware.SensorManager) getContext().getSystemService(android.content.Context.SENSOR_SERVICE);
-            // Re-armado: si ya había un listener, lo quitamos antes de registrar
-            // de nuevo. Esto permite que JS vuelva a llamar iniciarBrujula() para
-            // revivir el sensor cuando se "duerme" solo (sin duplicar listeners).
-            if (rotationListener != null) {
-                try { sensorManager.unregisterListener(rotationListener); } catch (Exception e) {}
-            }
-            if (rotationSensor == null)
-                rotationSensor = sensorManager.getDefaultSensor(android.hardware.Sensor.TYPE_ROTATION_VECTOR);
+            rotationSensor = sensorManager.getDefaultSensor(android.hardware.Sensor.TYPE_ROTATION_VECTOR);
             if (rotationSensor == null)
                 rotationSensor = sensorManager.getDefaultSensor(android.hardware.Sensor.TYPE_GEOMAGNETIC_ROTATION_VECTOR);
             if (rotationSensor == null) { call.reject("Sin sensor de orientación"); return; }
-            if (rotationListener == null) rotationListener = new android.hardware.SensorEventListener() {
+            rotationListener = new android.hardware.SensorEventListener() {
                 private final float[] R = new float[9];
                 private final float[] Rout = new float[9];
                 private final float[] ori = new float[3];

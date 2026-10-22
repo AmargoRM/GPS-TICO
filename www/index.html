@@ -686,15 +686,6 @@ function dibujarRasters(aPant){
 function dibujarCapasVector(aPant, vista){
   for(const capa of S.capas){
     if(!capa.visible) continue;
-    // Capas de referencia de "Dictámenes DA" (traen _rol): son SOLO para el
-    // análisis espacial, no para dibujar. Tienen miles de polígonos y, al
-    // pintarse en cada fotograma, dejaban el mapa y la app trabados. Se saltan
-    // acá (y así se arreglan también los teléfonos que ya las tenían cargadas).
-    if(capa._soloAnalisis === undefined){
-      capa._soloAnalisis = false;
-      try{ const fc0=capa.geojson; const f0 = fc0 && (fc0.features ? fc0.features[0] : (fc0.type==='Feature'?fc0:null)); if(f0 && f0.properties && f0.properties._rol) capa._soloAnalisis = true; }catch(e){}
-    }
-    if(capa._soloAnalisis) continue;
     if(capa.tipo==='big'){ try{ dibujarBig(capa, aPant, vista); }catch(e){} continue; }
     if(capa.tipo==='wms' || !capa.geojson) continue;
     const fc = capa.geojson;
@@ -2171,7 +2162,6 @@ function abrirMenu(){
     <div class="fila"><div class="cuerpo"><div class="t">Capas del proyecto</div><div class="s">${S.capas.length} capa(s) · GeoJSON · KML · SHP · WFS · WMS</div></div><button class="mini" id="mCapas">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Puntos y tracks</div><div class="s">${S.puntos.length} puntos · ${S.tracks.length} tracks</div></div><button class="mini" id="mDatos">Ver</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Podómetro (pasos)</div><div class="s">Pasos y distancia caminada · todo el día / por track</div></div><button class="mini" id="mPasos">Abrir</button></div>
-    ${modDictamenes ? '<div class="fila"><div class="cuerpo"><div class="t">Dictámenes DA</div><div class="s">Análisis espacial + datos del dictamen de cuerpo de agua</div></div><button class="mini verde" id="mDict">Abrir</button></div>' : ''}
     <div class="fila"><div class="cuerpo"><div class="t">Convertir coordenadas</div><div class="s">Geo ↔ CRTM05 ↔ Lambert N/S</div></div><button class="mini" id="mConv">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Mapa sin conexión</div><div class="s">Zonas y parches descargables</div></div><button class="mini" id="mOff">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Exportar proyecto</div><div class="s">GPX · CSV · GeoJSON</div></div><button class="mini" id="mExp">Abrir</button></div>
@@ -2185,7 +2175,6 @@ function abrirMenu(){
   document.getElementById('mCapas').onclick = ()=> navegarPanel(panelCapas);
   document.getElementById('mDatos').onclick = ()=> navegarPanel(panelDatos);
   document.getElementById('mPasos').onclick = ()=> navegarPanel(panelPodometro);
-  { const b=document.getElementById('mDict'); if(b) b.onclick = ()=> navegarPanel(panelDictamenes); }
   document.getElementById('mConv').onclick  = ()=> navegarPanel(panelConv);
   document.getElementById('mOff').onclick   = ()=> navegarPanel(panelOffline);
   document.getElementById('mExp').onclick   = ()=> navegarPanel(panelExport);
@@ -2263,10 +2252,8 @@ function panelConfig(){
     <div class="fila"><div class="cuerpo"><div class="t">Fuente de posición</div><div class="s">${S.fuente==='gps'?'GPS puro (nativo)':'Fusionada (GPS+WiFi+celda)'}</div></div><button class="mini" id="cFuente">Cambiar</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Brújula (flecha de dirección)</div><div class="s">${brujOffset?('Ajuste '+Math.round(brujOffset)+'°'):'Sin ajuste'} · calibrar / corregir</div></div><button class="mini" id="cBruj">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Grabación con pantalla bloqueada</div><div class="s">Permisos para que el track no se corte al bloquear el celular</div></div><button class="mini" id="cBg">Abrir</button></div>
-    <div class="fila"><div class="cuerpo"><div class="t">Dictámenes DA (paquete opcional)</div><div class="s">${modDictamenes?'Activado':'Apagado'} · generar dictámenes de cuerpo de agua con análisis espacial</div></div><button class="mini ${modDictamenes?'verde':''}" id="cDict">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Precisión y advertencias</div><div class="s">Términos de uso · leer antes de usar en expedientes</div></div><button class="mini" id="cInfo">Abrir</button></div>
   `);
-  document.getElementById('cDict').onclick  = ()=> navegarPanel(panelDictamenes);
   document.getElementById('cPlant').onclick = ()=> navegarPanel(panelPlantillas);
   document.getElementById('cDiag').onclick  = ()=> navegarPanel(panelDiagnosticos);
   document.getElementById('cFilt').onclick  = ()=> navegarPanel(panelFiltros);
@@ -3585,323 +3572,6 @@ function panelActividad(trackId){
     try{ await dbPut('conf', pedoManual, 'pedoManual'); }catch(e){}
     toast('Actividad quitada de tus resultados.');
     panelActividad(trackId);
-  };
-}
-
-/* =======================================================================
-   DICTÁMENES DA  (paquete opcional)
-   -----------------------------------------------------------------------
-   Reimplementa la lógica del complemento QGIS "Dictámenes-DA" (que a su vez
-   salió de un HTML de la Dirección de Agua): captura de puntos + análisis
-   espacial punto-en-polígono contra capas de referencia de Costa Rica
-   (distrito/cantón/provincia, cuencas, hoja cartográfica, suelos) para
-   completar la ubicación del dictamen de cuerpo de agua. Las capas se
-   importan como capas normales de GPS TICO (traen una propiedad _rol).
-   Esta primera etapa hace el formulario + análisis + exportación de datos;
-   la generación del Word (machote) queda para una etapa siguiente.
-   ======================================================================= */
-let _dictCap = { inicio:null, final:null };   // puntos capturados en WGS84 {lat,lon,acc}
-let _dictAnalisis = null;
-// Reúne los features de todas las capas cargadas cuyo rol coincide.
-function dictRolFeatures(rol){
-  const out=[];
-  for(const capa of (S.capas||[])){
-    if(!capa || !capa.geojson) continue;
-    const fc=capa.geojson;
-    const feats = fc.type==='FeatureCollection' ? (fc.features||[]) : fc.type==='Feature' ? [fc] : [];
-    if(!feats.length) continue;
-    let r=null;
-    for(const f of feats){ if(f && f.properties && f.properties._rol){ r=f.properties._rol; break; } }
-    if(r===rol) out.push(...feats);
-  }
-  return out;
-}
-function dictBB(f){
-  if(f._dbb) return f._dbb;
-  let mnx=Infinity,mny=Infinity,mxx=-Infinity,mxy=-Infinity;
-  const walk=a=>{ if(a && typeof a[0]==='number'){ if(a[0]<mnx)mnx=a[0]; if(a[0]>mxx)mxx=a[0]; if(a[1]<mny)mny=a[1]; if(a[1]>mxy)mxy=a[1]; } else if(a){ for(const c of a) walk(c); } };
-  if(f.geometry) walk(f.geometry.coordinates);
-  return (f._dbb=[mnx,mny,mxx,mxy]);
-}
-function dictRingIn(lon,lat,ring){
-  let ins=false, n=ring.length, j=n-1;
-  for(let i=0;i<n;i++){ const xi=ring[i][0],yi=ring[i][1],xj=ring[j][0],yj=ring[j][1];
-    if(((yi>lat)!=(yj>lat)) && (lon < (xj-xi)*(lat-yi)/(yj-yi)+xi)) ins=!ins; j=i; }
-  return ins;
-}
-function dictPolyIn(lon,lat,poly){
-  if(!poly.length || !dictRingIn(lon,lat,poly[0])) return false;
-  for(let k=1;k<poly.length;k++){ if(dictRingIn(lon,lat,poly[k])) return false; }
-  return true;
-}
-function dictFeatIn(lon,lat,f){
-  const b=dictBB(f); if(lon<b[0]||lon>b[2]||lat<b[1]||lat>b[3]) return false;
-  const g=f.geometry; if(!g) return false;
-  if(g.type==='Polygon') return dictPolyIn(lon,lat,g.coordinates);
-  if(g.type==='MultiPolygon'){ for(const poly of g.coordinates){ if(dictPolyIn(lon,lat,poly)) return true; } return false; }
-  return false;
-}
-function dictContiene(rol, lon, lat){
-  for(const f of dictRolFeatures(rol)){ if(dictFeatIn(lon,lat,f)) return f.properties||{}; }
-  return null;
-}
-function dictAttr(props, ...names){
-  if(!props) return '';
-  const norm=s=>String(s==null?'':s).toLowerCase().replace(/_/g,'').replace(/\s/g,'');
-  const want=names.map(norm);
-  for(const k in props){ if(want.includes(norm(k))){ const v=props[k]; return v==null?'':String(v); } }
-  return '';
-}
-function analizarDictamen(lon, lat){
-  const sp={provincia:'',canton:'',distrito:'',cuenca_numero:'',cuenca_nombre:'',hoja50:'',codigo50:'',hoja:'',orden_suelo:'',warning:''};
-  let p=dictContiene('distrito',lon,lat);
-  if(p){ sp.provincia=dictAttr(p,'provincia'); sp.canton=dictAttr(p,'canton','cantón'); sp.distrito=dictAttr(p,'distrito'); }
-  p=dictContiene('cuenca',lon,lat);
-  if(p){ sp.cuenca_numero=dictAttr(p,'cuenca_numero','numero','cuenca_num'); sp.cuenca_nombre=dictAttr(p,'cuenca_nombre','nombre'); }
-  p=dictContiene('hoja',lon,lat);
-  if(p){ sp.hoja50=dictAttr(p,'hoja50','hoja_50','nombre'); sp.codigo50=dictAttr(p,'codigo50','codigo_50'); }
-  if(sp.hoja50||sp.codigo50) sp.hoja=(sp.hoja50+' / '+sp.codigo50).replace(/(^ \/ )|( \/ $)/,'').trim();
-  p=dictContiene('suelo',lon,lat);
-  if(p){ sp.orden_suelo=dictAttr(p,'orden_suelo','carac_terr','orden'); }
-  return sp;
-}
-function dictEstadoCapas(){
-  const r={}; for(const rol of ['distrito','cuenca','hoja','suelo']) r[rol]=dictRolFeatures(rol).length; return r;
-}
-function dictLeerPunto(prefix, crs){
-  const cap=_dictCap[prefix]; if(cap) return cap;
-  const ea=document.getElementById('dict_'+prefix+'_a'), eb=document.getElementById('dict_'+prefix+'_b');
-  if(!ea||!eb) return null;
-  const a=parseFloat((ea.value||'').replace(',','.')), b=parseFloat((eb.value||'').replace(',','.'));
-  if(!isFinite(a)||!isFinite(b)) return null;
-  try{ return haciaWgs(a,b,crs); }catch(e){ return null; }
-}
-// Capas de referencia publicadas junto al APK (comprimidas gzip).
-const DICT_CAPAS = [
-  { archivo:'DA_distrito_canton_provincia.geojson.gz', nombre:'DA distrito/cantón/provincia', rol:'distrito' },
-  { archivo:'DA_cuencas.geojson.gz', nombre:'DA cuencas', rol:'cuenca' },
-  { archivo:'DA_hoja_cartografica.geojson.gz', nombre:'DA hoja cartográfica', rol:'hoja' },
-  { archivo:'DA_suelos.geojson.gz', nombre:'DA suelos', rol:'suelo' }
-];
-async function dictGunzipTexto(bytes){
-  if(typeof DecompressionStream==='undefined') throw new Error('Este dispositivo no descomprime gzip');
-  const s = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
-  return await new Response(s).text();
-}
-async function dictDescargarCapas(btn){
-  let ok=0;
-  for(const c of DICT_CAPAS){
-    if(dictRolFeatures(c.rol).length){ ok++; continue; }   // ya cargada
-    if(btn) btn.textContent='Descargando '+c.nombre+'…';
-    try{
-      const r = await httpGet(UPDATE_BASE+'/'+c.archivo+'?ts='+Date.now());
-      if(r.status<200 || r.status>=400) throw new Error('HTTP '+r.status);
-      const gj = JSON.parse(await dictGunzipTexto(r.bytes));
-      const capa = await guardarCapaVector(c.nombre, gj, true);
-      // Son capas de referencia: no se dibujan ni responden al toque (solo
-      // alimentan el análisis), así no traban el mapa.
-      if(capa){ capa.visible=false; capa.consultable=false; capa._soloAnalisis=true; try{ await dbPut('capas', capa); }catch(e){} }
-      ok++;
-    }catch(e){ toast('No se pudo bajar '+c.nombre+': '+(e&&e.message?e.message:e)); }
-  }
-  return ok;
-}
-// --- Generación de Word (.docx) del dictamen (documento OOXML mínimo) ---
-function _xmlEsc(s){ return String(s==null?'':s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&apos;'}[c])); }
-function crearDocxDictamen(d){
-  const A=d.analisis||{}, F=d.fuente||{};
-  const run=(t,o)=>{ o=o||{}; const b=o.bold?'<w:b/><w:bCs/>':''; const sz=o.sz||22;
-    return `<w:r><w:rPr><w:rFonts w:ascii="Times New Roman" w:hAnsi="Times New Roman"/>${b}<w:sz w:val="${sz}"/><w:szCs w:val="${sz}"/></w:rPr><w:t xml:space="preserve">${_xmlEsc(t)}</w:t></w:r>`; };
-  const par=(inner,o)=>{ o=o||{}; const jc=o.center?'<w:jc w:val="center"/>':''; const sp=`<w:spacing w:after="${o.after!=null?o.after:80}"/>`;
-    return `<w:p><w:pPr>${sp}${jc}</w:pPr>${inner}</w:p>`; };
-  const kv=(k,v)=> par(run(k+': ',{bold:true})+run(v||'—'));
-  const head=(t)=> par(run(t,{bold:true,sz:24}),{after:40});
-  const ini=d.punto_inicio, fin=d.punto_final;
-  const body=[
-    par(run('DIRECCIÓN DE AGUA',{bold:true,sz:28}),{center:true,after:20}),
-    par(run('DICTAMEN DE CUERPO DE AGUA',{bold:true,sz:26}),{center:true,after:160}),
-    head('Datos del oficio'),
-    kv('Oficio', d.oficio), kv('Fecha del oficio', d.fecha_oficio),
-    kv('Solicitante', d.solicitante), kv('Correo', d.correo), kv('ID de solicitud', d.id_solicitud),
-    head('Fuente dictaminada'),
-    kv('Nombre', F.nombre), kv('N° fuente', F.numero), kv('Tipo', F.tipo), kv('Criterio', F.criterio), kv('Afluente', F.afluente),
-    head('Coordenadas (CRTM05 · EPSG:5367)'),
-    kv('Inicio', ini?('E '+ini.crtmE+'  N '+ini.crtmN):'—'),
-    kv('Final', fin?('E '+fin.crtmE+'  N '+fin.crtmN):'—'),
-    head('Ubicación (análisis espacial)'),
-    kv('Provincia', A.provincia), kv('Cantón', A.canton), kv('Distrito', A.distrito),
-    kv('Cuenca', (A.cuenca_numero?A.cuenca_numero+' · ':'')+(A.cuenca_nombre||'')),
-    kv('Hoja cartográfica', A.hoja), kv('Orden de suelo', A.orden_suelo),
-    A.warning ? par(run('Aviso: '+A.warning,{bold:true})) : '',
-    head('Observaciones'),
-    par(run(d.observaciones||'—')),
-    par(run('Documento generado con GPS TICO · '+new Date().toLocaleString('es-CR'),{sz:18}),{after:0})
-  ].join('');
-  const doc=`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>`+
-    `<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>${body}`+
-    `<w:sectPr><w:pgSz w:w="12240" w:h="15840"/><w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440" w:header="708" w:footer="708" w:gutter="0"/></w:sectPr></w:body></w:document>`;
-  const ct=`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>`+
-    `<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>`;
-  const rels=`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>`+
-    `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>`;
-  const enc=new TextEncoder();
-  return construirZip([
-    { nombre:'[Content_Types].xml', datos:enc.encode(ct) },
-    { nombre:'_rels/.rels', datos:enc.encode(rels) },
-    { nombre:'word/document.xml', datos:enc.encode(doc) }
-  ]);
-}
-function panelDictamenes(){
-  if(!modDictamenes){
-    abrirPanel('Dictámenes DA', `
-      <div class="nota" style="border-color:var(--fix)">Herramienta <b>opcional</b> para generar dictámenes de cuerpo de agua: captura puntos en el campo y hace el <b>análisis espacial</b> (provincia, cantón, distrito, cuenca, hoja cartográfica y orden de suelo) contra capas oficiales de Costa Rica.</div>
-      <div class="nota">Es un paquete aparte: si no lo activás, GPS TICO sigue igual. Al activarlo tenés que <b>importar una vez</b> las capas de referencia (te las paso como archivos) desde <b>Menú → Capas → Archivo del teléfono</b>.</div>
-      <button class="ancho verde" id="dictActivar">Activar paquete Dictámenes DA</button>
-    `);
-    document.getElementById('dictActivar').onclick = async ()=>{ modDictamenes=true; try{ await dbPut('conf', true, 'modDictamenes'); }catch(e){} toast('Paquete Dictámenes DA activado.'); panelDictamenes(); };
-    return;
-  }
-  const est=dictEstadoCapas();
-  const rotulo={distrito:'Distrito/cantón/provincia',cuenca:'Cuencas',hoja:'Hoja cartográfica',suelo:'Suelos'};
-  const estHtml = Object.keys(rotulo).map(r=> `<div class="res"><div class="k">${rotulo[r]}</div><div class="v">${est[r]?('✓ '+est[r]+' geom.'):'⚠ no cargada'}</div></div>`).join('');
-  const faltan = Object.keys(rotulo).filter(r=>!est[r]);
-  abrirPanel('Dictámenes DA', `
-    <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px">
-      <button class="mini" id="dictDesactivar">Desactivar paquete</button>
-    </div>
-    <label>Capas de referencia</label>
-    ${estHtml}
-    ${faltan.length ? `<div class="nota" style="border-color:var(--alerta)">Faltan capas: <b>${faltan.map(r=>rotulo[r]).join(', ')}</b>.</div>` : '<div class="nota" style="border-color:var(--fix)">Capas listas. Ya podés analizar.</div>'}
-    <button class="ancho verde" id="dict_descargar">⬇ Descargar capas de referencia (automático)</button>
-    <div class="nota">Se bajan solas (~4.5 MB comprimidas) y quedan guardadas en el teléfono. Hace falta internet solo esta primera vez.</div>
-
-    <label style="margin-top:14px">Datos del oficio</label>
-    <div class="grid2"><input id="dict_oficio" inputmode="numeric" placeholder="Oficio (ej. 1234)"><input id="dict_fecha" type="date" title="Fecha del oficio"></div>
-    <input id="dict_solicitante" placeholder="Solicitante" style="margin-top:6px">
-    <input id="dict_correo" type="email" inputmode="email" autocapitalize="off" placeholder="Correo" style="margin-top:6px">
-    <input id="dict_id" placeholder="ID de solicitud" style="margin-top:6px">
-
-    <label style="margin-top:14px">Fuente dictaminada</label>
-    <input id="dict_fnombre" placeholder="Nombre de la fuente / cuerpo de agua">
-    <div class="grid2" style="margin-top:6px"><input id="dict_fnumero" placeholder="N° fuente"><input id="dict_ftipo" placeholder="Tipo"></div>
-    <div class="grid2" style="margin-top:6px"><input id="dict_fcriterio" placeholder="Criterio"><input id="dict_fafluente" placeholder="Afluente"></div>
-
-    <label style="margin-top:14px">Coordenadas de entrada</label>
-    <select id="dict_crs">
-      <option value="crtm05">CRTM05 · EPSG:5367 (E, N)</option>
-      <option value="geo">Geográficas · WGS84 (Lat, Lon)</option>
-      <option value="ln">Lambert Norte · EPSG:5456 (E, N)</option>
-      <option value="ls">Lambert Sur · EPSG:5457 (E, N)</option>
-    </select>
-    <div style="margin-top:10px"><b style="font-size:12px">Punto Inicio</b></div>
-    <div class="grid2"><input id="dict_inicio_a" inputmode="decimal" placeholder="Este (m)"><input id="dict_inicio_b" inputmode="decimal" placeholder="Norte (m)"></div>
-    <button class="ancho" id="dict_gps_inicio" style="margin-top:6px">📍 Usar mi posición GPS</button>
-    <div id="dict_cap_inicio" class="nota" style="margin-top:6px;display:none"></div>
-    <div style="margin-top:12px"><b style="font-size:12px">Punto Final (opcional)</b></div>
-    <div class="grid2"><input id="dict_final_a" inputmode="decimal" placeholder="Este (m)"><input id="dict_final_b" inputmode="decimal" placeholder="Norte (m)"></div>
-    <button class="ancho" id="dict_gps_final" style="margin-top:6px">📍 Usar mi posición GPS</button>
-    <div id="dict_cap_final" class="nota" style="margin-top:6px;display:none"></div>
-
-    <label style="margin-top:14px">Observaciones</label>
-    <textarea id="dict_obs" rows="2" style="width:100%;box-sizing:border-box" placeholder="Observaciones adicionales"></textarea>
-
-    <button class="ancho verde" id="dict_analizar" style="margin-top:12px">Analizar ubicación</button>
-    <div id="dictRes" style="margin-top:10px"></div>
-
-    <button class="ancho verde" id="dict_word" style="margin-top:12px">📄 Generar Word (.docx)</button>
-    <div class="grid2" style="margin-top:8px"><button class="ancho" id="dict_exp_json">Exportar JSON</button><button class="ancho borde" id="dict_exp_txt">Exportar texto</button></div>
-    <div class="nota" style="margin-top:10px">El Word sale con todos los datos y el análisis, en Times New Roman. Es un documento <b>funcional</b> (todavía no replica exactamente el formato del machote oficial; eso es una mejora siguiente). Verificá siempre los resultados contra la fuente oficial antes de usarlos en un expediente.</div>
-  `);
-  const crsSel=document.getElementById('dict_crs');
-  const actualizarLabelsCoord=()=>{
-    const geo = crsSel.value==='geo';
-    const pa = geo?'Latitud (ej. 9.9333)':'Este (m)', pb = geo?'Longitud (ej. -84.0817)':'Norte (m)';
-    ['inicio','final'].forEach(p=>{ const a=document.getElementById('dict_'+p+'_a'), b=document.getElementById('dict_'+p+'_b'); if(a)a.placeholder=pa; if(b)b.placeholder=pb; });
-  };
-  crsSel.onchange=actualizarLabelsCoord; actualizarLabelsCoord();
-  const marcaCap=(prefix)=>{ const el=document.getElementById('dict_cap_'+prefix); const c=_dictCap[prefix]; if(!el) return; if(c){ el.style.display='block'; el.innerHTML='✓ Capturado: '+c.lat.toFixed(6)+', '+c.lon.toFixed(6)+(c.acc!=null?(' (±'+c.acc.toFixed(0)+' m)'):''); } else { el.style.display='none'; } };
-  const capGps=(prefix)=>{ if(!S.fix){ toast('Sin posición GPS todavía.'); return; } const c=S.fix.coords; _dictCap[prefix]={lat:c.latitude, lon:c.longitude, acc:c.accuracy}; marcaCap(prefix); toast('Punto '+prefix+' capturado por GPS.'); };
-  document.getElementById('dict_gps_inicio').onclick=()=>capGps('inicio');
-  document.getElementById('dict_gps_final').onclick=()=>capGps('final');
-  document.getElementById('dict_descargar').onclick=async (e)=>{
-    const btn=e.currentTarget; const txt0=btn.textContent; btn.disabled=true;
-    if(!navigator.onLine){ toast('Necesitás internet para bajar las capas esta primera vez.'); btn.disabled=false; btn.textContent=txt0; return; }
-    const ok=await dictDescargarCapas(btn);
-    btn.disabled=false;
-    toast(ok? ('Capas listas: '+ok+'/'+DICT_CAPAS.length+'.') : 'No se pudo descargar. Revisá tu conexión.');
-    panelDictamenes();
-  };
-  // Si el usuario teclea coordenadas, se descarta la captura GPS de ese punto.
-  ['inicio','final'].forEach(pfx=>{ ['a','b'].forEach(s=>{ const el=document.getElementById('dict_'+pfx+'_'+s); if(el) el.oninput=()=>{ if(_dictCap[pfx]){ _dictCap[pfx]=null; marcaCap(pfx); } }; }); });
-  marcaCap('inicio'); marcaCap('final');
-  document.getElementById('dict_desactivar')?.addEventListener('click', async ()=>{ modDictamenes=false; try{ await dbPut('conf', false, 'modDictamenes'); }catch(e){} toast('Paquete desactivado.'); cerrarPanel(); });
-  document.getElementById('dict_analizar').onclick=()=>{
-    const crs=crsSel.value;
-    const ini=dictLeerPunto('inicio',crs), fin=dictLeerPunto('final',crs);
-    if(!ini && !fin){ toast('Capturá o ingresá al menos el punto de inicio.'); return; }
-    const pt = (ini&&fin) ? {lat:(ini.lat+fin.lat)/2, lon:(ini.lon+fin.lon)/2} : (ini||fin);
-    _dictAnalisis = analizarDictamen(pt.lon, pt.lat);
-    if(ini&&fin){ const di=analizarDictamen(ini.lon,ini.lat).distrito, df=analizarDictamen(fin.lon,fin.lat).distrito; if(di&&df&&di!==df) _dictAnalisis.warning='El punto inicial y final caen en distritos diferentes.'; }
-    const A=_dictAnalisis;
-    const row=(k,v)=>`<div class="res"><div class="k">${k}</div><div class="v">${v||'—'}</div></div>`;
-    const cr=tmFwd(pt.lat, pt.lon, CRTM05);
-    document.getElementById('dictRes').innerHTML =
-      row('Provincia', A.provincia)+row('Cantón', A.canton)+row('Distrito', A.distrito)+
-      row('Cuenca', (A.cuenca_numero?A.cuenca_numero+' · ':'')+A.cuenca_nombre)+
-      row('Hoja cartográfica', A.hoja)+row('Orden de suelo', A.orden_suelo)+
-      row('Punto analizado (CRTM05)', 'E '+cr.e.toFixed(1)+' · N '+cr.n.toFixed(1))+
-      (A.warning?`<div class="nota" style="border-color:var(--alerta)">⚠ ${A.warning}</div>`:'')+
-      ((!A.provincia&&!A.cuenca_nombre&&!A.hoja&&!A.orden_suelo)?'<div class="nota" style="border-color:var(--sangre)">No se obtuvo ningún dato. ¿Están cargadas las capas DA_* y el punto cae dentro de Costa Rica?</div>':'');
-  };
-  const juntar=()=>{
-    const crs=crsSel.value;
-    const ini=dictLeerPunto('inicio',crs), fin=dictLeerPunto('final',crs);
-    const ptCrtm=(p)=> p?((()=>{const c=tmFwd(p.lat,p.lon,CRTM05);return {lat:p.lat,lon:p.lon,crtmE:+c.e.toFixed(2),crtmN:+c.n.toFixed(2)};})()):null;
-    return {
-      _tipo:'gpstico-dictamen', fecha_generado:new Date().toISOString(),
-      oficio:document.getElementById('dict_oficio').value||'', fecha_oficio:document.getElementById('dict_fecha').value||'',
-      solicitante:document.getElementById('dict_solicitante').value||'', correo:document.getElementById('dict_correo').value||'',
-      id_solicitud:document.getElementById('dict_id').value||'',
-      fuente:{ nombre:document.getElementById('dict_fnombre').value||'', numero:document.getElementById('dict_fnumero').value||'',
-               tipo:document.getElementById('dict_ftipo').value||'', criterio:document.getElementById('dict_fcriterio').value||'',
-               afluente:document.getElementById('dict_fafluente').value||'' },
-      crs_entrada:crs, punto_inicio:ptCrtm(ini), punto_final:ptCrtm(fin),
-      observaciones:document.getElementById('dict_obs').value||'',
-      analisis:_dictAnalisis
-    };
-  };
-  document.getElementById('dict_word').onclick=()=>{
-    const d=juntar(); if(!d.analisis){ toast('Primero tocá "Analizar ubicación".'); return; }
-    try{
-      const bytes=crearDocxDictamen(d);
-      const nom='dictamen_'+(d.oficio||d.id_solicitud||'DA')+'_'+new Date().toISOString().slice(0,10)+'.docx';
-      bajarBlob(nom, new Blob([bytes], {type:'application/vnd.openxmlformats-officedocument.wordprocessingml.document'}));
-    }catch(err){ toast('No se pudo generar el Word: '+(err&&err.message?err.message:err)); }
-  };
-  document.getElementById('dict_exp_json').onclick=()=>{
-    const d=juntar(); if(!d.analisis){ toast('Primero tocá "Analizar ubicación".'); return; }
-    const nom='dictamen_'+(d.oficio||d.id_solicitud||'DA')+'_'+new Date().toISOString().slice(0,10)+'.json';
-    bajar(nom, JSON.stringify(d,null,2), 'application/json');
-  };
-  document.getElementById('dict_exp_txt').onclick=()=>{
-    const d=juntar(); if(!d.analisis){ toast('Primero tocá "Analizar ubicación".'); return; }
-    const A=d.analisis;
-    const L=[];
-    L.push('DICTAMEN DE CUERPO DE AGUA — datos'); L.push('');
-    L.push('Oficio: '+d.oficio+'   Fecha: '+d.fecha_oficio);
-    L.push('Solicitante: '+d.solicitante+'   Correo: '+d.correo); L.push('ID solicitud: '+d.id_solicitud); L.push('');
-    L.push('Fuente: '+d.fuente.nombre+' (N° '+d.fuente.numero+', '+d.fuente.tipo+')');
-    L.push('Criterio: '+d.fuente.criterio+'   Afluente: '+d.fuente.afluente); L.push('');
-    if(d.punto_inicio) L.push('Inicio CRTM05: E '+d.punto_inicio.crtmE+'  N '+d.punto_inicio.crtmN);
-    if(d.punto_final)  L.push('Final  CRTM05: E '+d.punto_final.crtmE+'  N '+d.punto_final.crtmN);
-    L.push('');
-    L.push('Provincia: '+A.provincia); L.push('Cantón: '+A.canton); L.push('Distrito: '+A.distrito);
-    L.push('Cuenca: '+(A.cuenca_numero?A.cuenca_numero+' · ':'')+A.cuenca_nombre);
-    L.push('Hoja cartográfica: '+A.hoja); L.push('Orden de suelo: '+A.orden_suelo);
-    if(A.warning) L.push('AVISO: '+A.warning);
-    L.push(''); L.push('Observaciones: '+d.observaciones);
-    const nom='dictamen_'+(d.oficio||d.id_solicitud||'DA')+'_'+new Date().toISOString().slice(0,10)+'.txt';
-    bajar(nom, L.join('\n'), 'text/plain');
   };
 }
 
@@ -5806,7 +5476,7 @@ function consultarPorRadio(px, py, radioM){
   const encontrados = [];   // {capa, feature, dist}
   for(let i=S.capas.length-1;i>=0;i--){
     const c = S.capas[i];
-    if(!c.visible || c.tipo==='wms' || c.consultable===false || c._soloAnalisis || !c.geojson) continue;
+    if(!c.visible || c.tipo==='wms' || c.consultable===false || !c.geojson) continue;
     const feats = c.geojson.type==='FeatureCollection' ? (c.geojson.features||[]) : c.geojson.type==='Feature' ? [c.geojson] : [];
     for(const f of feats){
       if(!f || !f.geometry) continue;
@@ -7371,20 +7041,16 @@ function exportarDiagCSV(){
 let brujOffset = 0;   // grados a sumar al rumbo del sensor (0..359)
 const Brujula = (()=>{
   let suave = null, ultDibujo = 0, activo = false;
-  let ultEvento = 0, usandoNativo = false, watchdog = null;
   // Aplica un rumbo (0..360, 0=N horario) con suavizado circular y redibuja.
   function aplicar(deg){
     if(deg == null || isNaN(deg)) return;
-    ultEvento = Date.now();                 // marca de vida del sensor
     let h = ((deg % 360) + 360) % 360;
     if(suave == null) suave = h;
     else { const d = ((h - suave + 540) % 360) - 180; suave = (suave + d*0.2 + 360) % 360; }
     S.rumboCrudo = suave;                                   // rumbo del sensor sin ajuste
     S.rumboDisp = ((suave + brujOffset) % 360 + 360) % 360; // rumbo mostrado (con ajuste)
     const ahora = (performance && performance.now) ? performance.now() : Date.now();
-    // pedirDibujo() coalesce los redibujos en un frame (requestAnimationFrame),
-    // en vez de forzar un dibujar() sincrónico en cada lectura del sensor.
-    if(ahora - ultDibujo > 120){ ultDibujo = ahora; try{ pedirDibujo(); }catch(e){} }
+    if(ahora - ultDibujo > 90){ ultDibujo = ahora; try{ dibujar(); }catch(e){} }
   }
   // Respaldo para navegador (sin plugin nativo): deviceorientation. Solo acierta
   // con el equipo plano; en el APK se usa el sensor nativo, mucho más fiable.
@@ -7399,25 +7065,6 @@ const Brujula = (()=>{
     if(h == null) return;
     aplicar((h + anguloPantalla()) % 360);
   }
-  // Vuelve a armar el sensor nativo (re-registrarlo). Sirve cuando el sensor
-  // se "duerme" solo: algunos equipos dejan de emitir el vector de rotación
-  // tras un rato o al volver de segundo plano, y la flecha quedaba congelada
-  // o desaparecía. El re-armado es idempotente del lado nativo.
-  async function reArmar(){
-    const P = pluginGnss();
-    if(usandoNativo && P && P.iniciarBrujula){ try{ await P.iniciarBrujula(); ultEvento = Date.now(); }catch(e){} }
-  }
-  function arrancarWatchdog(){
-    if(watchdog) return;
-    // Cada 2.5 s: si el sensor nativo lleva >3.5 s sin emitir (y la pantalla
-    // está visible), lo re-armamos. Evita que la flecha se "pierda" sola.
-    watchdog = setInterval(()=>{
-      if(!usandoNativo) return;
-      if(document.hidden) return;
-      if(Date.now() - ultEvento > 3500) reArmar();
-    }, 2500);
-    try{ document.addEventListener('visibilitychange', ()=>{ if(!document.hidden){ ultEvento = Date.now(); reArmar(); } }); }catch(e){}
-  }
   async function iniciar(){
     if(activo) return; activo = true;
     const P = pluginGnss();
@@ -7426,8 +7073,6 @@ const Brujula = (()=>{
       try{
         await P.addListener('heading', ev => aplicar(ev && ev.deg));
         await P.iniciarBrujula();
-        usandoNativo = true; ultEvento = Date.now();
-        arrancarWatchdog();
         return;
       }catch(e){ /* si falla, cae al respaldo de navegador */ }
     }
@@ -7457,7 +7102,6 @@ let pedoDia = null;                          // { fecha, base, banco, distM, las
 let pedoHist = {};                           // { 'YYYY-MM-DD': {pasos, distM, kcal} } histórico
 let pedoManual = {};                         // { trackId: {fecha, pasos, distM, kcal} } tracks sumados a mano
 let perfilFisico = { peso: 70, altura: null, edad: null, sexo: null };  // para calorías
-let modDictamenes = false;   // paquete opcional "Dictámenes DA" (off por defecto)
 const ZANCADA = 0.75;                        // m por paso (para estimar sin sensor)
 
 // --- Calorías: método ACSM (American College of Sports Medicine) ---
@@ -7628,7 +7272,6 @@ const Pedometro = (()=>{
   try{ const ph = await dbGet('conf','pedoHist'); if(ph && typeof ph==='object'){ pedoHist = ph; } }catch(e){}
   try{ const pm = await dbGet('conf','pedoManual'); if(pm && typeof pm==='object'){ pedoManual = pm; } }catch(e){}
   try{ const pf = await dbGet('conf','perfilFisico'); if(pf){ perfilFisico = Object.assign(perfilFisico, pf); } }catch(e){}
-  try{ const md = await dbGet('conf','modDictamenes'); modDictamenes = !!md; }catch(e){}
   const filtGuardados = await dbGet('conf','filtros');
   if(filtGuardados) S.filtros = Object.assign(S.filtros, filtGuardados);
   try{

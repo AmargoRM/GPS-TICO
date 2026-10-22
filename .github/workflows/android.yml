@@ -90,10 +90,6 @@ jobs:
         run: |
           gh release delete apk-release --yes --cleanup-tag || true
           gh release create apk-release gps-tico.apk version.json \
-            paquetes/dictamenes/DA_distrito_canton_provincia.geojson.gz \
-            paquetes/dictamenes/DA_cuencas.geojson.gz \
-            paquetes/dictamenes/DA_hoja_cartografica.geojson.gz \
-            paquetes/dictamenes/DA_suelos.geojson.gz \
             --title "GPS TICO - APK (release firmado)" \
             --target "$GITHUB_SHA" \
             --notes "APK de release firmado con la llave de produccion. Se instala/actualiza directamente encima de una version anterior firmada con la misma llave (no hace falta desinstalar). Descarga el archivo gps-tico.apk y abrilo en el telefono."
