@@ -686,6 +686,15 @@ function dibujarRasters(aPant){
 function dibujarCapasVector(aPant, vista){
   for(const capa of S.capas){
     if(!capa.visible) continue;
+    // Capas de referencia de "Dictámenes DA" (traen _rol): son SOLO para el
+    // análisis espacial, no para dibujar. Tienen miles de polígonos y, al
+    // pintarse en cada fotograma, dejaban el mapa y la app trabados. Se saltan
+    // acá (y así se arreglan también los teléfonos que ya las tenían cargadas).
+    if(capa._soloAnalisis === undefined){
+      capa._soloAnalisis = false;
+      try{ const fc0=capa.geojson; const f0 = fc0 && (fc0.features ? fc0.features[0] : (fc0.type==='Feature'?fc0:null)); if(f0 && f0.properties && f0.properties._rol) capa._soloAnalisis = true; }catch(e){}
+    }
+    if(capa._soloAnalisis) continue;
     if(capa.tipo==='big'){ try{ dibujarBig(capa, aPant, vista); }catch(e){} continue; }
     if(capa.tipo==='wms' || !capa.geojson) continue;
     const fc = capa.geojson;
@@ -3688,7 +3697,10 @@ async function dictDescargarCapas(btn){
       const r = await httpGet(UPDATE_BASE+'/'+c.archivo+'?ts='+Date.now());
       if(r.status<200 || r.status>=400) throw new Error('HTTP '+r.status);
       const gj = JSON.parse(await dictGunzipTexto(r.bytes));
-      await guardarCapaVector(c.nombre, gj, true);
+      const capa = await guardarCapaVector(c.nombre, gj, true);
+      // Son capas de referencia: no se dibujan ni responden al toque (solo
+      // alimentan el análisis), así no traban el mapa.
+      if(capa){ capa.visible=false; capa.consultable=false; capa._soloAnalisis=true; try{ await dbPut('capas', capa); }catch(e){} }
       ok++;
     }catch(e){ toast('No se pudo bajar '+c.nombre+': '+(e&&e.message?e.message:e)); }
   }
@@ -5794,7 +5806,7 @@ function consultarPorRadio(px, py, radioM){
   const encontrados = [];   // {capa, feature, dist}
   for(let i=S.capas.length-1;i>=0;i--){
     const c = S.capas[i];
-    if(!c.visible || c.tipo==='wms' || c.consultable===false || !c.geojson) continue;
+    if(!c.visible || c.tipo==='wms' || c.consultable===false || c._soloAnalisis || !c.geojson) continue;
     const feats = c.geojson.type==='FeatureCollection' ? (c.geojson.features||[]) : c.geojson.type==='Feature' ? [c.geojson] : [];
     for(const f of feats){
       if(!f || !f.geometry) continue;
@@ -7370,7 +7382,9 @@ const Brujula = (()=>{
     S.rumboCrudo = suave;                                   // rumbo del sensor sin ajuste
     S.rumboDisp = ((suave + brujOffset) % 360 + 360) % 360; // rumbo mostrado (con ajuste)
     const ahora = (performance && performance.now) ? performance.now() : Date.now();
-    if(ahora - ultDibujo > 90){ ultDibujo = ahora; try{ dibujar(); }catch(e){} }
+    // pedirDibujo() coalesce los redibujos en un frame (requestAnimationFrame),
+    // en vez de forzar un dibujar() sincrónico en cada lectura del sensor.
+    if(ahora - ultDibujo > 120){ ultDibujo = ahora; try{ pedirDibujo(); }catch(e){} }
   }
   // Respaldo para navegador (sin plugin nativo): deviceorientation. Solo acierta
   // con el equipo plano; en el APK se usa el sensor nativo, mucho más fiable.
