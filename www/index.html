@@ -2323,13 +2323,41 @@ function volcarConf(){
   });
 }
 // Arma el objeto de copia completo (se usa para exportar a archivo y para el respaldo interno).
+// Prepara una capa para el respaldo SIN sus datos pesados. Serializar geometrías
+// grandes (arrays binarios del motor compacto, GeoJSON enormes, PNG de rásters)
+// con JSON.stringify crea un string gigante que agota la memoria del WebView y
+// cierra la app (OutOfMemoryError). Las capas pesadas se guardan solo como
+// metadatos (son re-importables); los datos críticos —proyectos, puntos, tracks—
+// sí van completos.
+const _CAMPOS_PESADOS = new Set(['coords','partStart','featPartStart','featType','featBBox','grid','png']);
+function capaParaBackup(c){
+  if(!c || typeof c!=='object') return c;
+  if(c.tipo==='wms') return c;   // WMS es solo configuración, liviana
+  const out = {};
+  let omit = null;
+  for(const k of Object.keys(c)){
+    const v = c[k];
+    if(v==null){ out[k]=v; continue; }
+    // Campos pesados conocidos (motor "big" y PNG de ráster): fuera por nombre.
+    if(_CAMPOS_PESADOS.has(k)){ omit = omit || (k==='png'?'raster':'big'); continue; }
+    // Arrays binarios y bitmaps (por si quedara alguno): fuera.
+    if(v instanceof ArrayBuffer || ArrayBuffer.isView(v) || (typeof ImageBitmap!=='undefined' && v instanceof ImageBitmap)){ omit=omit||'binario'; continue; }
+    // GeoJSON con muchos elementos: fuera (se re-importa).
+    if(k==='geojson'){ const n=(v && v.features)?v.features.length:0; if(n>800){ omit='geojson'; out._nFeats=n; continue; } }
+    // Red de seguridad: cualquier string descomunal.
+    if(typeof v==='string' && v.length>200000){ omit=omit||'texto'; continue; }
+    out[k]=v;
+  }
+  if(omit) out._omitido = omit;
+  return out;
+}
 async function construirBackupObj(){
   return {
     _tipo:'gpstico-backup', _v:1, fecha:new Date().toISOString(),
     proyectos: await dbAll('proyectos'),
     puntos: await dbAll('puntos'),
     tracks: await dbAll('tracks'),
-    capas: await dbAll('capas'),
+    capas: (await dbAll('capas')).map(capaParaBackup),
     conf: await volcarConf()
   };
 }
@@ -2417,7 +2445,14 @@ async function restaurarBackup(d){
     for(const p of (d.proyectos||[])) await dbPut('proyectos', p);
     for(const p of (d.puntos||[]))   await dbPut('puntos', p);
     for(const t of (d.tracks||[]))   await dbPut('tracks', t);
-    for(const c of (d.capas||[]))    await dbPut('capas', c);
+    for(const c of (d.capas||[])){
+      // Una capa "stub" (sin su geometría pesada) NO debe pisar una capa completa
+      // que ya exista con ese id.
+      if(c && c._omitido){
+        try{ const ex = await dbGet('capas', c.id); if(ex && (ex.geojson || ex.coords || ex.png)) continue; }catch(e){}
+      }
+      await dbPut('capas', c);
+    }
     if(d.conf) for(const k of Object.keys(d.conf)) await dbPut('conf', d.conf[k], k);
     ocultarCargando();
     toast('Copia restaurada. Reiniciando…');

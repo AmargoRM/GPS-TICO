@@ -48,6 +48,14 @@ Vive en `www/index.html`. Dos capas:
    que sobrevive a que el sistema vacíe la base del navegador, e incluso a desinstalar
    la app (carpeta compartida de Documentos).
    - `construirBackupObj()` arma `{_tipo:'gpstico-backup', _v:1, proyectos, puntos, tracks, capas, conf}`.
+   - **CRÍTICO**: las capas pasan por `capaParaBackup()`, que EXCLUYE los campos
+     pesados (`coords/partStart/featPartStart/featType/featBBox/grid` del motor big,
+     `png` del ráster, GeoJSON con >800 elementos, binarios y strings enormes). Si
+     no se excluyen, `JSON.stringify` crea un string de cientos de MB y la app muere
+     con `OutOfMemoryError` (build 97: ~1 GB de allocation con 17 capas → crash en
+     bucle). Nunca serializar geometrías de capas pesadas. Las capas pesadas se
+     respaldan solo como metadatos (`_omitido`) y son re-importables; restaurar un
+     stub no pisa una capa completa existente (chequeo en `restaurarBackup`).
    - `programarRespaldoInterno()` lo dispara con antirrebote (6 s tras el último
      cambio, máx. 1 cada 30 s). Se engancha dentro de `dbPut`/`dbDel` para los stores
      de datos del usuario.
