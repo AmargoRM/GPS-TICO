@@ -440,6 +440,129 @@ const dbPut   = (s,v,k)=>{ const p=_dbPutRaw(s,v,k); if(s==='proyectos'||s==='pu
 const dbDel   = (s,k)=>{ const p=pedir(tx(s,'readwrite').delete(k)); if(s==='proyectos'||s==='puntos'||s==='tracks'||s==='capas'){ try{ programarRespaldoInterno(); }catch(e){} } return p; };
 const porIndice = (s,i,v)=> pedir(tx(s).index(i).getAll(v));
 const nid = ()=> Date.now().toString(36) + Math.random().toString(36).slice(2,7);
+
+/* =========================================================================
+   REGISTRO DE USO Y FALLOS  (diagnóstico)
+   Guarda un historial de acciones y errores que SOBREVIVE al cierre por fallo:
+   · window.onerror, promesas rechazadas y console.error quedan registrados.
+   · Detección de "cierre inesperado": si la sesión anterior no cerró limpio
+     (traba/ANR/kill del sistema, que NO lanza excepción), se anota al arrancar.
+   · Se persiste a Documentos/GPSTICO/registro-uso.log y, como respaldo rápido,
+     a localStorage (sincrónico, sobrevive al cierre). El crash nativo Java se
+     escribe aparte (crash-nativo.log) y se incluye en el .txt exportado.
+   Exportable desde Configuración → Historial de uso y fallos.
+   ========================================================================= */
+const Registro = (()=>{
+  const DIRLOG='GPSTICO', ARCHLOG='GPSTICO/registro-uso.log', MAX=400;
+  let buf=[], flushT=null, ultFlush=0;
+  const stamp=()=> new Date().toISOString().replace('T',' ').slice(0,19);
+  const P=()=> (window.Capacitor && window.Capacitor.Plugins);
+  const linea=(e)=> `[${e.t}] ${(e.tipo||'info').toUpperCase()}: ${e.msg}`+(e.extra?('  '+e.extra):'');
+  function lsGuardar(){ try{ localStorage.setItem('gt_log', JSON.stringify(buf.slice(-150))); }catch(e){} }
+  async function flush(forzar){
+    const pp=P(); if(!(pp && pp.Filesystem)) return;
+    const now=Date.now(); if(!forzar && now-ultFlush<2500) return; ultFlush=now;
+    try{
+      try{ await pp.Filesystem.mkdir({ path:DIRLOG, directory:'DOCUMENTS', recursive:true }); }catch(e){}
+      await pp.Filesystem.writeFile({ path:ARCHLOG, data:buf.map(linea).join('\n')+'\n', directory:'DOCUMENTS', encoding:'utf8' });
+    }catch(e){}
+  }
+  function programarFlush(){ if(flushT) return; flushT=setTimeout(()=>{ flushT=null; flush(false); }, 2500); }
+  function evento(tipo, msg, extra){
+    try{
+      const e={ t:stamp(), tipo:String(tipo||'info'),
+                msg:String(msg==null?'':msg).slice(0,500),
+                extra:(extra!=null?String(extra).slice(0,500):'') };
+      buf.push(e); if(buf.length>MAX) buf=buf.slice(-MAX);
+      lsGuardar();
+      if(e.tipo==='error'||e.tipo==='crash') flush(true); else programarFlush();
+    }catch(_){}
+  }
+  function infoDispositivo(){
+    const l=[];
+    try{ l.push('equipo: '+navigator.userAgent); }catch(e){}
+    try{ l.push('pantalla: '+screen.width+'x'+screen.height+' @'+(window.devicePixelRatio||1)+'x · ventana '+innerWidth+'x'+innerHeight); }catch(e){}
+    try{ if(navigator.deviceMemory) l.push('RAM aprox: '+navigator.deviceMemory+' GB'); }catch(e){}
+    try{ if(performance && performance.memory){ const m=performance.memory; l.push('heap JS: '+Math.round(m.usedJSHeapSize/1048576)+' MB usados / límite '+Math.round(m.jsHeapSizeLimit/1048576)+' MB'); } }catch(e){}
+    try{ l.push('build instalado: '+(typeof APP_BUILD!=='undefined'?APP_BUILD:'?')+' · online: '+navigator.onLine); }catch(e){}
+    return l.join('\n');
+  }
+  async function leerArchivo(path, dir){
+    const pp=P(); if(!(pp && pp.Filesystem)) return '';
+    try{ const r=await pp.Filesystem.readFile({ path, directory:dir, encoding:'utf8' }); return r.data||''; }catch(e){ return ''; }
+  }
+  async function exportar(){
+    mostrarCargando('Preparando diagnóstico…');
+    try{
+      await flush(true);
+      let conteos='';
+      try{ conteos=`proyectos: ${(await dbAll('proyectos')).length} · puntos: ${(await dbAll('puntos')).length} · tracks: ${(await dbAll('tracks')).length} · capas: ${(await dbAll('capas')).length}`; }catch(e){}
+      let almac='';
+      try{ if(navigator.storage && navigator.storage.estimate){ const s=await navigator.storage.estimate(); almac=`almacenamiento: ${Math.round((s.usage||0)/1048576)} MB usados de ${Math.round((s.quota||0)/1048576)} MB · persistente: ${navigator.storage.persisted?await navigator.storage.persisted():'?'}`; } }catch(e){}
+      const crashNativo = await leerArchivo('crash-nativo.log','DATA');
+      const logJS = buf.length ? buf.map(linea).join('\n') : (await leerArchivo(ARCHLOG,'DOCUMENTS'));
+      const txt =
+        'GPS TICO — REGISTRO DE USO Y FALLOS\n'+
+        'generado: '+stamp()+'\n'+
+        '========================================\n'+
+        infoDispositivo()+'\n'+
+        (conteos?('datos: '+conteos+'\n'):'')+
+        (almac?(almac+'\n'):'')+
+        '========================================\n\n'+
+        '----- CRASHES NATIVOS (Java) -----\n'+
+        (crashNativo.trim() ? crashNativo : '(sin crashes nativos registrados)')+'\n\n'+
+        '----- HISTORIAL DE USO Y ERRORES (JS) -----\n'+
+        (logJS.trim() ? logJS : '(sin eventos registrados)')+'\n';
+      const nom='gpstico-registro-'+new Date().toISOString().slice(0,19).replace(/[:T]/g,'-')+'.txt';
+      await bajar(nom, txt, 'text/plain');
+    }catch(e){ toast('No se pudo exportar el registro.'); }
+    finally{ ocultarCargando(); }
+  }
+  async function limpiar(){
+    buf=[]; try{ localStorage.removeItem('gt_log'); }catch(e){}
+    const pp=P();
+    if(pp && pp.Filesystem){
+      try{ await pp.Filesystem.deleteFile({ path:ARCHLOG, directory:'DOCUMENTS' }); }catch(e){}
+      try{ await pp.Filesystem.deleteFile({ path:'crash-nativo.log', directory:'DATA' }); }catch(e){}
+    }
+    evento('info','Registro limpiado por el usuario.');
+  }
+  function ultimos(n){ return buf.slice(-(n||40)); }
+  function init(){
+    // Restaurar el historial reciente guardado antes de un posible cierre.
+    try{ const prev=JSON.parse(localStorage.getItem('gt_log')||'[]'); if(Array.isArray(prev)) buf=prev.slice(-MAX); }catch(e){}
+    // Detección de cierre inesperado (traba/ANR/kill): si el marcador quedó en "1",
+    // la sesión anterior no cerró limpio.
+    try{
+      if(localStorage.getItem('gt_sesionAbierta')==='1')
+        evento('crash','Cierre inesperado de la sesión anterior (la app se trabó o el sistema la cerró sin aviso).');
+      localStorage.setItem('gt_sesionAbierta','1');
+    }catch(e){}
+    // Errores JS no controlados.
+    window.addEventListener('error', ev=>{
+      try{
+        if(ev && ev.message) evento('error', ev.message, (ev.filename?((ev.filename.split('/').pop())+':'+ev.lineno+':'+ev.colno):'')+(ev.error&&ev.error.stack?('  '+String(ev.error.stack).slice(0,300)):''));
+      }catch(_){}
+    }, true);
+    window.addEventListener('unhandledrejection', ev=>{
+      try{ const r=ev&&ev.reason; evento('error','Promesa rechazada: '+(r&&r.message?r.message:String(r)), (r&&r.stack?String(r.stack).slice(0,300):'')); }catch(_){}
+    });
+    // Conservar console.error en el registro.
+    try{ const orig=console.error.bind(console); console.error=function(){ try{ evento('error','console.error: '+Array.from(arguments).map(a=>{ try{ return typeof a==='string'?a:JSON.stringify(a); }catch(_){ return String(a); } }).join(' ').slice(0,400)); }catch(_){} return orig.apply(null, arguments); }; }catch(e){}
+    // Cierre limpio: al ocultarse/descargarse se baja el marcador y se vuelca el log.
+    const alOcultar=()=>{ try{ localStorage.setItem('gt_sesionAbierta','0'); }catch(e){} flush(true); };
+    window.addEventListener('pagehide', alOcultar);
+    window.addEventListener('beforeunload', alOcultar);
+    // Al volver al frente, restablecer el marcador de sesión activa.
+    const alVolver=()=>{ try{ if(document.visibilityState==='visible') localStorage.setItem('gt_sesionAbierta','1'); }catch(e){} };
+    window.addEventListener('pageshow', alVolver);
+    document.addEventListener('visibilitychange', ()=>{ if(document.visibilityState==='hidden') flush(true); else alVolver(); });
+    evento('info','App iniciada. '+(typeof APP_BUILD!=='undefined'?('build '+APP_BUILD):''));
+  }
+  return { init, evento, exportar, limpiar, ultimos, flush };
+})();
+const logEvento = (t,m,e)=> Registro.evento(t,m,e);
+Registro.init();
 // Centra el mapa en una coordenada (usable desde cualquier panel).
 function volarA(lat, lon){ S.centro.lat=lat; S.centro.lon=lon; S.zoom=Math.max(S.zoom,17); S.seguir=false; cerrarPanel(); dibujar(); }
 
@@ -1649,6 +1772,7 @@ async function alternarTrack(){
     let camInfo = '';
     try{ const pt = Pedometro.pasosTrack(); const dc = S.grabando.distCaminada||0; if(pt || dc) camInfo = ` · 👟 ${pt} pasos · ${dc>=1000?(dc/1000).toFixed(2)+' km':Math.round(dc)+' m'} caminados`; }catch(e){}
     toast(`Track guardado · ${S.grabando.pts.length} puntos · ${S.grabando.dist.toFixed(0)} m` + (rech?` · ${rech} filtrados`:'') + camInfo);
+    logEvento('accion','Track detenido y guardado', `${S.grabando.pts.length} puntos · ${S.grabando.dist.toFixed(0)} m`);
     disparoAutoSync();
     S.grabando = null;
     b.dataset.on = '0'; b.textContent = 'Grabar track';
@@ -1674,6 +1798,7 @@ async function alternarTrack(){
     await dbPut('tracks', JSON.parse(JSON.stringify(S.grabando)));
     await dbPut('conf', S.grabando.id, 'trackEnCurso');
     b.dataset.on = '1'; b.textContent = 'Detener';
+    logEvento('accion','Track iniciado', S.grabando.nom);
     await mantenerPantalla();
     await iniciarServicioTrack();
     dibujar();
@@ -1882,6 +2007,7 @@ function abrirPanel(titulo, html){
   document.getElementById('panelCuerpo').innerHTML = html;
   document.getElementById('panel').classList.add('on');
   document.getElementById('velo').classList.add('on');
+  try{ if(typeof logEvento==='function' && titulo!=='Historial de uso y fallos') logEvento('nav','Abrió: '+titulo); }catch(e){}
 }
 function cerrarPanel(){
   document.getElementById('panel').classList.remove('on');
@@ -2344,6 +2470,7 @@ function panelConfig(){
     <div class="fila"><div class="cuerpo"><div class="t">Fuente de posición</div><div class="s">${S.fuente==='gps'?'GPS puro (nativo)':'Fusionada (GPS+WiFi+celda)'}</div></div><button class="mini" id="cFuente">Cambiar</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Brújula (flecha de dirección)</div><div class="s">${brujOffset?('Ajuste '+Math.round(brujOffset)+'°'):'Sin ajuste'} · calibrar / corregir</div></div><button class="mini" id="cBruj">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Grabación con pantalla bloqueada</div><div class="s">Permisos para que el track no se corte al bloquear el celular</div></div><button class="mini" id="cBg">Abrir</button></div>
+    <div class="fila"><div class="cuerpo"><div class="t">Historial de uso y fallos</div><div class="s">Registro de errores/crashes · exportar .txt de diagnóstico</div></div><button class="mini" id="cLog">Abrir</button></div>
     <div class="fila"><div class="cuerpo"><div class="t">Precisión y advertencias</div><div class="s">Términos de uso · leer antes de usar en expedientes</div></div><button class="mini" id="cInfo">Abrir</button></div>
   `);
   document.getElementById('cPlant').onclick = ()=> navegarPanel(panelPlantillas);
@@ -2353,7 +2480,30 @@ function panelConfig(){
   document.getElementById('cFuente').onclick = ()=> navegarPanel(panelFuente);
   document.getElementById('cBruj').onclick   = ()=> navegarPanel(panelBrujula);
   document.getElementById('cBg').onclick    = ()=> navegarPanel(panelPermisosBackground);
+  document.getElementById('cLog').onclick   = ()=> navegarPanel(panelRegistro);
   document.getElementById('cInfo').onclick  = ()=> navegarPanel(panelInfo);
+}
+// Panel de diagnóstico: ver y exportar el historial de uso y fallos.
+function panelRegistro(){
+  const evs = Registro.ultimos(60).slice().reverse();
+  const color = t=> t==='crash'?'var(--sangre)':t==='error'?'#E0A458':'var(--musgo)';
+  const filas = evs.length
+    ? evs.map(e=>`<div style="padding:6px 2px;border-bottom:1px solid var(--abismo);font-size:11px;line-height:1.35">
+        <span style="color:${color(e.tipo)};font-weight:600">${(e.tipo||'info').toUpperCase()}</span>
+        <span style="color:var(--musgo)"> · ${e.t.slice(11)}</span><br>${escHtml(e.msg)}${e.extra?`<br><span style="color:var(--musgo)">${escHtml(e.extra)}</span>`:''}
+      </div>`).join('')
+    : '<div class="vacio">Sin eventos registrados todavía.</div>';
+  abrirPanel('Historial de uso y fallos', `
+    <div class="nota">Aquí queda registrado <b>qué estabas haciendo y qué falló</b>, incluso si la app se trabó o se cerró sola (se guarda en el teléfono y sobrevive al cierre). Si te da errores, tocá <b>Exportar .txt</b> y enviámelo: con ese archivo puedo ver la causa y corregirla.</div>
+    <button class="ancho" id="lgExp">📄 Exportar .txt de diagnóstico</button>
+    <button class="ancho borde" id="lgRef">↻ Actualizar</button>
+    <button class="ancho borde" id="lgClr">🗑 Limpiar registro</button>
+    <label style="margin-top:12px">Últimos eventos (más reciente arriba)</label>
+    <div style="max-height:46vh;overflow:auto;border:1px solid var(--cauce);border-radius:8px;padding:6px">${filas}</div>
+  `);
+  document.getElementById('lgExp').onclick = ()=> Registro.exportar();
+  document.getElementById('lgRef').onclick = ()=> panelRegistro();
+  document.getElementById('lgClr').onclick = async ()=>{ if(confirm('¿Borrar todo el historial de uso y fallos?')){ await Registro.limpiar(); panelRegistro(); } };
 }
 
 /* --- proyectos --- */
@@ -4692,8 +4842,9 @@ async function importarFeaturesGrande(nombre, feats, proyKnown){
     await dbPut('capas', capa); S.capas.push(capa);
     centrarEnCapa(capa); dibujar();
     toast(`Capa "${capa.nombre}": ${nFeats} elementos`+(proyFuente!=='geo'&&dentroCR?' · '+proyFuente.toUpperCase()+'→WGS84':''));
+    logEvento('info','Capa grande cargada', `${capa.nombre} · ${nFeats} elementos · motor compacto`);
     return capa;
-  }catch(e){ toast('No se pudo procesar la capa: '+(e.message||e)); return null; }
+  }catch(e){ toast('No se pudo procesar la capa: '+(e.message||e)); logEvento('error','Capa grande falló', (e&&e.message)||String(e)); return null; }
   finally{ ocultarCargando(); }
 }
 // --- dibujo de una capa grande (con culling por grilla y decimación) ---
@@ -5150,6 +5301,7 @@ async function agregarCapaRaster(nombre, ab){
 async function agregarCapaArchivo(file){
   const nombre = file.name.replace(/\.(geojson|json|kml|kmz|shp|zip|tif|tiff|geotiff|dxf|gpx)$/i,'');
   let ext = (file.name.split('.').pop()||'').toLowerCase();
+  logEvento('accion','Agregar capa de archivo', `${file.name} · ${file.size!=null?Math.round(file.size/1024)+' KB':'?'} · ext=${ext}`);
   // GeoTIFF raster por extensión O por firma (los gestores que reportan MIME
   // genérico suelen entregar el archivo sin extensión útil). TIFF empieza con
   // "II*\0" (49 49 2A 00) o "MM\0*" (4D 4D 00 2A).
@@ -5172,7 +5324,7 @@ async function agregarCapaArchivo(file){
     if(file.size!=null && file.size > BIG_UMBRAL){ await importarGeoJSONGrande(nombre, file.stream()); return; }
     mostrarCargando('Leyendo archivo…');
     try{ await guardarCapaVector(nombre, JSON.parse(await file.text())); }
-    catch(e){ toast('No se pudo importar: '+(e.message||e)); }
+    catch(e){ toast('No se pudo importar: '+(e.message||e)); logEvento('error','Importar GeoJSON falló', (e&&e.message)||String(e)); }
     finally{ ocultarCargando(); }
     return;
   }
@@ -5200,7 +5352,7 @@ async function agregarCapaArchivo(file){
     } else {
       toast('Formato no reconocido. Usá GeoJSON, KML, KMZ, GPX, SHP, ZIP o DXF.');
     }
-  }catch(e){ toast('No se pudo importar: '+(e.message||e)); }
+  }catch(e){ toast('No se pudo importar: '+(e.message||e)); logEvento('error','Importar capa ('+ext+') falló', (e&&e.message)||String(e)); }
   finally{ ocultarCargando(); }
 }
 async function agregarCapaURL(nombre, url){

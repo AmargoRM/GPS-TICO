@@ -65,6 +65,27 @@ Vive en `www/index.html`. Dos capas:
 
 Al tocar el sistema de datos, mantener ambas capas intactas.
 
+## Registro de uso y fallos (diagnóstico)
+
+Para depurar trabas/cierres sin poder reproducirlos. Sobrevive al cierre por fallo.
+
+- **JS** (`www/index.html`): módulo `Registro` (global `logEvento(tipo,msg,extra)`).
+  Captura `window.onerror`, promesas rechazadas y `console.error`. Persiste a
+  `Documentos/GPSTICO/registro-uso.log` (Filesystem) y a `localStorage` (rápido,
+  sincrónico). **Detección de cierre inesperado**: marcador `gt_sesionAbierta` en
+  localStorage; si al arrancar sigue en "1", la sesión anterior no cerró limpio
+  (traba/ANR/kill que no lanza excepción) → se anota como `crash`. Breadcrumbs en
+  apertura de paneles, carga de capas y tracks.
+- **Nativo** (`CrashCatcher.java`, instalado primero en `MainActivity.onCreate`):
+  `Thread.setDefaultUncaughtExceptionHandler` escribe el stack trace a
+  `getFilesDir()/crash-nativo.log` ANTES de que el sistema mate el proceso. JS lo
+  lee con Filesystem `directory:'DATA'`.
+- **Exportar**: Configuración → Historial de uso y fallos → "Exportar .txt"
+  (`Registro.exportar()`): arma un .txt con info del equipo, almacenamiento,
+  conteos, crashes nativos y el historial JS, y abre Compartir.
+- Al tocar errores/estabilidad, mantener este registro y agregar `logEvento` en los
+  puntos nuevos que puedan fallar.
+
 ## Nube (Neon vía Cloudflare Worker)
 
 - Sincronización **solo de subida** (upload-only): `getNube`/`postNube` mandan

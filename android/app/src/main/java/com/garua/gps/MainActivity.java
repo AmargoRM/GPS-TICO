@@ -8,6 +8,8 @@ import com.getcapacitor.BridgeActivity;
 public class MainActivity extends BridgeActivity {
     @Override
     public void onCreate(Bundle savedInstanceState) {
+        // Cazador de crashes: lo primero, para registrar cualquier fallo no controlado.
+        CrashCatcher.instalar(this);
         // Registrar plugins nativos antes de super.
         registerPlugin(KeepAwakePlugin.class);
         registerPlugin(GnssPlugin.class);
