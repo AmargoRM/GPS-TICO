@@ -432,8 +432,12 @@ function tx(store, modo='readonly'){ return DB.transaction(store, modo).objectSt
 function pedir(req){ return new Promise((ok,mal)=>{ req.onsuccess=()=>ok(req.result); req.onerror=()=>mal(req.error); }); }
 const dbGet   = (s,k)=> pedir(tx(s).get(k));
 const dbAll   = (s)=> pedir(tx(s).getAll());
-const dbPut   = (s,v,k)=> pedir(tx(s,'readwrite').put(v,k));
-const dbDel   = (s,k)=> pedir(tx(s,'readwrite').delete(k));
+const _dbPutRaw = (s,v,k)=> pedir(tx(s,'readwrite').put(v,k));
+// dbPut dispara un respaldo interno (antirrebote) cuando cambian datos de usuario.
+// Así, si el sistema vacía la base del navegador (o se desinstala la app), queda
+// una copia en la carpeta Documentos del teléfono para restaurar.
+const dbPut   = (s,v,k)=>{ const p=_dbPutRaw(s,v,k); if(s==='proyectos'||s==='puntos'||s==='tracks'||s==='capas'){ try{ programarRespaldoInterno(); }catch(e){} } return p; };
+const dbDel   = (s,k)=>{ const p=pedir(tx(s,'readwrite').delete(k)); if(s==='proyectos'||s==='puntos'||s==='tracks'||s==='capas'){ try{ programarRespaldoInterno(); }catch(e){} } return p; };
 const porIndice = (s,i,v)=> pedir(tx(s).index(i).getAll(v));
 const nid = ()=> Date.now().toString(36) + Math.random().toString(36).slice(2,7);
 // Centra el mapa en una coordenada (usable desde cualquier panel).
@@ -2191,17 +2195,88 @@ function volcarConf(){
     req.onerror = ()=> ok(out);
   });
 }
+// Arma el objeto de copia completo (se usa para exportar a archivo y para el respaldo interno).
+async function construirBackupObj(){
+  return {
+    _tipo:'gpstico-backup', _v:1, fecha:new Date().toISOString(),
+    proyectos: await dbAll('proyectos'),
+    puntos: await dbAll('puntos'),
+    tracks: await dbAll('tracks'),
+    capas: await dbAll('capas'),
+    conf: await volcarConf()
+  };
+}
+
+/* =========================================================================
+   RESPALDO INTERNO AUTOMÁTICO
+   Guarda una copia completa en Documentos/GPSTICO/ del teléfono — FUERA de la
+   base de datos del navegador (IndexedDB), que el sistema Android puede vaciar
+   si se queda sin espacio. Al estar en la carpeta compartida de Documentos,
+   sobrevive incluso a desinstalar la app. Se dispara solo tras cada cambio
+   (antirrebote) y se puede restaurar al abrir la app si no hay datos cargados.
+   ========================================================================= */
+const RESP_DIR  = 'GPSTICO';
+const RESP_FILE = RESP_DIR + '/respaldo-auto.json';
+let _respTimer = null, _respUltimo = 0;
+
+// Programa un respaldo interno: se ejecuta 6 s después del último cambio y
+// no más de uno cada 30 s, para no castigar el disco al capturar muchos puntos.
+function programarRespaldoInterno(){
+  if(_respTimer) clearTimeout(_respTimer);
+  _respTimer = setTimeout(()=>{
+    _respTimer = null;
+    if(Date.now() - _respUltimo < 30000) { programarRespaldoInterno(); return; }
+    _respUltimo = Date.now();
+    guardarRespaldoInterno(true);
+  }, 6000);
+}
+
+async function guardarRespaldoInterno(silencioso){
+  const P = window.Capacitor && window.Capacitor.Plugins;
+  if(!(P && P.Filesystem)){ if(!silencioso) toast('El respaldo interno solo funciona en la app (APK).'); return false; }
+  try{
+    const data = await construirBackupObj();
+    try{ await P.Filesystem.mkdir({ path:RESP_DIR, directory:'DOCUMENTS', recursive:true }); }catch(e){}
+    await P.Filesystem.writeFile({ path:RESP_FILE, data:JSON.stringify(data), directory:'DOCUMENTS', encoding:'utf8' });
+    try{ await _dbPutRaw('conf', { fecha:data.fecha, puntos:data.puntos.length, tracks:data.tracks.length, proyectos:data.proyectos.length }, 'respaldoInterno'); }catch(e){}
+    if(!silencioso) toast(`Respaldo interno guardado: ${data.puntos.length} puntos · ${data.tracks.length} tracks.`);
+    return true;
+  }catch(e){ console.log('respaldo interno:', e); if(!silencioso) toast('No se pudo guardar el respaldo interno.'); return false; }
+}
+
+async function leerRespaldoInterno(){
+  const P = window.Capacitor && window.Capacitor.Plugins;
+  if(!(P && P.Filesystem)) return null;
+  try{
+    const r = await P.Filesystem.readFile({ path:RESP_FILE, directory:'DOCUMENTS', encoding:'utf8' });
+    const d = JSON.parse(r.data);
+    return (d && d._tipo==='gpstico-backup') ? d : null;
+  }catch(e){ return null; }
+}
+
+// Al arrancar: si la app quedó SIN datos (base vaciada o recién reinstalada) pero
+// existe un respaldo interno con contenido, ofrece restaurarlo automáticamente.
+async function revisarRespaldoAlInicio(){
+  try{
+    const ps = await dbAll('proyectos');
+    const pts = await dbAll('puntos');
+    const tks = await dbAll('tracks');
+    if((ps.length + pts.length + tks.length) > 0) return;   // ya hay datos: nada que hacer
+    const bk = await leerRespaldoInterno();
+    if(!bk) return;
+    const nP = (bk.puntos||[]).length, nT = (bk.tracks||[]).length, nPr = (bk.proyectos||[]).length;
+    if((nP + nT + nPr) === 0) return;
+    const fec = (bk.fecha||'').slice(0,16).replace('T',' ');
+    if(confirm(`La app no tiene datos cargados, pero se encontró un RESPALDO INTERNO del ${fec} con:\n\n• ${nPr} proyecto(s)\n• ${nP} punto(s)\n• ${nT} track(s)\n\n¿Restaurar ahora?`)){
+      await restaurarBackup(bk);   // restaura y reinicia
+    }
+  }catch(e){ console.log('revisar respaldo:', e); }
+}
+
 async function exportarBackup(){
   mostrarCargando('Preparando copia…');
   try{
-    const data = {
-      _tipo:'gpstico-backup', _v:1, fecha:new Date().toISOString(),
-      proyectos: await dbAll('proyectos'),
-      puntos: await dbAll('puntos'),
-      tracks: await dbAll('tracks'),
-      capas: await dbAll('capas'),
-      conf: await volcarConf()
-    };
+    const data = await construirBackupObj();
     const n = 'gpstico-backup-'+new Date().toISOString().slice(0,19).replace(/[:T]/g,'-')+'.json';
     await bajar(n, JSON.stringify(data), 'application/json');
     toast(`Copia lista: ${data.proyectos.length} proyectos · ${data.puntos.length} puntos · ${data.tracks.length} tracks.`);
@@ -2229,16 +2304,32 @@ function importarBackupArchivo(file){
   reader.onerror = ()=> toast('No se pudo leer el archivo.');
   reader.readAsText(file);
 }
-function panelBackup(){
+async function panelBackup(){
+  let ri = null; try{ ri = await dbGet('conf','respaldoInterno'); }catch(e){}
+  const riTxt = ri && ri.fecha
+    ? `Último: ${ri.fecha.slice(0,16).replace('T',' ')} · ${ri.puntos||0} puntos · ${ri.tracks||0} tracks`
+    : 'Todavía no se ha guardado ninguno (se crea solo al capturar datos).';
   abrirPanel('Copia de seguridad', `
-    <div class="nota">Guardá una copia de <b>TODO</b> (proyectos, puntos, tracks, capas y ajustes) en un archivo. Si cambiás de teléfono o una actualización borra datos, restaurás desde acá. Hacelo seguido y guardá el archivo en Drive o tu PC.</div>
+    <div class="nota"><b>Respaldo interno automático.</b> La app guarda sola una copia de todo en la carpeta <b>Documentos/GPSTICO</b> del teléfono cada vez que capturás datos. Esa carpeta <b>no se borra</b> aunque el sistema vacíe la app o la desinstales, y si abrís la app sin datos te ofrece restaurarla.</div>
+    <div class="res"><div class="k">Respaldo interno</div><div class="v">${riTxt}</div></div>
     <div class="res"><div class="k">Contenido actual</div><div class="v">${S.puntos.length} puntos · ${S.tracks.length} tracks · ${S.capas.length} capas</div></div>
-    <button class="ancho" id="bkExp">Exportar copia (todo)</button>
+    <button class="ancho" id="bkIntNow">Guardar respaldo interno ahora</button>
+    <button class="ancho borde" id="bkIntRest">Restaurar desde respaldo interno</button>
+    <hr style="border:none;border-top:1px solid #2a3344;margin:14px 0">
+    <div class="nota"><b>Copia a un archivo (para Drive, PC u otro teléfono).</b> Guardá o compartí un archivo con TODO. Úsalo para transferir tus datos a otro equipo o tener una copia fuera del celular.</div>
+    <button class="ancho" id="bkExp">Exportar copia a un archivo</button>
     <label>Restaurar desde un archivo de copia</label>
     <input type="file" id="bkFile" accept="application/json,.json">
     <button class="ancho borde" id="bkImp">Restaurar copia</button>
     <div class="nota">Restaurar <b>agrega/actualiza</b> sin borrar lo que ya tengas. La app se reinicia al terminar.</div>
   `);
+  document.getElementById('bkIntNow').onclick = ()=> guardarRespaldoInterno(false);
+  document.getElementById('bkIntRest').onclick = async ()=>{
+    const bk = await leerRespaldoInterno();
+    if(!bk){ toast('No hay respaldo interno guardado todavía.'); return; }
+    const nP=(bk.puntos||[]).length, nT=(bk.tracks||[]).length;
+    if(confirm(`Restaurar el respaldo interno del ${(bk.fecha||'').slice(0,16).replace('T',' ')}?\n\n${nP} puntos · ${nT} tracks (se agregan/actualizan sin borrar lo actual).`)) restaurarBackup(bk);
+  };
   document.getElementById('bkExp').onclick = exportarBackup;
   document.getElementById('bkImp').onclick = ()=>{ const f=document.getElementById('bkFile').files[0]; if(!f){ toast('Elegí el archivo de copia.'); return; } importarBackupArchivo(f); };
 }
@@ -7264,6 +7355,9 @@ const Pedometro = (()=>{
   await abrirDB();
   Voz.init();
   await migrarAGeoJSON();
+  // Si la base quedó vacía (sistema la vació o reinstalación) y hay respaldo
+  // interno en Documentos/GPSTICO, ofrecer restaurarlo antes de seguir.
+  await revisarRespaldoAlInicio();
   S.modo = await dbGet('conf','modo') || 'geo';
   S.capa = await dbGet('conf','capa') || 'sat';
   try{ const bo = await dbGet('conf','brujOffset'); if(bo!=null && isFinite(bo)) brujOffset = ((Number(bo)%360)+360)%360; }catch(e){}
