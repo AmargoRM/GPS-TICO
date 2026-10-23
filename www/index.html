@@ -1443,6 +1443,7 @@ function alFix(pos){
   if(pendientePuntoWidget){ pendientePuntoWidget = false; marcarPuntoRapido(); }
   if(S.grabando) grabarPunto(pos);
   try{ Pedometro.alFix(pos); }catch(e){}
+  try{ Brujula.actualizarUbicacion(c.latitude, c.longitude, (pos.altElip!=null?pos.altElip:c.altitude)); }catch(e){}
   if(ocupacion && ocupacion.activa) ocupacion.muestras.push({
     lat:c.latitude, lon:c.longitude, acc:(c.accuracy!=null?c.accuracy:null),
     altElip:pos.altElip, altOrto:pos.altOrto, altOrtoFuente:pos.altOrtoFuente,
@@ -3292,6 +3293,8 @@ function panelBrujula(){
     <div class="nota" style="border-color:var(--fix)">La flecha/cono verde marca hacia dónde <b>apunta el borde superior del teléfono</b>. En casi todos los equipos sale bien; esto es el <b>ajuste fino</b>, como última alternativa si en tu modelo la flecha queda desviada.</div>
     <div class="res"><div class="k">La flecha marca ahora</div><div class="v" id="brujVal">—</div></div>
     <div class="res"><div class="k">Sensor sin ajuste</div><div class="v" id="brujRaw">—</div></div>
+    <div class="res"><div class="k">Calibración del sensor</div><div class="v" id="brujCal">—</div></div>
+    <div class="nota">La flecha ya apunta al <b>norte geográfico</b> (la app aplica la declinación magnética según tu ubicación). Si al arrancar la flecha quedó desviada, casi siempre es que el <b>magnetómetro está sin calibrar</b>: mové el teléfono en forma de <b>8</b> unas 3–4 veces hasta que la calibración diga «Alta».</div>
 
     <label>Calibración fácil (recomendada)</label>
     <div class="nota">Apuntá el <b>borde superior</b> del teléfono exactamente al <b>Norte</b> (con otra brújula, el sol o una calle conocida) y tocá el botón: la app calcula el ángulo exacto para tu equipo, sea cual sea.</div>
@@ -3324,6 +3327,11 @@ function panelBrujula(){
     const v=S.rumboDisp, r=S.rumboCrudo;
     a.textContent = (v==null) ? 'sin sensor / esperando…' : (Math.round(v)+'° ('+dir(v)+')');
     if(b) b.textContent = (r==null) ? '—' : (Math.round(r)+'° ('+dir(r)+')');
+    const cal=document.getElementById('brujCal');
+    if(cal){ const p=Brujula.precision();
+      cal.textContent = p<0?'esperando…':p>=3?'✓ Alta':p===2?'Media':p===1?'Baja — mové el teléfono en 8':'✗ No fiable — mové el teléfono en 8';
+      cal.style.color = p>=2?'var(--fix)':(p>=0?'#E0A458':'');
+    }
   };
   tick();
   if(window._brujIv) clearInterval(window._brujIv);
@@ -4068,6 +4076,15 @@ async function guardarCapaVector(nombre, gj, silencioso){
   if(gj.type !== 'FeatureCollection'){
     fc = { type:'FeatureCollection', features: gj.type==='Feature' ? [gj] : [{type:'Feature',geometry:gj,properties:{}}] };
   }
+  // Capas con MUCHOS elementos → motor compacto (grilla + recorte por vista + cede
+  // el hilo). Evita el congelamiento por reproyectar/recorrer todo de forma síncrona
+  // y no guarda el GeoJSON crudo entero en la base del navegador.
+  const _feats = fc.features || [];
+  if(_feats.length > UMBRAL_FEATS_BIG){
+    const capa = await importarFeaturesGrande((nombre||'Capa').slice(0,40), _feats, fc._proyFuente);
+    if(capa && !silencioso) panelCapas();
+    return capa;
+  }
   // Proyección de origen: la del shapefile (ya reproyectado) o autodetectada.
   let proyFuente, aviso = '';
   if(fc._proyFuente !== undefined){
@@ -4463,9 +4480,10 @@ function exportarDXF(modo, puntos, tracks, suf){
    - Índice espacial por grilla: dibuja/consulta sólo lo visible.
    - Atributos en IndexedDB (store 'bigprops') por chunks; se leen al tocar.
    ======================================================================= */
-const BIG_UMBRAL = 8*1048576;      // GeoJSON de archivo > 8 MB usa este motor
+const BIG_UMBRAL = 4*1048576;      // GeoJSON de archivo > 4 MB usa el motor compacto (streaming)
 const BIG_MAX    = 400*1048576;    // tope duro razonable
 const PROP_CHUNK = 1000;           // atributos por chunk en IndexedDB
+const UMBRAL_FEATS_BIG = 2500;     // capas con más de N elementos van al motor compacto (no congelan)
 
 // Escáner de objetos JSON balanceado (respeta comillas y escapes).
 function _scanObjeto(buf, start){
@@ -4627,6 +4645,55 @@ async function importarGeoJSONGrande(nombre, byteStream){
     centrarEnCapa(capa); dibujar(); panelCapas();
     toast(`Capa "${capa.nombre}": ${nFeats} elementos`+(proyFuente!=='geo'?(dentroCR?' · '+proyFuente.toUpperCase()+'→WGS84':' · asumí CRTM05'):''));
   }catch(e){ toast('No se pudo importar la capa grande: '+(e.message||e)); }
+  finally{ ocultarCargando(); }
+}
+// Importa una lista de features YA en memoria con el motor compacto, reproyectando
+// por elemento y CEDIENDO EL HILO cada tanto para que la app no se congele. Se usa
+// cuando una capa (de archivo, KML, SHP, WFS, etc.) trae muchos elementos: evita
+// guardar el GeoJSON crudo entero en la base y recorrerlo completo en cada redibujo.
+async function importarFeaturesGrande(nombre, feats, proyKnown){
+  mostrarCargando('Procesando capa…');
+  try{
+    const id = nid();
+    let B=null, proyFuente='geo', dentroCR=false, detHecha=false, nFeats=0;
+    let props=[], chunkIdx=0;
+    const flush = async ()=>{ if(props.length){ await dbPut('bigprops', props, id+':'+chunkIdx); chunkIdx++; props=[]; } };
+    for(let i=0;i<feats.length;i++){
+      const feat = feats[i];
+      const g = feat && feat.geometry; if(!g) continue;
+      const first = _primeraCoordGeom(g); if(!first) continue;
+      if(!detHecha){
+        detHecha=true;
+        let conv=null; const x=first[0], y=first[1];
+        if(proyKnown!==undefined){
+          // Capa ya reproyectada a WGS84 (p. ej. shapefile): coords en geo, sin conv.
+          proyFuente = proyKnown || 'geo';
+        } else if(Math.abs(x)>180 || Math.abs(y)>90){
+          let m='crtm05';
+          for(const mm of PROY_TICAS){ try{ const w=haciaWgs(x,y,mm); if(w.lat>=CR_BBOX.latMin&&w.lat<=CR_BBOX.latMax&&w.lon>=CR_BBOX.lonMin&&w.lon<=CR_BBOX.lonMax){ m=mm; dentroCR=true; break; } }catch(e){} }
+          proyFuente=m; conv=(a,b)=>{ const w=haciaWgs(a,b,m); return [w.lon,w.lat]; };
+        }
+        const o = conv?conv(x,y):[x,y];
+        B=_nuevoBuilder(o[0], o[1]); B.conv=conv;
+      }
+      if(_addFeatureBig(B, feat)){
+        props.push(feat.properties||{});
+        nFeats++;
+        if(props.length>=PROP_CHUNK) await flush();
+        if((nFeats & 2047)===0){
+          const el=document.getElementById('cargandoTxt'); if(el) el.textContent='Procesando capa… '+nFeats+' elem.';
+          await new Promise(r=>setTimeout(r));   // ceder el hilo: la UI sigue respondiendo
+        }
+      }
+    }
+    await flush();
+    if(!B || !nFeats){ toast('No se encontraron elementos en la capa.'); return null; }
+    const capa = _finalizarBig(B, id, nombre, proyFuente, nFeats);
+    await dbPut('capas', capa); S.capas.push(capa);
+    centrarEnCapa(capa); dibujar();
+    toast(`Capa "${capa.nombre}": ${nFeats} elementos`+(proyFuente!=='geo'&&dentroCR?' · '+proyFuente.toUpperCase()+'→WGS84':''));
+    return capa;
+  }catch(e){ toast('No se pudo procesar la capa: '+(e.message||e)); return null; }
   finally{ ocultarCargando(); }
 }
 // --- dibujo de una capa grande (con culling por grilla y decimación) ---
@@ -6928,14 +6995,49 @@ async function escanearYListar(tipo){
   try{
     const capas = tipo==='wms' ? await escanearWMS(url) : await escanearWFS(url);
     if(!capas.length){ cont.innerHTML = '<div class="nota" style="border-color:var(--sangre)">No se encontraron capas. ¿La URL es del servicio '+tipo.toUpperCase()+'?</div>'; return; }
-    cont.innerHTML = `<label>Capas disponibles (${capas.length})</label>
-      <select id="capSel">${capas.map(c=>`<option value="${c.name.replace(/"/g,'&quot;')}">${(c.title||c.name).slice(0,60)}</option>`).join('')}</select>
-      <button class="ancho" id="capAddSel">Agregar capa seleccionada</button>`;
-    document.getElementById('capAddSel').onclick = ()=>{
-      const name = document.getElementById('capSel').value;
-      const title = document.getElementById('capSel').selectedOptions[0].textContent;
-      if(tipo==='wms') agregarCapaWMS(title, url, name, '1.3.0');
-      else agregarCapaWFS(title, url, name);
+    // Lista de casillas: se pueden marcar VARIAS y se cargan por separado.
+    cont.innerHTML = `<label>Capas disponibles (${capas.length}) — marcá las que quieras</label>
+      <input id="capFiltro" placeholder="Filtrar por nombre…" style="margin-bottom:6px">
+      <div style="display:flex;gap:6px;margin-bottom:6px">
+        <button class="mini" id="capTodas">☑ Marcar todas</button>
+        <button class="mini" id="capNinguna">☐ Ninguna</button>
+      </div>
+      <div id="capChecks" style="max-height:240px;overflow:auto;border:1px solid var(--cauce);border-radius:8px;padding:6px">
+        ${capas.map((c,i)=>`<label style="display:flex;gap:8px;align-items:flex-start;padding:5px 2px;cursor:pointer;border-bottom:1px solid var(--abismo)" data-row="${i}">
+          <input type="checkbox" class="capChk" value="${i}" style="margin-top:2px">
+          <span style="font-size:12px;line-height:1.3">${escHtml((c.title||c.name)).slice(0,80)}<br><span style="color:var(--musgo);font-size:10px">${escHtml(c.name).slice(0,80)}</span></span>
+        </label>`).join('')}
+      </div>
+      <button class="ancho" id="capAddSel">Agregar seleccionadas</button>`;
+    const chks = ()=> [...cont.querySelectorAll('.capChk')];
+    const actualizarBtn = ()=>{ const n = chks().filter(c=>c.checked).length; document.getElementById('capAddSel').textContent = n? `Agregar ${n} capa(s)` : 'Agregar seleccionadas'; };
+    chks().forEach(c=> c.onchange = actualizarBtn);
+    document.getElementById('capTodas').onclick = ()=>{ chks().forEach(c=>{ if(c.closest('label').style.display!=='none') c.checked=true; }); actualizarBtn(); };
+    document.getElementById('capNinguna').onclick = ()=>{ chks().forEach(c=> c.checked=false); actualizarBtn(); };
+    document.getElementById('capFiltro').oninput = (e)=>{
+      const q = e.target.value.trim().toLowerCase();
+      capas.forEach((c,i)=>{ const row = cont.querySelector(`[data-row="${i}"]`); if(!row) return;
+        const txt = ((c.title||'')+' '+(c.name||'')).toLowerCase();
+        row.style.display = (!q || txt.includes(q)) ? 'flex' : 'none';
+      });
+    };
+    document.getElementById('capAddSel').onclick = async ()=>{
+      const sel = chks().filter(c=>c.checked).map(c=> capas[+c.value]);
+      if(!sel.length){ toast('Marcá al menos una capa.'); return; }
+      mostrarCargando(`Agregando 0/${sel.length} capas…`);
+      let ok=0;
+      for(let i=0;i<sel.length;i++){
+        const c = sel[i];
+        const el=document.getElementById('cargandoTxt'); if(el) el.textContent=`Agregando ${i+1}/${sel.length}: ${(c.title||c.name).slice(0,30)}…`;
+        try{
+          if(tipo==='wms') await agregarCapaWMS(c.title||c.name, url, c.name, '1.3.0');
+          else await agregarCapaWFS(c.title||c.name, url, c.name);
+          ok++;
+        }catch(e){ /* sigue con las demás */ }
+      }
+      ocultarCargando();
+      toast(`${ok} de ${sel.length} capa(s) agregada(s).`);
+      panelCapas();
     };
   }catch(e){
     cont.innerHTML = '<div class="nota" style="border-color:var(--sangre)">No se pudo escanear: '+((e&&e.message)||e)+'. Verificá la URL del servicio.</div>';
@@ -7132,6 +7234,7 @@ function exportarDiagCSV(){
 let brujOffset = 0;   // grados a sumar al rumbo del sensor (0..359)
 const Brujula = (()=>{
   let suave = null, ultDibujo = 0, activo = false;
+  let acc = -1, ultUbic = 0, avisoCalib = 0;   // precisión del sensor y throttle de ubicación
   // Aplica un rumbo (0..360, 0=N horario) con suavizado circular y redibuja.
   function aplicar(deg){
     if(deg == null || isNaN(deg)) return;
@@ -7162,17 +7265,42 @@ const Brujula = (()=>{
     if(P && P.iniciarBrujula){
       // Sensor nativo (vector de rotación): rumbo del borde superior del teléfono.
       try{
-        await P.addListener('heading', ev => aplicar(ev && ev.deg));
+        await P.addListener('heading', ev => {
+          if(ev && ev.acc != null){
+            acc = ev.acc;
+            // Si el magnetómetro está sin calibrar (típico al arrancar), avisar una
+            // vez cómo recalibrarlo: es lo que hace que la flecha apunte distinto
+            // en cada arranque hasta que se recalibra.
+            if(acc >= 0 && acc <= 1 && Date.now()-avisoCalib > 60000){
+              avisoCalib = Date.now();
+              toast('La brújula necesita calibrarse: mové el teléfono en forma de 8, lejos de metales.');
+            }
+          }
+          aplicar(ev && ev.deg);
+        });
         await P.iniciarBrujula();
         return;
       }catch(e){ /* si falla, cae al respaldo de navegador */ }
     }
+    // Respaldo web: SOLO orientación absoluta. La relativa (alpha de
+    // deviceorientation) arranca en una referencia distinta cada vez → la flecha
+    // cambiaría de posición en cada arranque, justo lo que queremos evitar.
     try{
       if('ondeviceorientationabsolute' in window) window.addEventListener('deviceorientationabsolute', onOrient, true);
-      else window.addEventListener('deviceorientation', onOrient, true);
     }catch(e){}
   }
-  return { iniciar };
+  // Recibe la ubicación del GPS (throttle 2 min) para que el sensor nativo
+  // aplique la declinación magnética y entregue rumbo respecto al norte geográfico.
+  function actualizarUbicacion(lat, lon, alt){
+    const P = pluginGnss();
+    if(!(P && P.fijarUbicacion) || lat==null || lon==null) return;
+    const now = Date.now();
+    if(now - ultUbic < 120000) return;
+    ultUbic = now;
+    try{ P.fijarUbicacion({ lat, lon, alt:(alt!=null?alt:0) }); }catch(e){}
+  }
+  function precision(){ return acc; }   // -1 desconocida, 0 no fiable, 1 baja, 2 media, 3 alta
+  return { iniciar, actualizarUbicacion, precision };
 })();
 
 /* =======================================================================

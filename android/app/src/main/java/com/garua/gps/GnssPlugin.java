@@ -37,6 +37,8 @@ public class GnssPlugin extends Plugin {
     private android.hardware.SensorEventListener rotationListener;
     private boolean brujulaOn = false;
     private long ultBrujulaMs = 0;
+    private int brujulaAcc = -1;          // precisión del sensor (SensorManager.SENSOR_STATUS_*)
+    private float declinacion = 0f;       // declinación magnética (grados) según la ubicación
     // Podómetro (sensor de pasos de hardware).
     private android.hardware.Sensor pasosSensor;
     private android.hardware.SensorEventListener pasosListener;
@@ -112,11 +114,15 @@ public class GnssPlugin extends Plugin {
                         }
                         android.hardware.SensorManager.remapCoordinateSystem(R, ax, ay, Rout);
                         android.hardware.SensorManager.getOrientation(Rout, ori);
-                        double az = (Math.toDegrees(ori[0]) + 360.0) % 360.0;
-                        notifyListeners("heading", new JSObject().put("deg", az));
+                        // Rumbo magnético + declinación = rumbo respecto al NORTE GEOGRÁFICO.
+                        // Así la flecha no depende de dónde se calibró y es consistente.
+                        double az = (Math.toDegrees(ori[0]) + declinacion + 360.0) % 360.0;
+                        notifyListeners("heading", new JSObject().put("deg", az).put("acc", brujulaAcc));
                     } catch (Exception ignored) {}
                 }
-                @Override public void onAccuracyChanged(android.hardware.Sensor s, int a) {}
+                @Override public void onAccuracyChanged(android.hardware.Sensor s, int a) {
+                    brujulaAcc = a;   // 0=no fiable, 1=baja, 2=media, 3=alta
+                }
             };
             sensorManager.registerListener(rotationListener, rotationSensor, android.hardware.SensorManager.SENSOR_DELAY_UI);
             brujulaOn = true;
@@ -131,6 +137,24 @@ public class GnssPlugin extends Plugin {
             brujulaOn = false;
         } catch (Exception ignored) {}
         if (call != null) call.resolve();
+    }
+
+    // Recibe la ubicación actual (del GPS) para calcular la declinación magnética
+    // del lugar. Con eso la brújula entrega rumbo respecto al NORTE GEOGRÁFICO,
+    // estable y correcto sin importar dónde se haya calibrado el equipo.
+    @PluginMethod
+    public void fijarUbicacion(PluginCall call) {
+        try {
+            double lat = call.getDouble("lat", 0.0);
+            double lon = call.getDouble("lon", 0.0);
+            float  alt = call.getFloat("alt", 0f);
+            if (lat != 0.0 || lon != 0.0) {
+                android.hardware.GeomagneticField gf = new android.hardware.GeomagneticField(
+                        (float) lat, (float) lon, alt, System.currentTimeMillis());
+                declinacion = gf.getDeclination();   // grados (E positivo)
+            }
+            call.resolve(new JSObject().put("declinacion", declinacion));
+        } catch (Exception e) { call.resolve(new JSObject().put("declinacion", declinacion)); }
     }
 
     // ---- Podómetro: pasos del sensor de hardware (TYPE_STEP_COUNTER) ----
