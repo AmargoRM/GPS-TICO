@@ -463,8 +463,9 @@ const Registro = (()=>{
     const pp=P(); if(!(pp && pp.Filesystem)) return;
     const now=Date.now(); if(!forzar && now-ultFlush<2500) return; ultFlush=now;
     try{
-      try{ await pp.Filesystem.mkdir({ path:DIRLOG, directory:'DOCUMENTS', recursive:true }); }catch(e){}
-      await pp.Filesystem.writeFile({ path:ARCHLOG, data:buf.map(linea).join('\n')+'\n', directory:'DOCUMENTS', encoding:'utf8' });
+      // Directory.Data: escribible sin permisos en todo Android (DOCUMENTS falla en 11+).
+      try{ await pp.Filesystem.mkdir({ path:DIRLOG, directory:'DATA', recursive:true }); }catch(e){}
+      await pp.Filesystem.writeFile({ path:ARCHLOG, data:buf.map(linea).join('\n')+'\n', directory:'DATA', encoding:'utf8' });
     }catch(e){}
   }
   function programarFlush(){ if(flushT) return; flushT=setTimeout(()=>{ flushT=null; flush(false); }, 2500); }
@@ -500,7 +501,7 @@ const Registro = (()=>{
       let almac='';
       try{ if(navigator.storage && navigator.storage.estimate){ const s=await navigator.storage.estimate(); almac=`almacenamiento: ${Math.round((s.usage||0)/1048576)} MB usados de ${Math.round((s.quota||0)/1048576)} MB · persistente: ${navigator.storage.persisted?await navigator.storage.persisted():'?'}`; } }catch(e){}
       const crashNativo = await leerArchivo('crash-nativo.log','DATA');
-      const logJS = buf.length ? buf.map(linea).join('\n') : (await leerArchivo(ARCHLOG,'DOCUMENTS'));
+      const logJS = buf.length ? buf.map(linea).join('\n') : (await leerArchivo(ARCHLOG,'DATA'));
       const txt =
         'GPS TICO — REGISTRO DE USO Y FALLOS\n'+
         'generado: '+stamp()+'\n'+
@@ -2303,7 +2304,7 @@ function abrirMenu(){
     <div class="fila"><div class="cuerpo"><div class="t">⚙ Configuración y términos de uso</div><div class="s">Fuente, diagnóstico, filtros, alertas, precisión</div></div><button class="mini" id="mConfig">Abrir</button></div>
   `);
   document.getElementById('mUpd').onclick = ()=> buscarActualizacion(true);
-  document.getElementById('mCapas').onclick = ()=> navegarPanel(panelCapas);
+  document.getElementById('mCapas').onclick = ()=>{ grupoColapsado = {}; navegarPanel(panelCapas); };   // abrir siempre con las carpetas comprimidas
   document.getElementById('mDatos').onclick = ()=> navegarPanel(panelDatos);
   document.getElementById('mPasos').onclick = ()=> navegarPanel(panelPodometro);
   document.getElementById('mConv').onclick  = ()=> navegarPanel(panelConv);
@@ -2386,27 +2387,46 @@ function programarRespaldoInterno(){
   }, 6000);
 }
 
+// IMPORTANTE: se escribe en Directory.Data (almacenamiento interno de la app), que
+// SIEMPRE es escribible sin permisos y sobrevive al vaciado de IndexedDB. Escribir
+// en Directory.Documents falla en Android 11+ por el almacenamiento aislado (scoped
+// storage) — por eso el respaldo "no funcionaba". Para sacar la copia fuera del
+// equipo (otro teléfono / desinstalar) se usa Exportar copia a un archivo (Compartir).
+const RESP_DIRS = ['DATA','DOCUMENTS'];   // DATA primario; DOCUMENTS best-effort/lectura de versiones viejas
 async function guardarRespaldoInterno(silencioso){
   const P = window.Capacitor && window.Capacitor.Plugins;
   if(!(P && P.Filesystem)){ if(!silencioso) toast('El respaldo interno solo funciona en la app (APK).'); return false; }
+  if(!silencioso) mostrarCargando('Guardando respaldo…');
   try{
     const data = await construirBackupObj();
-    try{ await P.Filesystem.mkdir({ path:RESP_DIR, directory:'DOCUMENTS', recursive:true }); }catch(e){}
-    await P.Filesystem.writeFile({ path:RESP_FILE, data:JSON.stringify(data), directory:'DOCUMENTS', encoding:'utf8' });
-    try{ await _dbPutRaw('conf', { fecha:data.fecha, puntos:data.puntos.length, tracks:data.tracks.length, proyectos:data.proyectos.length }, 'respaldoInterno'); }catch(e){}
+    const txt = JSON.stringify(data);
+    let okDir = null, ultErr = null;
+    for(const dir of RESP_DIRS){
+      try{
+        try{ await P.Filesystem.mkdir({ path:RESP_DIR, directory:dir, recursive:true }); }catch(e){}
+        await P.Filesystem.writeFile({ path:RESP_FILE, data:txt, directory:dir, encoding:'utf8' });
+        if(!okDir) okDir = dir;
+      }catch(e){ ultErr = e; }   // DOCUMENTS falla en Android 11+: no pasa nada, con DATA alcanza
+    }
+    if(!okDir) throw (ultErr || new Error('no se pudo escribir'));
+    try{ await _dbPutRaw('conf', { fecha:data.fecha, puntos:data.puntos.length, tracks:data.tracks.length, proyectos:data.proyectos.length, dir:okDir }, 'respaldoInterno'); }catch(e){}
     if(!silencioso) toast(`Respaldo interno guardado: ${data.puntos.length} puntos · ${data.tracks.length} tracks.`);
     return true;
-  }catch(e){ console.log('respaldo interno:', e); if(!silencioso) toast('No se pudo guardar el respaldo interno.'); return false; }
+  }catch(e){ try{ logEvento('error','Respaldo interno falló', (e&&e.message)||String(e)); }catch(_){} if(!silencioso) toast('No se pudo guardar el respaldo: '+((e&&e.message)||e)); return false; }
+  finally{ if(!silencioso) ocultarCargando(); }
 }
 
 async function leerRespaldoInterno(){
   const P = window.Capacitor && window.Capacitor.Plugins;
   if(!(P && P.Filesystem)) return null;
-  try{
-    const r = await P.Filesystem.readFile({ path:RESP_FILE, directory:'DOCUMENTS', encoding:'utf8' });
-    const d = JSON.parse(r.data);
-    return (d && d._tipo==='gpstico-backup') ? d : null;
-  }catch(e){ return null; }
+  for(const dir of RESP_DIRS){
+    try{
+      const r = await P.Filesystem.readFile({ path:RESP_FILE, directory:dir, encoding:'utf8' });
+      const d = JSON.parse(r.data);
+      if(d && d._tipo==='gpstico-backup') return d;
+    }catch(e){}
+  }
+  return null;
 }
 
 // Al arrancar: si la app quedó SIN datos (base vaciada o recién reinstalada) pero
@@ -3523,7 +3543,19 @@ function panelBrujula(){
   window._brujIv = setInterval(()=>{ if(!document.getElementById('brujVal')){ clearInterval(window._brujIv); window._brujIv=null; return; } tick(); }, 250);
   document.getElementById('brujNorte').onclick = ()=>{
     if(S.rumboCrudo == null){ toast('Esperá a que el sensor dé lectura y volvé a intentar.'); return; }
-    setOff((360 - S.rumboCrudo) % 360);   // el rumbo actual pasa a 0 (Norte)
+    if(Brujula.precision()>=0 && Brujula.precision()<=1)
+      toast('Ojo: la calibración del sensor está baja. Mové el teléfono en 8 antes de calibrar para que no se desvíe.');
+    // Promediar ~1,2 s de lecturas crudas (media circular) para un ajuste estable.
+    toast('Calibrando… mantené el teléfono apuntando al Norte, quieto.');
+    let sx=0, sy=0, n=0;
+    const iv = setInterval(()=>{
+      if(S.rumboCrudo!=null){ const a=S.rumboCrudo*Math.PI/180; sx+=Math.cos(a); sy+=Math.sin(a); n++; }
+    }, 100);
+    setTimeout(()=>{
+      clearInterval(iv);
+      const base = n ? ((Math.atan2(sy/n, sx/n)*180/Math.PI)+360)%360 : S.rumboCrudo;
+      setOff((360 - base) % 360);   // el rumbo promedio actual pasa a 0 (Norte)
+    }, 1200);
   };
   document.getElementById('brujAplicar').onclick = ()=>{
     const v = parseFloat((document.getElementById('brujOff').value||'').replace(',','.'));
@@ -4298,7 +4330,7 @@ async function guardarCapaVector(nombre, gj, silencioso){
 async function reinterpretarCapa(capaId, nuevoModo){
   const c = S.capas.find(x=>x.id===capaId); if(!c || !c.geojson) return;
   const actual = c.proyFuente || 'geo';
-  if(actual === nuevoModo){ panelCapas(); return; }
+  if(actual === nuevoModo){ volverPanel(); return; }
   const rec = coords=>{
     if(typeof coords[0]==='number'){
       // Recuperar la coordenada cruda (Este/Norte o lon/lat) desde WGS84 actual.
@@ -4318,7 +4350,7 @@ async function reinterpretarCapa(capaId, nuevoModo){
   }
   c.proyFuente = nuevoModo;
   await dbPut('capas', c);
-  centrarEnCapa(c); dibujar(); panelCapas();
+  centrarEnCapa(c); dibujar(); volverPanel();
   toast('Proyección: ' + (nuevoModo==='geo'?'WGS84 (geográficas)':nuevoModo==='crtm05'?'CRTM05':nuevoModo==='ln'?'Lambert Norte':'Lambert Sur'));
 }
 // Selector de proyección de origen de una capa.
@@ -6205,19 +6237,26 @@ function trackParaNube(t){
 async function postNube(ruta, body){
   if(!syncCfg.url) throw new Error('Falta la URL del proxy');
   const base = syncCfg.url.replace(/\/+$/,'');
-  const r = await fetch(base + ruta, {
-    method:'POST',
-    headers:{ 'Content-Type':'application/json', 'Authorization':'Bearer '+(syncCfg.token||'') },
-    body: JSON.stringify(body)
-  });
-  const txt = await r.text();
+  const url = base + ruta;
+  const bodyStr = JSON.stringify(body);
+  const headers = { 'Content-Type':'application/json', 'Authorization':'Bearer '+(syncCfg.token||'') };
+  const P = pluginGnss();
+  let status, txt;
+  // HTTP nativo (salta CORS del WebView y trae timeouts); si no, fetch con timeout.
+  if(P && P.httpPost){
+    const r = await P.httpPost({ url, body:bodyStr, headers });
+    status = r.status; txt = r.body || '';
+  } else {
+    const r = await fetch(url, { method:'POST', headers, body:bodyStr, signal: AbortSignal.timeout(30000) });
+    status = r.status; txt = await r.text();
+  }
   let data = {}; try{ data = JSON.parse(txt); }catch(e){}
-  if(!r.ok){
+  if(!(status>=200 && status<300)){
     let hint = '';
-    if(r.status===401) hint = ' — token incorrecto';
-    else if(r.status===404) hint = ' — ¿hiciste Deploy del Worker nuevo?';
-    else if(r.status>=500) hint = ' — error en Neon (revisá tabla)';
-    throw new Error('HTTP '+r.status+hint+': '+(data.error||txt.slice(0,120)));
+    if(status===401) hint = ' — token incorrecto';
+    else if(status===404) hint = ' — ¿hiciste Deploy del Worker nuevo?';
+    else if(status>=500) hint = ' — error en Neon (revisá tabla)';
+    throw new Error('HTTP '+status+hint+': '+(data.error||txt.slice(0,120)));
   }
   // Solo aceptamos éxito real. Un Worker viejo devuelve {success:true,...} sin
   // el campo ok → lo tratamos como error para no falsear "sincronizado".
@@ -6230,12 +6269,19 @@ async function postNube(ruta, body){
 async function getNube(ruta){
   if(!syncCfg.url) throw new Error('Falta la URL del proxy');
   const base = syncCfg.url.replace(/\/+$/,'');
-  const r = await fetch(base + ruta, {
-    headers:{ 'Authorization':'Bearer '+(syncCfg.token||'') }
-  });
-  const txt = await r.text();
+  const url = base + ruta;
+  const headers = { 'Authorization':'Bearer '+(syncCfg.token||'') };
+  const P = pluginGnss();
+  let status, txt;
+  if(P && P.httpGet){
+    const r = await P.httpGet({ url, headers });
+    status = r.status; txt = (r.body!=null ? r.body : bytesATexto(Uint8Array.from(atob(r.dataBase64||''), c=>c.charCodeAt(0))));
+  } else {
+    const r = await fetch(url, { headers, signal: AbortSignal.timeout(30000) });
+    status = r.status; txt = await r.text();
+  }
   let data = {}; try{ data = JSON.parse(txt); }catch(e){}
-  if(!r.ok) throw new Error('HTTP '+r.status);
+  if(!(status>=200 && status<300)) throw new Error('HTTP '+status);
   if(data.ok !== true) throw new Error('El proxy no confirmó éxito');
   return data;
 }
@@ -6767,7 +6813,7 @@ function camposDeCapa(c){
 async function setEtiqueta(id, campo){
   const c = S.capas.find(x=>x.id===id); if(!c) return;
   c.etiqueta = campo || null;
-  await dbPut('capas', c); dibujar(); panelCapas();
+  await dbPut('capas', c); dibujar(); panelEtiqueta(id);
   toast(campo ? 'Etiquetando por: '+campo : 'Etiquetas apagadas.');
 }
 // Elegir el campo con el que rotular los elementos de la capa sobre el mapa.
@@ -6856,7 +6902,7 @@ function panelSimbologia(id){
         <input type="color" id="smColor" value="${(c.color||'#E0A458')}" style="height:44px;padding:4px">
         <button class="ancho" id="smGuardar">Guardar</button>`;
       document.getElementById('smColor').oninput = e=>{ c.color = e.target.value; };
-      document.getElementById('smGuardar').onclick = async ()=>{ delete c.simbologia; await dbPut('capas', c); dibujar(); toast('Simbología: color único.'); cerrarPanel(); };
+      document.getElementById('smGuardar').onclick = async ()=>{ delete c.simbologia; await dbPut('capas', c); dibujar(); toast('Simbología: color único.'); volverPanel(); };
     } else {
       const sm = c.simbologia;
       if(!sm.ocultas) sm.ocultas = {};
@@ -6897,7 +6943,7 @@ function panelSimbologia(id){
         pintarCats(); dibujar();
       };
       pintarCats();
-      document.getElementById('smGuardar').onclick = async ()=>{ await dbPut('capas', c); dibujar(); toast('Simbología por "'+sm.campo+'" guardada.'); cerrarPanel(); };
+      document.getElementById('smGuardar').onclick = async ()=>{ await dbPut('capas', c); dibujar(); toast('Simbología por "'+sm.campo+'" guardada.'); volverPanel(); };
     }
   };
   document.getElementById('smUnico').onclick = ()=>{ delete c.simbologia; render(); };
@@ -6965,7 +7011,7 @@ function cambiarGrupoCapa(id){
   const sel = document.getElementById('gCambSel');
   const divNuevo = document.getElementById('gCambNuevo');
   sel.onchange = ()=>{ divNuevo.style.display = sel.value==='__nuevo__' ? 'block' : 'none'; };
-  document.getElementById('gCambNo').onclick = panelCapas;
+  document.getElementById('gCambNo').onclick = ()=> volverPanel();
   document.getElementById('gCambOk').onclick = async ()=>{
     let g = sel.value;
     if(g==='__nuevo__'){
@@ -6975,7 +7021,7 @@ function cambiarGrupoCapa(id){
     c.grupo = g || null;
     await dbPut('capas', c);
     toast(g ? 'Movida a "'+g+'".' : 'Sacada del grupo.');
-    panelCapas();
+    volverPanel();
   };
 }
 // Renombra un grupo completo: cambia c.grupo en todas las capas que lo tengan.
@@ -7009,6 +7055,20 @@ async function moverCapa(id, dir){
   for(let k=0;k<S.capas.length;k++) S.capas[k].orden = k;
   await dbPut('capas', S.capas[i]);
   await dbPut('capas', S.capas[j]);
+  dibujar(); panelCapas();
+}
+// Mueve una CARPETA (grupo) entera arriba/abajo respecto a la carpeta vecina.
+async function moverGrupo(nombre, dir){
+  const porG = capasPorGrupo();
+  const grupos = [...porG.keys()];
+  const gi = grupos.indexOf(nombre), gj = gi + dir;
+  if(gi<0 || gj<0 || gj>=grupos.length) return;
+  const t = grupos[gi]; grupos[gi] = grupos[gj]; grupos[gj] = t;   // nuevo orden de carpetas
+  const nuevo = [];
+  for(const g of grupos) for(const c of porG.get(g)) nuevo.push(c);  // preserva orden interno
+  S.capas = nuevo;
+  for(let k=0;k<S.capas.length;k++) S.capas[k].orden = k;
+  for(const c of S.capas) await dbPut('capas', c);
   dibujar(); panelCapas();
 }
 function renderFilaCapa(c, idx, total){
@@ -7074,18 +7134,24 @@ function panelCapas(){
     contenido = '<div class="vacio">Sin capas todavía. Agregá una abajo.<br>Tocá un elemento en el mapa para ver sus atributos.</div>';
   } else {
     // Barra de acciones por carpetas: comprimir, encender/apagar todo.
-    const algunaExpandida = [...grupos.keys()].some(g=> !grupoColapsado[g]);
+    // Por defecto las carpetas están COMPRIMIDAS (colapsadas salvo las que el
+    // usuario expandió explícitamente, grupoColapsado[g]===false).
+    const algunaExpandida = [...grupos.keys()].some(g=> grupoColapsado[g]===false);
+    const nombresGrupos = [...grupos.keys()];
     contenido += `<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:2px">
       <button class="mini" id="capColapsar">🗂 ${algunaExpandida?'Comprimir carpetas':'Expandir carpetas'}</button>
       <button class="mini" id="capOnTodo">👁 Encender todo</button>
       <button class="mini" id="capOffTodo">⦸ Apagar todo</button>
     </div>`;
-    for(const [nombreGrupo, capasG] of grupos){
-      const col = !!grupoColapsado[nombreGrupo];
+    nombresGrupos.forEach((nombreGrupo, gi)=>{
+      const capasG = grupos.get(nombreGrupo);
+      const col = grupoColapsado[nombreGrupo] !== false;   // comprimido salvo que se haya expandido
       const puedeRenombrar = nombreGrupo !== 'Sin grupo';
       contenido += `<div style="margin-top:10px;background:var(--abismo);border:1px solid var(--cauce);border-radius:8px;overflow:hidden">
         <div style="padding:8px 12px;background:var(--cauce);display:flex;justify-content:space-between;align-items:center;user-select:none;font-weight:600;font-size:12px">
           <span data-tgg="${escHtml(nombreGrupo)}" style="cursor:pointer;flex:1">${col?'▸':'▾'} 📁 ${escHtml(nombreGrupo)} <span style="color:var(--musgo);font-weight:400">· ${capasG.length}</span></span>
+          <button class="mini" data-gmup="${escHtml(nombreGrupo)}" title="Subir carpeta" ${gi===0?'disabled style="opacity:.3;margin-left:6px"':'style="margin-left:6px"'}>▲</button>
+          <button class="mini" data-gmdn="${escHtml(nombreGrupo)}" title="Bajar carpeta" ${gi===nombresGrupos.length-1?'disabled style="opacity:.3;margin-left:4px"':'style="margin-left:4px"'}>▼</button>
           <button class="mini" data-gon="${escHtml(nombreGrupo)}" title="Encender capas de la carpeta" style="margin-left:6px">👁</button>
           <button class="mini" data-goff="${escHtml(nombreGrupo)}" title="Apagar capas de la carpeta" style="margin-left:4px">⦸</button>
           ${puedeRenombrar?`<button class="mini" data-gren="${escHtml(nombreGrupo)}" title="Renombrar grupo" style="margin-left:4px">✎</button>`:''}
@@ -7095,7 +7161,7 @@ function panelCapas(){
           return renderFilaCapa(c, idxGlobal, S.capas.length);
         }).join('')}</div>`}
       </div>`;
-    }
+    });
   }
   abrirPanel('Capas del proyecto', `
     ${contenido}
@@ -7115,12 +7181,14 @@ function panelCapas(){
   document.querySelectorAll('[data-vc]').forEach(b=> b.onclick = ()=> vincularCapaAURL(b.dataset.vc));
   document.querySelectorAll('[data-up]').forEach(b=> b.onclick = ()=> moverCapa(b.dataset.up, -1));
   document.querySelectorAll('[data-dn]').forEach(b=> b.onclick = ()=> moverCapa(b.dataset.dn, +1));
-  document.querySelectorAll('[data-gr]').forEach(b=> b.onclick = ()=> cambiarGrupoCapa(b.dataset.gr));
+  document.querySelectorAll('[data-gr]').forEach(b=> b.onclick = ()=> navegarPanel(()=> cambiarGrupoCapa(b.dataset.gr)));
   document.querySelectorAll('[data-tgg]').forEach(el=> el.onclick = ()=>{
-    const n = el.dataset.tgg; grupoColapsado[n] = !grupoColapsado[n]; panelCapas();
+    const n = el.dataset.tgg; grupoColapsado[n] = (grupoColapsado[n]===false) ? true : false; panelCapas();
   });
+  document.querySelectorAll('[data-gmup]').forEach(b=> b.onclick = (e)=>{ e.stopPropagation(); moverGrupo(b.dataset.gmup, -1); });
+  document.querySelectorAll('[data-gmdn]').forEach(b=> b.onclick = (e)=>{ e.stopPropagation(); moverGrupo(b.dataset.gmdn, +1); });
   const bCol = document.getElementById('capColapsar');
-  if(bCol) bCol.onclick = ()=>{ const alg = [...capasPorGrupo().keys()].some(g=> !grupoColapsado[g]); colapsarTodosGrupos(alg); };
+  if(bCol) bCol.onclick = ()=>{ const alg = [...capasPorGrupo().keys()].some(g=> grupoColapsado[g]===false); colapsarTodosGrupos(alg); };
   const bOn = document.getElementById('capOnTodo');
   if(bOn) bOn.onclick = ()=> setVisTodasCapas(true);
   const bOff = document.getElementById('capOffTodo');
@@ -7128,11 +7196,11 @@ function panelCapas(){
   document.querySelectorAll('[data-gon]').forEach(b=> b.onclick = (e)=>{ e.stopPropagation(); setVisGrupoCapas(b.dataset.gon, true); });
   document.querySelectorAll('[data-goff]').forEach(b=> b.onclick = (e)=>{ e.stopPropagation(); setVisGrupoCapas(b.dataset.goff, false); });
   document.querySelectorAll('[data-gren]').forEach(b=> b.onclick = (e)=>{ e.stopPropagation(); renombrarGrupo(b.dataset.gren); });
-  document.querySelectorAll('[data-tb]').forEach(b=> b.onclick = ()=> tablaAtributos(b.dataset.tb));
-  document.querySelectorAll('[data-sm]').forEach(b=> b.onclick = ()=> panelSimbologia(b.dataset.sm));
-  document.querySelectorAll('[data-et]').forEach(b=> b.onclick = ()=> panelEtiqueta(b.dataset.et));
-  document.querySelectorAll('[data-se]').forEach(b=> b.onclick = ()=> panelEstilo(b.dataset.se));
-  document.querySelectorAll('[data-pj]').forEach(b=> b.onclick = ()=> panelProyeccion(b.dataset.pj));
+  document.querySelectorAll('[data-tb]').forEach(b=> b.onclick = ()=> navegarPanel(()=> tablaAtributos(b.dataset.tb)));
+  document.querySelectorAll('[data-sm]').forEach(b=> b.onclick = ()=> navegarPanel(()=> panelSimbologia(b.dataset.sm)));
+  document.querySelectorAll('[data-et]').forEach(b=> b.onclick = ()=> navegarPanel(()=> panelEtiqueta(b.dataset.et)));
+  document.querySelectorAll('[data-se]').forEach(b=> b.onclick = ()=> navegarPanel(()=> panelEstilo(b.dataset.se)));
+  document.querySelectorAll('[data-pj]').forEach(b=> b.onclick = ()=> navegarPanel(()=> panelProyeccion(b.dataset.pj)));
   document.querySelectorAll('[data-cir]').forEach(b=> b.onclick = ()=>{ const c=S.capas.find(x=>x.id===b.dataset.cir); if(c){ centrarEnCapa(c); cerrarPanel(); dibujar(); } });
   document.querySelectorAll('[data-bc]').forEach(b=> b.onclick = ()=> borrarCapa(b.dataset.bc));
   document.querySelectorAll('[data-rop]').forEach(b=> b.onclick = async ()=>{

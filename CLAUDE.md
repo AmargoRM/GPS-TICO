@@ -43,10 +43,15 @@ Qué causó la pérdida y cómo evitarla:
 
 Vive en `www/index.html`. Dos capas:
 
-1. **Respaldo interno automático** → `Documentos/GPSTICO/respaldo-auto.json`
-   (Capacitor Filesystem, `directory:'DOCUMENTS'`). Está **fuera de IndexedDB**, así
-   que sobrevive a que el sistema vacíe la base del navegador, e incluso a desinstalar
-   la app (carpeta compartida de Documentos).
+1. **Respaldo interno automático** → `GPSTICO/respaldo-auto.json` en
+   **`Directory.Data`** (almacenamiento interno de la app). Está **fuera de IndexedDB**,
+   así que sobrevive a que el sistema vacíe la base del navegador.
+   - ⚠️ Escribir en `Directory.Documents` **FALLA en Android 11+** (scoped storage):
+     por eso "guardar respaldo interno" no funcionaba. Usar SIEMPRE `Directory.Data`
+     para archivos internos de la app (respaldo y `registro-uso.log`). Para sacar la
+     copia del equipo se usa Exportar a archivo (Compartir), que escribe en CACHE.
+     `RESP_DIRS=['DATA','DOCUMENTS']`: DATA primario; DOCUMENTS es best-effort/lectura
+     de versiones viejas.
    - `construirBackupObj()` arma `{_tipo:'gpstico-backup', _v:1, proyectos, puntos, tracks, capas, conf}`.
    - **CRÍTICO**: las capas pasan por `capaParaBackup()`, que EXCLUYE los campos
      pesados (`coords/partStart/featPartStart/featType/featBBox/grid` del motor big,
@@ -99,6 +104,10 @@ Para depurar trabas/cierres sin poder reproducirlos. Sobrevive al cierre por fal
 - Sincronización **solo de subida** (upload-only): `getNube`/`postNube` mandan
   `Authorization: Bearer <API_TOKEN>` al Worker `nube.*.workers.dev`. No hay función
   de descarga/pull desde la nube. Conectar la nube NO restaura datos locales perdidos.
+- `postNube`/`getNube` usan **HTTP nativo** (`Gnss.httpPost`/`httpGet` en Java, con
+  timeouts) para **saltar CORS** del WebView; si no está el plugin, `fetch` con
+  `AbortSignal.timeout(30000)`. Antes usaban `fetch` plano (CORS + sin timeout) y el
+  sync se "colgaba sin avanzar".
 - El campo "TOKEN DE ACCESO" de la app es el `API_TOKEN` del Worker (Cloudflare →
   Workers & Pages → worker → Configuración → Variables y secretos), **no** la cadena
   `postgresql://...` de Neon (esa es la dirección de la base, nunca va en la app).

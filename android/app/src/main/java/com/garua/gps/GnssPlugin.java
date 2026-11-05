@@ -559,6 +559,7 @@ public class GnssPlugin extends Plugin {
     @PluginMethod
     public void httpGet(final PluginCall call) {
         final String url = call.getString("url");
+        final JSObject headers = call.getObject("headers");
         if (url == null || url.isEmpty()) { call.reject("URL vacía"); return; }
         new Thread(new Runnable() {
             @Override public void run() {
@@ -570,6 +571,10 @@ public class GnssPlugin extends Plugin {
                     conn.setInstanceFollowRedirects(true);
                     conn.setRequestProperty("User-Agent", "GPS-TICO/1.0");
                     conn.setRequestProperty("Accept", "*/*");
+                    if (headers != null) {
+                        java.util.Iterator<String> it = headers.keys();
+                        while (it.hasNext()) { String k = it.next(); try { conn.setRequestProperty(k, headers.getString(k)); } catch (Exception ig) {} }
+                    }
                     int code = conn.getResponseCode();
                     java.io.InputStream is = (code >= 200 && code < 400) ? conn.getInputStream() : conn.getErrorStream();
                     java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
@@ -581,6 +586,52 @@ public class GnssPlugin extends Plugin {
                     r.put("status", code);
                     r.put("contentType", ct == null ? "" : ct);
                     r.put("dataBase64", b64);
+                    call.resolve(r);
+                } catch (Exception e) {
+                    call.reject("http error: " + e.getMessage());
+                } finally {
+                    if (conn != null) conn.disconnect();
+                }
+            }
+        }).start();
+    }
+
+    // HTTP POST nativo (evita CORS del WebView y tiene timeouts, para la nube Neon).
+    @PluginMethod
+    public void httpPost(final PluginCall call) {
+        final String url = call.getString("url");
+        final String body = call.getString("body", "");
+        final JSObject headers = call.getObject("headers");
+        if (url == null || url.isEmpty()) { call.reject("URL vacía"); return; }
+        new Thread(new Runnable() {
+            @Override public void run() {
+                java.net.HttpURLConnection conn = null;
+                try {
+                    conn = (java.net.HttpURLConnection) new java.net.URL(url).openConnection();
+                    conn.setConnectTimeout(15000);
+                    conn.setReadTimeout(30000);
+                    conn.setInstanceFollowRedirects(true);
+                    conn.setRequestMethod("POST");
+                    conn.setDoOutput(true);
+                    conn.setRequestProperty("User-Agent", "GPS-TICO/1.0");
+                    conn.setRequestProperty("Content-Type", "application/json");
+                    if (headers != null) {
+                        java.util.Iterator<String> it = headers.keys();
+                        while (it.hasNext()) { String k = it.next(); try { conn.setRequestProperty(k, headers.getString(k)); } catch (Exception ig) {} }
+                    }
+                    byte[] out = (body == null ? "" : body).getBytes("UTF-8");
+                    java.io.OutputStream os = conn.getOutputStream();
+                    os.write(out); os.flush(); os.close();
+                    int code = conn.getResponseCode();
+                    java.io.InputStream is = (code >= 200 && code < 400) ? conn.getInputStream() : conn.getErrorStream();
+                    java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
+                    byte[] buf = new byte[8192]; int n;
+                    if (is != null) { while ((n = is.read(buf)) > 0) bos.write(buf, 0, n); is.close(); }
+                    String ct = conn.getContentType();
+                    JSObject r = new JSObject();
+                    r.put("status", code);
+                    r.put("contentType", ct == null ? "" : ct);
+                    r.put("body", new String(bos.toByteArray(), "UTF-8"));
                     call.resolve(r);
                 } catch (Exception e) {
                     call.reject("http error: " + e.getMessage());
