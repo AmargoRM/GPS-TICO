@@ -6200,6 +6200,15 @@ async function buscarActualizacion(manual){
 let syncCfg = { url:'', token:'', auto:true };
 async function cargarSyncCfg(){ try{ const c = await dbGet('conf','syncCfg'); if(c) syncCfg = Object.assign(syncCfg, c); }catch(e){} }
 async function guardarSyncCfg(){ await dbPut('conf', syncCfg, 'syncCfg'); }
+// Normaliza la dirección del proxy: si el usuario escribió solo
+// "nube.cuenta.workers.dev" (sin https://), Java no la acepta ("no protocol")
+// y el auto-sync fallaba en silencio. Se agrega https:// y se quitan "/" finales.
+function urlNube(u){
+  u = String(u||'').trim().replace(/\/+$/,'');
+  if(u && !/^https?:\/\//i.test(u)) u = 'https://' + u;
+  return u;
+}
+let ultimoErrorSync = '';   // último fallo de sincronización (se muestra en el panel)
 // Formato del punto para enviar al proxy. Coincide con la tabla `puntos`
 // que arma el Worker: id, proy, nombre, detalle, fecha, lat, lon, alt_orto, exac.
 function puntoParaNube(p){
@@ -6236,7 +6245,7 @@ function trackParaNube(t){
 // error de Neon) es error → NO se marca como sincronizado.
 async function postNube(ruta, body){
   if(!syncCfg.url) throw new Error('Falta la URL del proxy');
-  const base = syncCfg.url.replace(/\/+$/,'');
+  const base = urlNube(syncCfg.url);
   const url = base + ruta;
   const bodyStr = JSON.stringify(body);
   const headers = { 'Content-Type':'application/json', 'Authorization':'Bearer '+(syncCfg.token||'') };
@@ -6268,7 +6277,7 @@ async function postNube(ruta, body){
 // GET del proxy con validación estricta (mismo criterio que postNube).
 async function getNube(ruta){
   if(!syncCfg.url) throw new Error('Falta la URL del proxy');
-  const base = syncCfg.url.replace(/\/+$/,'');
+  const base = urlNube(syncCfg.url);
   const url = base + ruta;
   const headers = { 'Authorization':'Bearer '+(syncCfg.token||'') };
   const P = pluginGnss();
@@ -6381,7 +6390,10 @@ async function sincronizarNube(manual){
     }
     if(manual) actualizarProgreso(100, 'Listo');
     if(manual) toast('Subidos '+nP+' punto(s), '+nT+' track(s) y '+nF+' foto(s).');
+    ultimoErrorSync = '';
   }catch(e){
+    ultimoErrorSync = new Date().toLocaleTimeString()+' — '+(e.message||e);
+    try{ logEvento('sync', 'Fallo al subir a la nube: '+(e.message||e)); }catch(_){}
     if(manual) toast('No se pudo subir: '+(e.message||e));
   }finally{
     if(manual) setTimeout(ocultarCargando, 400);
@@ -6431,23 +6443,25 @@ function panelSync(){
       <button class="mini" id="syGuardar">Guardar ajustes</button>
     </div>
     <div class="res" style="margin-top:12px"><div class="k">Pendientes de subir</div><div class="v">${puntosPend} punto(s) · ${tracksPend} track(s) · ${fotosPend} foto(s)</div></div>
+    ${ultimoErrorSync?`<div class="nota" style="border-color:var(--sangre)">Último error al subir: ${escHtml(ultimoErrorSync)}</div>`:''}
     <button class="ancho" id="sySubir">Subir ahora</button>
     <button class="ancho borde" id="syReset">Volver a marcar todo como pendiente</button>
     <div class="nota">Si algo se marcó como "subido" sin haber llegado, tocá el segundo botón para reenviar. Las fotos se guardan en la tabla <b>fotos</b> como base64, enlazadas al punto por <b>punto_id</b>.</div>
   `);
   document.getElementById('syGuardar').onclick = async ()=>{
-    syncCfg.url = document.getElementById('syUrl').value.trim();
+    syncCfg.url = urlNube(document.getElementById('syUrl').value);
+    document.getElementById('syUrl').value = syncCfg.url;
     syncCfg.token = document.getElementById('syTok').value.trim();
     syncCfg.auto = document.getElementById('syAuto').checked;
     await guardarSyncCfg(); toast('Ajustes guardados.');
   };
   document.getElementById('syProbar').onclick = async ()=>{
-    const url = document.getElementById('syUrl').value.trim();
+    const url = urlNube(document.getElementById('syUrl').value);
     if(!url){ toast('Poné la URL primero.'); return; }
     mostrarCargando('Probando…');
     let txt = '', st = '?', ok = false, diag = '';
     try{
-      const r = await fetch(url.replace(/\/+$/,'')+'/ping');
+      const r = await fetch(url+'/ping');
       st = r.status;
       txt = await r.text();
       let j = {}; try{ j = JSON.parse(txt); }catch(e){}
