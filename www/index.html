@@ -41,7 +41,7 @@ body{display:flex;flex-direction:column;padding-top:env(safe-area-inset-top);pad
 #btnFuente[data-src="gps"]{border-color:var(--fix);color:var(--fix)}
 button.flot:active{background:var(--cauce)}
 #estadoRed{position:absolute;top:10px;left:10px;font-family:var(--mono);font-size:9px;letter-spacing:.1em;color:var(--musgo);background:rgba(10,18,20,.8);padding:4px 7px;border-radius:4px}
-#toast{position:absolute;left:50%;bottom:14px;transform:translateX(-50%);background:var(--cauce);color:var(--niebla);font-size:12px;padding:8px 14px;border-radius:20px;opacity:0;transition:opacity .25s;pointer-events:none;max-width:88%;text-align:center}
+#toast{position:fixed;z-index:40;left:50%;bottom:14px;transform:translateX(-50%);background:var(--cauce);color:var(--niebla);font-size:12px;padding:8px 14px;border-radius:20px;opacity:0;transition:opacity .25s;pointer-events:none;max-width:88%;text-align:center}
 #toast.on{opacity:1}
 
 /* ---------- lectura ---------- */
@@ -6350,16 +6350,40 @@ async function sincronizarNube(manual){
     };
     if(puntosPend.length){
       if(manual) actualizarProgreso(Math.round((paso/pasos)*95)+5, 'Subiendo '+puntosPend.length+' punto(s)…');
-      const rr = await postNube('/puntos', { puntos: puntosPend.map(puntoParaNube) });
-      for(const p of puntosPend){ p.sincronizado = true; await dbPut('puntos', p); }
-      nP = rr.recibidos || puntosPend.length;
+      // Lotes chicos: el Worker hace ~40 consultas de preparación por pedido y
+      // Cloudflare (plan gratis) corta en 50 subpedidos. Con 18 puntos de una
+      // vez se pasaba del límite y fallaba todo el lote. Con 4 por pedido entra.
+      const LOTE_P = 4;
+      for(let i=0;i<puntosPend.length;i+=LOTE_P){
+        const lote = puntosPend.slice(i, i+LOTE_P);
+        if(manual) actualizarProgreso(Math.round((paso/pasos)*95)+5, 'Subiendo puntos '+(i+1)+'–'+(i+lote.length)+' de '+puntosPend.length+'…');
+        const rr = await postNube('/puntos', { puntos: lote.map(puntoParaNube) });
+        for(const p of lote){ p.sincronizado = true; await dbPut('puntos', p); }
+        nP += (rr.recibidos!=null ? rr.recibidos : lote.length);
+      }
       paso++; avance();
     }
     if(tracksPend.length){
       if(manual) actualizarProgreso(Math.round((paso/pasos)*95)+5, 'Subiendo '+tracksPend.length+' track(s)…');
-      const rr = await postNube('/tracks', { tracks: tracksPend.map(trackParaNube) });
-      for(const t of tracksPend){ t.sincronizado = true; await dbPut('tracks', t); }
-      nT = rr.recibidos || tracksPend.length;
+      // Lotes de 2 (cada track puede usar 2 consultas si reintenta sin geometría).
+      const LOTE_T = 2;
+      let fallT = 0, errT = '';
+      for(let i=0;i<tracksPend.length;i+=LOTE_T){
+        const lote = tracksPend.slice(i, i+LOTE_T);
+        if(manual) actualizarProgreso(Math.round((paso/pasos)*95)+5, 'Subiendo tracks '+(i+1)+'–'+(i+lote.length)+' de '+tracksPend.length+'…');
+        const rr = await postNube('/tracks', { tracks: lote.map(trackParaNube) });
+        // El Worker responde ok:true aunque algún track falle (lo cuenta en
+        // "fallidos"). Esos NO se marcan como subidos, para reintentarlos.
+        const fallidos = rr.fallidos || 0;
+        const idsMal = new Set((rr.errores||[]).map(e=> String(e).split(':')[0]));
+        for(const t of lote){
+          if(fallidos && (idsMal.has(String(t.id)) || idsMal.size < fallidos)) continue;
+          t.sincronizado = true; await dbPut('tracks', t);
+        }
+        if(fallidos){ fallT += fallidos; if(!errT && rr.errores && rr.errores.length) errT = String(rr.errores[0]); }
+        nT += (rr.recibidos!=null ? rr.recibidos : lote.length);
+      }
+      if(fallT) throw new Error(fallT+' track(s) no se guardaron en Neon: '+errT.slice(0,140));
       paso++; avance();
     }
     if(puntosConFotosPend.length){
